@@ -1,5 +1,6 @@
 from pyGandalf.utilities.logger import logger
 from pyGandalf.utilities.definitions import MODELS_PATH
+from pyGandalf.utilities.tet_generator import generate_tetrahedral_mesh
 
 import numpy as np
 import trimesh
@@ -16,6 +17,14 @@ class MeshInstance:
         self.indices = indices
         self.normals = normals
         self.texcoords = texcoords
+        
+class TetrahedralMeshInstance:
+    def __init__(self, name, path, vertices, tetrahedra):
+        self.name = name
+        self.path = path
+        self.vertices = vertices        # Nx3 array of vertex positions
+        self.tetrahedra = tetrahedra    # Mx4 array of tet indices
+        # Could add more later: boundary faces, vertex markers, etc.
 
 class MeshLib(object):
     def __new__(cls):
@@ -38,7 +47,7 @@ class MeshLib(object):
         texcoords = None
 
         if '.usd' in path.name:
-            if False:
+            if True:
                 stage = Usd.Stage.Open(filename)
                 flattened_stage = stage.Flatten().ExportToString()
                 logger.debug(flattened_stage)
@@ -62,9 +71,15 @@ class MeshLib(object):
                         result.extend(extracted_elements)
                     indices = np.array(result)
 
-                normals = np.asarray(mesh.normals, dtype=np.float32)
-                texcoords = np.asarray(mesh.texcoords, dtype=np.float32)
-            raise NotImplementedError()
+                # Compute normals if missing or invalid (like trimesh does for OBJ)
+                if mesh.normals is None or len(mesh.normals) != len(vertices):
+                    # Use trimesh to compute proper vertex normals
+                    temp_mesh = trimesh.Trimesh(vertices=vertices, faces=indices)
+                    normals = np.asarray(temp_mesh.vertex_normals, dtype=np.float32)
+                else:
+                    normals = np.asarray(mesh.normals, dtype=np.float32)
+
+                texcoords = np.asarray(mesh.texcoords, dtype=np.float32) if mesh.texcoords is not None else None
         else:
             mesh: trimesh.Trimesh = trimesh.load(filename, force='mesh')
             vertices = np.asarray(mesh.vertices, dtype=np.float32)
@@ -131,3 +146,13 @@ class MeshLib(object):
                 submeshes.append(MeshInstance(name, file_path, vertices, indices, normals, uvs))
     
         return submeshes, face_vertex_count
+    
+    def build_tetrahedral(cls, name: str, surface_mesh_path: Path):
+        # 1. Load surface mesh using existing build()
+        surface_mesh = cls.build(name, surface_mesh_path)
+        
+        # 2. Generate tetrahedral mesh
+        tet_mesh = generate_tetrahedral_mesh(surface_mesh)
+        
+        # 3. Store and return
+        return tet_mesh
