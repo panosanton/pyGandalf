@@ -1,6 +1,5 @@
 from pyGandalf.utilities.logger import logger
 from pyGandalf.utilities.definitions import MODELS_PATH
-from pyGandalf.utilities.tet_generator import generate_tetrahedral_mesh
 
 import numpy as np
 import trimesh
@@ -148,6 +147,9 @@ class MeshLib(object):
         return submeshes, face_vertex_count
     
     def build_tetrahedral(cls, name: str, surface_mesh_path: Path):
+
+        from pyGandalf.thesis_utilities.tet_generator import generate_tetrahedral_mesh
+
         # 1. Load surface mesh using existing build()
         surface_mesh = cls.build(name, surface_mesh_path)
         

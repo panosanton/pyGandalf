@@ -4,7 +4,7 @@ Simple test script to verify Taichi setup and tetrahedral mesh generation
 
 from pathlib import Path
 from pyGandalf.utilities.mesh_lib import MeshLib, TetrahedralMeshInstance
-from pyGandalf.utilities.tet_generator import analyze_tetrahedral_mesh
+from pyGandalf.thesis_utilities.tet_generator import analyze_tetrahedral_mesh
 from pyGandalf.utilities.definitions import MODELS_PATH
 
 def test_taichi_setup():

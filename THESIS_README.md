@@ -42,11 +42,55 @@ pip install tetgen
 - `compute_tet_quality()` Taichi kernel - GPU-accelerated quality metrics
 - `analyze_tetrahedral_mesh()` helper function - Analyzes mesh statistics
 
-### `test_taichi.py`
+---
 
-**Created:**
-- Complete test suite for tetrahedral mesh generation pipeline
-- Tests: Taichi setup, surface mesh loading, tetrahedral generation, GPU analysis
+## New Thesis-Specific Files
+
+### `pyGandalf/thesis_utilities/` (New Directory)
+
+Created a dedicated folder for thesis-specific code to keep it separate from pyGandalf core utilities.
+
+### `pyGandalf/thesis_utilities/tet_exploder.py`
+
+**Added:**
+- `explode_tetrahedral_mesh()` - Creates static exploded view where tetrahedra move away from center
+- Extracts all 4 triangular faces from each tetrahedron for rendering
+- Taichi GPU-accelerated normal computation
+  - Handles 711,000 tetrahedra (2.8M triangles)
+  - Performance: minutes (Python) → seconds (Taichi GPU)
+
+### `pyGandalf/thesis_utilities/animated_tet_exploder.py`
+
+**Added:**
+- `AnimatedTetExplosion` class - Manages animated explosion effect with sine wave motion
+- Pre-computes explosion directions for all tetrahedra
+- NumPy vectorized operations for per-frame updates
+- Taichi GPU-accelerated normal computation
+
+### `pyGandalf/thesis_utilities/animated_explosion_system.py`
+
+**Added:**
+- `AnimatedExplosionComponent` - Stores animation data
+- `AnimatedExplosionSystem` - ECS system that updates vertex positions in GPU buffers every frame
+- Integrates with pyGandalf's rendering system
+- Built-in performance profiling
+
+---
+
+## Test Files
+
+### `My_tests/test_taichi.py`
+- Tetrahedral mesh generation pipeline test
+- GPU-accelerated quality analysis
+
+### `My_tests/test_exploded_tets.py`
+- Static exploded tetrahedral visualization
+- Verifies interior tetrahedra are visible
+
+### `My_tests/test_animated_explosion.py`
+- Interactive animated explosion demo
+- Full ECS setup with camera controls
+- Verifies tetrahedral structure throughout volume
 
 ---
 
@@ -76,7 +120,16 @@ Structures and packages simulation parameters (input mesh, cutting plane locatio
 
 ## Running the Code
 
-*(Instructions to be added)*
+```bash
+# Generate tetrahedral mesh
+python My_tests/test_taichi.py
+
+# Static exploded visualization
+python My_tests/test_exploded_tets.py
+
+# Animated explosion (interactive, use mouse to control camera)
+python My_tests/test_animated_explosion.py
+```
 
 ---
 
