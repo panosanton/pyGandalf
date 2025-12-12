@@ -4,9 +4,13 @@ from pyGandalf.utilities.definitions import MODELS_PATH
 import numpy as np
 import trimesh
 from pxr import Usd, UsdGeom
+import taichi as ti
 
 import os
 from pathlib import Path
+
+# Initialize Taichi for GPU acceleration
+ti.init(arch=ti.gpu, default_fp=ti.f32)
 
 class MeshInstance:
     def __init__(self, name, path, vertices, indices, normals, texcoords):
@@ -24,6 +28,52 @@ class TetrahedralMeshInstance:
         self.vertices = vertices        # Nx3 array of vertex positions
         self.tetrahedra = tetrahedra    # Mx4 array of tet indices
         # Could add more later: boundary faces, vertex markers, etc.
+
+    def extract_all_faces(self) -> 'MeshInstance':
+        """
+        Extract all triangular faces from tetrahedra using shared vertices.
+
+        Efficient method for static visualization - uses existing vertex array
+        and creates triangle indices pointing to those vertices.
+
+        Returns:
+            MeshInstance with all tetrahedral faces as triangles
+        """
+        print(f"Extracting faces from {len(self.tetrahedra):,} tetrahedra...")
+
+        # Each tetrahedron has 4 triangular faces
+        all_triangles = []
+
+        for tet in self.tetrahedra:
+            v0, v1, v2, v3 = tet
+
+            # Extract 4 triangular faces (indices into original vertex array)
+            faces = [
+                [v0, v1, v2],
+                [v0, v1, v3],
+                [v0, v2, v3],
+                [v1, v2, v3],
+            ]
+            all_triangles.extend(faces)
+
+        indices = np.array(all_triangles, dtype=np.uint32)
+
+        # Compute normals using Taichi GPU acceleration
+        print(f"Computing normals for {len(indices):,} triangles...")
+        normals = _compute_normals_taichi(self.vertices, indices)
+
+        # Create MeshInstance using original vertices (no duplication)
+        mesh = MeshInstance(
+            name=f"{self.name}_all_faces",
+            path=self.path,
+            vertices=self.vertices,
+            indices=indices,
+            normals=normals,
+            texcoords=np.zeros((len(self.vertices), 2), dtype=np.float32)
+        )
+
+        print(f"Created mesh: {len(self.vertices):,} vertices, {len(indices):,} triangles")
+        return mesh
 
 class MeshLib(object):
     def __new__(cls):
@@ -152,9 +202,71 @@ class MeshLib(object):
 
         # 1. Load surface mesh using existing build()
         surface_mesh = cls.build(name, surface_mesh_path)
-        
+
         # 2. Generate tetrahedral mesh
         tet_mesh = generate_tetrahedral_mesh(surface_mesh)
-        
+
         # 3. Store and return
         return tet_mesh
+
+
+# Taichi GPU-accelerated normal computation
+@ti.kernel
+def _compute_normals_kernel(vertices: ti.types.ndarray(), indices: ti.types.ndarray(), normals: ti.types.ndarray()):
+    """
+    Taichi kernel to compute face normals in parallel on GPU
+    """
+    for tri_idx in range(indices.shape[0]):
+        # Get vertex indices
+        v0 = indices[tri_idx, 0]
+        v1 = indices[tri_idx, 1]
+        v2 = indices[tri_idx, 2]
+
+        # Get vertex positions
+        p0 = ti.Vector([vertices[v0, 0], vertices[v0, 1], vertices[v0, 2]])
+        p1 = ti.Vector([vertices[v1, 0], vertices[v1, 1], vertices[v1, 2]])
+        p2 = ti.Vector([vertices[v2, 0], vertices[v2, 1], vertices[v2, 2]])
+
+        # Compute edges
+        edge1 = p1 - p0
+        edge2 = p2 - p0
+
+        # Compute cross product (face normal)
+        normal = edge1.cross(edge2)
+
+        # Normalize
+        length = normal.norm()
+        if length > 1e-6:
+            normal = normal / length
+
+        # Assign to all 3 vertices
+        normals[v0, 0] = normal[0]
+        normals[v0, 1] = normal[1]
+        normals[v0, 2] = normal[2]
+
+        normals[v1, 0] = normal[0]
+        normals[v1, 1] = normal[1]
+        normals[v1, 2] = normal[2]
+
+        normals[v2, 0] = normal[0]
+        normals[v2, 1] = normal[1]
+        normals[v2, 2] = normal[2]
+
+
+def _compute_normals_taichi(vertices: np.ndarray, indices: np.ndarray) -> np.ndarray:
+    """
+    Compute normals using Taichi GPU acceleration (wrapper function)
+
+    Args:
+        vertices: (N, 3) array of vertex positions
+        indices: (M, 3) array of triangle indices
+
+    Returns:
+        (N, 3) array of vertex normals
+    """
+    normals = np.zeros_like(vertices, dtype=np.float32)
+
+    # Call Taichi kernel (runs on GPU)
+    _compute_normals_kernel(vertices, indices, normals)
+
+    return normals

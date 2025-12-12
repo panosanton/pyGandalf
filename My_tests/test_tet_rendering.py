@@ -60,29 +60,27 @@ def main():
     tet_mesh = MeshLib().build_tetrahedral('bunny_tet', MODELS_PATH / 'bunny.usdc')
     print(f"Generated {len(tet_mesh.tetrahedra):,} tetrahedra")
 
-    # Load original surface mesh for rendering (temporary)
-    # For slicing simulator, you'll extract surface from cut tetrahedra
-    print("\nLoading surface mesh for rendering...")
-    surface_mesh = MeshLib().build('bunny_surface', MODELS_PATH / 'bunny.usdc')
-    print(f"Surface mesh: {len(surface_mesh.vertices)} vertices, {len(surface_mesh.indices)} triangles")
+    # Extract all faces to visualize interior structure
+    print("\nExtracting all tetrahedral faces for visualization...")
+    tet_faces_mesh = tet_mesh.extract_all_faces()
 
-    print("\nNOTE: pyGandalf's StaticMeshComponent renders surface meshes (triangles).")
-    print("For your slicing simulator, you'll need to:")
-    print("  1. Store the tetrahedral mesh (done)")
-    print("  2. Perform slicing/cutting on tetrahedra")
-    print("  3. Extract surface triangles from cut geometry")
-    print("  4. Update the surface mesh dynamically")
+    # Register the mesh with MeshLib so it can be used for rendering
+    MeshLib().instance.meshes['tet_faces'] = tet_faces_mesh
+    MeshLib().instance.meshes_names['tet_faces'] = 'tet_faces'
+
+    print("\nNOTE: Showing ALL tetrahedral faces (interior structure visible).")
+    print("This visualizes the complete 3D tetrahedral mesh, not just the surface.")
 
     # Register components to root
     scene.add_component(root, TransformComponent(glm.vec3(0, 0, 0), glm.vec3(0, 0, 0), glm.vec3(1, 1, 1)))
     scene.add_component(root, InfoComponent('root'))
     scene.add_component(root, LinkComponent(None))
 
-    # Register components to tet mesh entity (rendering surface)
+    # Register components to tet mesh entity (rendering all faces)
     scene.add_component(tet_mesh_entity, InfoComponent("tetrahedral_bunny"))
     scene.add_component(tet_mesh_entity, TransformComponent(glm.vec3(0, 0, 0), glm.vec3(0, 10, 0), glm.vec3(1, 1, 1)))
     scene.add_component(tet_mesh_entity, LinkComponent(root))
-    scene.add_component(tet_mesh_entity, StaticMeshComponent('bunny_surface'))
+    scene.add_component(tet_mesh_entity, StaticMeshComponent('tet_faces'))  # Render extracted tetrahedral faces
     scene.add_component(tet_mesh_entity, MaterialComponent('M_TetMesh'))
 
     # Register components to light
@@ -111,8 +109,8 @@ def main():
 
     # Start application
     print("\nStarting pyGandalf renderer...")
-    print("Tetrahedral mesh is stored in memory (for slicing)")
-    print("Surface mesh is being rendered (green bunny)")
+    print("Rendering ALL tetrahedral faces - interior structure visible")
+    print("Use mouse to rotate and inspect the 3D tetrahedralization")
 
     Application().start()
 
