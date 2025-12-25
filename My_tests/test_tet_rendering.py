@@ -60,16 +60,19 @@ def main():
     tet_mesh = MeshLib().build_tetrahedral('bunny_tet', MODELS_PATH / 'bunny.usdc')
     print(f"Generated {len(tet_mesh.tetrahedra):,} tetrahedra")
 
-    # Extract all faces to visualize interior structure
-    print("\nExtracting all tetrahedral faces for visualization...")
-    tet_faces_mesh = tet_mesh.extract_all_faces()
+    # Extract all faces using hybrid rendering (smooth surface + interior structure)
+    print("\nExtracting tetrahedral faces with hybrid normals...")
+    print("(Smooth surface shading + visible interior structure)")
+    tet_faces_mesh = tet_mesh.extract_interior_and_surface_hybrid()
 
     # Register the mesh with MeshLib so it can be used for rendering
     MeshLib().instance.meshes['tet_faces'] = tet_faces_mesh
     MeshLib().instance.meshes_names['tet_faces'] = 'tet_faces'
 
-    print("\nNOTE: Showing ALL tetrahedral faces (interior structure visible).")
-    print("This visualizes the complete 3D tetrahedral mesh, not just the surface.")
+    print("\nUsing hybrid rendering:")
+    print("  - Surface: smooth normals (natural shading)")
+    print("  - Interior: visible tetrahedral structure")
+    print("  - No boundary face overlap (clean rendering)")
 
     # Register components to root
     scene.add_component(root, TransformComponent(glm.vec3(0, 0, 0), glm.vec3(0, 0, 0), glm.vec3(1, 1, 1)))
@@ -109,8 +112,8 @@ def main():
 
     # Start application
     print("\nStarting pyGandalf renderer...")
-    print("Rendering ALL tetrahedral faces - interior structure visible")
-    print("Use mouse to rotate and inspect the 3D tetrahedralization")
+    print("Hybrid tetrahedral rendering with optimal lighting")
+    print("Use mouse to rotate and inspect the smooth surface + interior structure")
 
     Application().start()
 

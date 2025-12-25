@@ -22,11 +22,12 @@ class MeshInstance:
         self.texcoords = texcoords
         
 class TetrahedralMeshInstance:
-    def __init__(self, name, path, vertices, tetrahedra):
+    def __init__(self, name, path, vertices, tetrahedra, original_surface_mesh=None):
         self.name = name
         self.path = path
         self.vertices = vertices        # Nx3 array of vertex positions
         self.tetrahedra = tetrahedra    # Mx4 array of tet indices
+        self.original_surface_mesh = original_surface_mesh  # Store original mesh for normal preservation
         # Could add more later: boundary faces, vertex markers, etc.
 
     def extract_all_faces(self) -> 'MeshInstance':
@@ -35,6 +36,7 @@ class TetrahedralMeshInstance:
 
         Efficient method for static visualization - uses existing vertex array
         and creates triangle indices pointing to those vertices.
+        Normals are averaged across all triangles sharing a vertex.
 
         Returns:
             MeshInstance with all tetrahedral faces as triangles
@@ -73,6 +75,112 @@ class TetrahedralMeshInstance:
         )
 
         print(f"Created mesh: {len(self.vertices):,} vertices, {len(indices):,} triangles")
+        return mesh
+
+    def extract_interior_and_surface_hybrid(self) -> 'MeshInstance':
+        """
+        Extract tetrahedral faces with hybrid approach for optimal lighting.
+
+        This method creates two separate parts:
+        1. Interior faces: Uses original vertices, excludes boundary faces
+        2. Surface shell: Duplicated vertices with smooth surface normals
+
+        This avoids normal blending between surface and interior while being
+        more efficient than full vertex duplication.
+
+        Uses NumPy vectorization for optimal performance.
+
+        Returns:
+            MeshInstance with interior + surface shell (no boundary face overlap)
+        """
+        if self.original_surface_mesh is None:
+            print("WARNING: No original surface mesh available. Falling back to standard extraction.")
+            return self.extract_all_faces()
+
+        print(f"Extracting hybrid interior+surface mesh from {len(self.tetrahedra):,} tetrahedra...")
+
+        # Step 1: Generate all faces from all tetrahedra using NumPy vectorization
+        tetrahedra = self.tetrahedra  # Shape: (N, 4)
+
+        # Face index combinations for a tetrahedron [v0, v1, v2, v3]
+        face_indices = np.array([
+            [0, 1, 2],  # Face 0
+            [0, 1, 3],  # Face 1
+            [0, 2, 3],  # Face 2
+            [1, 2, 3]   # Face 3
+        ], dtype=np.int32)
+
+        # Extract all faces: (N_tets, 4, 3) -> (N_tets * 4, 3)
+        # For each tet, get its 4 faces
+        all_faces = tetrahedra[:, face_indices].reshape(-1, 3)
+
+        # Sort each face for consistent comparison
+        all_faces_sorted = np.sort(all_faces, axis=1)
+
+        # Step 2: Find unique faces and count occurrences
+        print("  Identifying boundary and interior faces...")
+        unique_faces, inverse_indices, counts = np.unique(
+            all_faces_sorted, axis=0, return_inverse=True, return_counts=True
+        )
+
+        # Boundary faces appear once, interior faces appear twice
+        boundary_mask = counts == 1
+        interior_mask = counts == 2
+
+        # Map back to original face list
+        is_boundary = boundary_mask[inverse_indices]
+        is_interior = interior_mask[inverse_indices]
+
+        # Extract interior faces (use original unsorted order)
+        interior_triangles = all_faces[is_interior]
+
+        num_boundary = is_boundary.sum()
+        num_interior = is_interior.sum()
+
+        print(f"  Boundary faces: {num_boundary:,}")
+        print(f"  Interior faces: {num_interior:,}")
+
+        # Step 3: Create duplicated surface vertices and triangles
+        num_original_verts = len(self.vertices)
+        num_surface_verts = len(self.original_surface_mesh.vertices)
+
+        surface_vertices = self.original_surface_mesh.vertices.copy()
+        surface_normals = self.original_surface_mesh.normals.copy()
+
+        # Offset surface triangle indices
+        vertex_offset = num_original_verts
+        surface_triangles = self.original_surface_mesh.indices + vertex_offset
+
+        # Step 4: Combine everything using NumPy vstack/concatenate
+        all_vertices = np.vstack([self.vertices, surface_vertices]).astype(np.float32)
+        all_indices = np.vstack([interior_triangles, surface_triangles]).astype(np.uint32)
+
+        # Step 5: Compute normals
+        print(f"  Computing normals for interior vertices...")
+        normals = np.zeros((len(all_vertices), 3), dtype=np.float32)
+
+        # Compute normals for interior triangles only
+        if len(interior_triangles) > 0:
+            interior_normals = _compute_normals_taichi(self.vertices, interior_triangles.astype(np.uint32))
+            normals[:num_original_verts] = interior_normals
+
+        # Copy smooth normals for duplicated surface vertices
+        normals[vertex_offset:] = surface_normals
+
+        # Create final mesh
+        mesh = MeshInstance(
+            name=f"{self.name}_hybrid",
+            path=self.path,
+            vertices=all_vertices,
+            indices=all_indices,
+            normals=normals,
+            texcoords=np.zeros((len(all_vertices), 2), dtype=np.float32)
+        )
+
+        print(f"Created hybrid mesh:")
+        print(f"  Total vertices: {len(all_vertices):,} (original: {num_original_verts:,}, duplicated surface: {num_surface_verts:,})")
+        print(f"  Total triangles: {len(all_indices):,} (interior: {len(interior_triangles):,}, surface: {len(surface_triangles):,})")
+
         return mesh
 
 class MeshLib(object):
@@ -203,8 +311,8 @@ class MeshLib(object):
         # 1. Load surface mesh using existing build()
         surface_mesh = cls.build(name, surface_mesh_path)
 
-        # 2. Generate tetrahedral mesh
-        tet_mesh = generate_tetrahedral_mesh(surface_mesh)
+        # 2. Generate tetrahedral mesh (passing original surface mesh for normal preservation)
+        tet_mesh = generate_tetrahedral_mesh(surface_mesh, preserve_surface_mesh=True)
 
         # 3. Store and return
         return tet_mesh
@@ -212,9 +320,9 @@ class MeshLib(object):
 
 # Taichi GPU-accelerated normal computation
 @ti.kernel
-def _compute_normals_kernel(vertices: ti.types.ndarray(), indices: ti.types.ndarray(), normals: ti.types.ndarray()):
+def _accumulate_normals_kernel(vertices: ti.types.ndarray(), indices: ti.types.ndarray(), normals: ti.types.ndarray()):
     """
-    Taichi kernel to compute face normals in parallel on GPU
+    Taichi kernel to accumulate face normals for each vertex (parallel on GPU)
     """
     for tri_idx in range(indices.shape[0]):
         # Get vertex indices
@@ -231,42 +339,59 @@ def _compute_normals_kernel(vertices: ti.types.ndarray(), indices: ti.types.ndar
         edge1 = p1 - p0
         edge2 = p2 - p0
 
-        # Compute cross product (face normal)
+        # Compute cross product (face normal, not normalized yet)
         normal = edge1.cross(edge2)
 
-        # Normalize
+        # Accumulate (add) to all 3 vertices using atomic operations
+        # This averages normals across all triangles sharing a vertex
+        ti.atomic_add(normals[v0, 0], normal[0])
+        ti.atomic_add(normals[v0, 1], normal[1])
+        ti.atomic_add(normals[v0, 2], normal[2])
+
+        ti.atomic_add(normals[v1, 0], normal[0])
+        ti.atomic_add(normals[v1, 1], normal[1])
+        ti.atomic_add(normals[v1, 2], normal[2])
+
+        ti.atomic_add(normals[v2, 0], normal[0])
+        ti.atomic_add(normals[v2, 1], normal[1])
+        ti.atomic_add(normals[v2, 2], normal[2])
+
+
+@ti.kernel
+def _normalize_normals_kernel(normals: ti.types.ndarray()):
+    """
+    Taichi kernel to normalize accumulated normals (parallel on GPU)
+    """
+    for i in range(normals.shape[0]):
+        normal = ti.Vector([normals[i, 0], normals[i, 1], normals[i, 2]])
         length = normal.norm()
         if length > 1e-6:
             normal = normal / length
-
-        # Assign to all 3 vertices
-        normals[v0, 0] = normal[0]
-        normals[v0, 1] = normal[1]
-        normals[v0, 2] = normal[2]
-
-        normals[v1, 0] = normal[0]
-        normals[v1, 1] = normal[1]
-        normals[v1, 2] = normal[2]
-
-        normals[v2, 0] = normal[0]
-        normals[v2, 1] = normal[1]
-        normals[v2, 2] = normal[2]
+            normals[i, 0] = normal[0]
+            normals[i, 1] = normal[1]
+            normals[i, 2] = normal[2]
 
 
 def _compute_normals_taichi(vertices: np.ndarray, indices: np.ndarray) -> np.ndarray:
     """
-    Compute normals using Taichi GPU acceleration (wrapper function)
+    Compute smooth vertex normals using Taichi GPU acceleration
+
+    Averages face normals for all triangles sharing each vertex,
+    resulting in smooth shading.
 
     Args:
         vertices: (N, 3) array of vertex positions
         indices: (M, 3) array of triangle indices
 
     Returns:
-        (N, 3) array of vertex normals
+        (N, 3) array of averaged vertex normals
     """
     normals = np.zeros_like(vertices, dtype=np.float32)
 
-    # Call Taichi kernel (runs on GPU)
-    _compute_normals_kernel(vertices, indices, normals)
+    # Step 1: Accumulate face normals for each vertex (GPU parallel)
+    _accumulate_normals_kernel(vertices, indices, normals)
+
+    # Step 2: Normalize the accumulated normals (GPU parallel)
+    _normalize_normals_kernel(normals)
 
     return normals

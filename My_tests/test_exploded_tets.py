@@ -1,12 +1,11 @@
 """
-Tetrahedral Mesh Exploded View Test
+Tetrahedral Mesh Exploded View with Hybrid Normals
 
-This example demonstrates tetrahedral mesh generation and visualization
-by creating an "exploded view" where each tetrahedron is moved away from
-the center, making the internal structure visible.
+Demonstrates exploded tetrahedral mesh visualization with hybrid normals:
+- Smooth normals on boundary faces (natural surface shading)
+- Flat normals on interior faces (clear tetrahedron visibility)
 
-This verifies that tetrahedralization is working correctly by showing
-all tetrahedra as individual rendered objects.
+This creates a visually appealing exploded view with optimal lighting.
 """
 
 from pyGandalf.core.application import Application
@@ -60,19 +59,20 @@ def main():
     # Build materials
     OpenGLMaterialLib().build('M_Exploded', MaterialData('default_mesh', ['white_texture'], glm.vec4(0.3, 0.7, 0.9, 1.0), 1.0))
 
-    print("="*60)
-    print("TETRAHEDRAL MESH EXPLODED VIEW TEST")
-    print("="*60)
+    print("="*80)
+    print("EXPLODED TETRAHEDRAL MESH WITH HYBRID NORMALS")
+    print("="*80)
 
     # Generate tetrahedral mesh
     print("\n[1/3] Generating tetrahedral mesh...")
-    tet_mesh = MeshLib().build_tetrahedral('bunny_tet', MODELS_PATH / 'bunny.obj')
+    tet_mesh = MeshLib().build_tetrahedral('bunny_tet', MODELS_PATH / 'bunny.usdc')
     print(f"      Generated {len(tet_mesh.tetrahedra):,} tetrahedra from {len(tet_mesh.vertices):,} vertices")
 
-    # Create exploded view
-    print("\n[2/3] Creating exploded view...")
-    print("      Each tetrahedron will be moved away from center for visualization")
-    exploded_mesh = explode_tetrahedral_mesh(tet_mesh, explosion_factor=0.3)
+    # Create exploded view with hybrid normals
+    print("\n[2/3] Creating exploded view with hybrid normals...")
+    print("      - Smooth surface shading on boundary faces")
+    print("      - Flat shading on interior faces for clarity")
+    exploded_mesh = explode_tetrahedral_mesh(tet_mesh, explosion_factor=0.3, use_hybrid_normals=True)
     print(f"      Exploded mesh: {len(exploded_mesh.vertices):,} vertices, {len(exploded_mesh.indices):,} triangles")
 
     # Register the exploded mesh with MeshLib so it can be used by StaticMeshComponent
@@ -117,13 +117,15 @@ def main():
 
     # Start application
     print("\n[3/3] Starting pyGandalf renderer...")
-    print("="*60)
-    print("VISUALIZATION:")
-    print("  - Each tetrahedron is visible as 4 triangular faces")
-    print("  - Gaps between tetrahedra show the exploded structure")
-    print("  - Use mouse to rotate and zoom to inspect internal structure")
-    print("  - This verifies all tetrahedra are present and correctly generated")
-    print("="*60)
+    print("="*80)
+    print("VISUALIZATION - HYBRID NORMALS:")
+    print("  - Smooth lighting on outer surface (like original mesh)")
+    print("  - Clear flat shading on interior tetrahedra")
+    print("  - No lighting artifacts from normal averaging")
+    print("  - Gaps between tetrahedra show exploded structure")
+    print()
+    print("Use mouse to rotate and inspect the quality of the hybrid lighting")
+    print("="*80)
 
     Application().start()
 

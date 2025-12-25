@@ -17,12 +17,13 @@ if TYPE_CHECKING:
 ti.init(arch=ti.gpu)  # Change to ti.cpu if you don't have a GPU
 
 
-def generate_tetrahedral_mesh(surface_mesh: 'MeshInstance') -> 'TetrahedralMeshInstance':
+def generate_tetrahedral_mesh(surface_mesh: 'MeshInstance', preserve_surface_mesh: bool = False) -> 'TetrahedralMeshInstance':
     """
     Convert a surface mesh into a tetrahedral mesh using TetGen library.
 
     Args:
         surface_mesh: Input surface mesh (triangular faces)
+        preserve_surface_mesh: If True, stores original mesh for normal preservation
 
     Returns:
         TetrahedralMeshInstance: Generated tetrahedral mesh
@@ -62,7 +63,8 @@ def generate_tetrahedral_mesh(surface_mesh: 'MeshInstance') -> 'TetrahedralMeshI
         name=f"{surface_mesh.name}_tet",
         path=surface_mesh.path,
         vertices=tg.node.astype(np.float32),
-        tetrahedra=tg.elem.astype(np.int32)
+        tetrahedra=tg.elem.astype(np.int32),
+        original_surface_mesh=surface_mesh if preserve_surface_mesh else None
     )
 
 
