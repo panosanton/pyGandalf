@@ -54,7 +54,7 @@ def generate_tetrahedral_mesh(surface_mesh: 'MeshInstance', preserve_surface_mes
     # 'pq1.2' = quality ratio 1.2 (~700k tets, best quality)
     # Higher ratio = fewer tets, lower quality (fine for spring-mass simulation)
     print("  Running TetGen algorithm...")
-    tg.tetrahedralize(switches='p')
+    tg.tetrahedralize(switches='pq2.0')
 
     print(f"  Generated vertices: {len(tg.node)}")
     print(f"  Generated tetrahedra: {len(tg.elem)}")

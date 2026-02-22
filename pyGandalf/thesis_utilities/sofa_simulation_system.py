@@ -4,11 +4,17 @@ SOFA Simulation System
 Integrates SOFA physics simulation with pyGandalf's rendering pipeline.
 Each frame: SOFA steps the spring-mass simulation, new vertex positions are read back
 and uploaded to the GPU via glBufferSubData.
+
+Press C to perform a cut along the plane defined in SofaSimulationComponent.
 """
 
 import OpenGL.GL as gl
 import numpy as np
+import ctypes
 import time
+
+import glfw
+from pyGandalf.core.input_manager import InputManager
 
 from pyGandalf.systems.system import System
 from pyGandalf.scene.components import Component, StaticMeshComponent
@@ -29,7 +35,7 @@ class SofaSimulationComponent(Component):
             tet_mesh:    TetrahedralMeshInstance to simulate.
             time_step:   SOFA simulation timestep in seconds.
                          Explicit integration requires small steps (~0.001) for stability.
-            gravity:     Gravity vector, defaults to [0, -9.81, 0].
+            gravity:     Gravity vector, defaults to [0, 0, 0] (no gravity).
             stiffness:   Spring stiffness along tetrahedral edges.
             damping:     Spring damping (higher = less oscillation).
             total_mass:  Total mass of the object (kg).
@@ -37,26 +43,30 @@ class SofaSimulationComponent(Component):
         super().__init__()
         self.tet_mesh = tet_mesh
         self.time_step = time_step
-        self.gravity = gravity if gravity is not None else [0, -9.81, 0]
+        self.gravity = gravity if gravity is not None else [0, 0, 0]
         self.stiffness = stiffness
         self.damping = damping
         self.total_mass = total_mass
 
         # Populated by SofaSimulationSystem.on_create_entity
         self.sofa_root = None
-        self.mechanical_object = None  # Reference to SOFA MechanicalObject (source of positions)
-        self.surface_indices = None    # uint32 (N_faces, 3) — used for normal recomputation
+        self.mechanical_object = None   # MechanicalObject (source of positions)
+        self.surface_indices = None     # uint32 (N_faces, 3) — boundary faces
+        self.current_tetrahedra = None  # Python-side tet array, shrinks on each cut
 
-        # Cutting control (used in Task 2)
+        # Cutting control: set should_cut=True to trigger a cut next frame.
+        # cut_plane_origin / cut_plane_normal define the cutting plane.
         self.should_cut = False
         self.cut_plane_origin = [0.0, 0.0, 0.0]
-        self.cut_plane_normal = [1.0, 0.0, 0.0]
+        self.cut_plane_normal = [0.0, 1.0, 0.0]   # horizontal cut by default
 
 
 class SofaSimulationSystem(System):
     """
     Drives a SOFA spring-mass simulation and uploads deformed vertex positions
     to the GPU each frame.
+
+    Press C to perform a cut along SofaSimulationComponent.cut_plane_*.
 
     Requires entities with both SofaSimulationComponent and StaticMeshComponent.
     The StaticMeshComponent must be initialised with attributes and indices directly
@@ -77,7 +87,6 @@ class SofaSimulationSystem(System):
 
         # Store surface indices on the component so on_update_entity can
         # recompute normals without re-extracting them every frame.
-        # Pass vertices so winding order can be corrected (outward normals).
         sofa_comp.surface_indices = _extract_boundary_faces(tet_mesh.tetrahedra, tet_mesh.vertices)
 
         # Fix the bottom 5% of vertices so the object doesn't fall indefinitely.
@@ -90,10 +99,8 @@ class SofaSimulationSystem(System):
         root.gravity.value = sofa_comp.gravity
         root.dt.value = sofa_comp.time_step
 
-        # Since SOFA v22.06, components were reorganised into separate plugins
-        # that must be explicitly loaded before they can be used.
-        # Spring model uses EulerExplicitSolver — no linear solver needed.
-        root.addObject('RequiredPlugin', name='Sofa.Component.ODESolver.Forward')
+        root.addObject('RequiredPlugin', name='Sofa.Component.ODESolver.Backward')
+        root.addObject('RequiredPlugin', name='Sofa.Component.LinearSolver.Iterative')
         root.addObject('RequiredPlugin', name='Sofa.Component.Topology.Container.Dynamic')
         root.addObject('RequiredPlugin', name='Sofa.Component.StateContainer')
         root.addObject('RequiredPlugin', name='Sofa.Component.SolidMechanics.Spring')
@@ -104,22 +111,17 @@ class SofaSimulationSystem(System):
         root.addObject('DefaultAnimationLoop')
 
         obj = root.addChild('Object')
-        # Explicit integration: no linear system to solve — much faster than FEM.
-        # Requires a small timestep (~0.001s) to remain stable.
-        obj.addObject('EulerExplicitSolver')
+        obj.addObject('EulerImplicitSolver', rayleighStiffness=0.01, rayleighMass=0.01)
+        obj.addObject('CGLinearSolver', iterations=25, tolerance=1e-9, threshold=1e-9)
 
         obj.addObject('TetrahedronSetTopologyContainer',
                       points=tet_mesh.vertices.tolist(),
                       tetrahedra=tet_mesh.tetrahedra.tolist())
         obj.addObject('TetrahedronSetTopologyModifier')
 
-        # Explicitly pass position= so SOFA initialises the DOFs from the tet
-        # mesh vertices rather than relying on implicit topology inheritance
-        # (which is version-dependent and not guaranteed).
         mech = obj.addObject('MechanicalObject', name='dofs', template='Vec3d',
                              position=tet_mesh.vertices.tolist())
 
-        # Spring forces computed per-edge — O(edges) instead of O(N^1.5) for FEM solve.
         obj.addObject('MeshSpringForceField',
                       stiffness=sofa_comp.stiffness,
                       damping=sofa_comp.damping)
@@ -133,8 +135,8 @@ class SofaSimulationSystem(System):
 
         sofa_comp.sofa_root = root
         sofa_comp.mechanical_object = mech
+        sofa_comp.current_tetrahedra = tet_mesh.tetrahedra.copy()
 
-        # Verify SOFA received the correct positions after init.
         sofa_pos = np.array(mech.position.value, dtype=np.float32)
         orig = tet_mesh.vertices
         print(f"[SofaSimulationSystem] Scene initialized:")
@@ -142,15 +144,9 @@ class SofaSimulationSystem(System):
         print(f"  Tetrahedra:     {len(tet_mesh.tetrahedra):,}")
         print(f"  Surface faces:  {len(sofa_comp.surface_indices):,}")
         print(f"  Fixed vertices: {len(fixed_indices)}")
-        print(f"  Original bbox   X[{orig[:,0].min():.4f}, {orig[:,0].max():.4f}]"
-              f"  Y[{orig[:,1].min():.4f}, {orig[:,1].max():.4f}]"
-              f"  Z[{orig[:,2].min():.4f}, {orig[:,2].max():.4f}]")
+        print(f"  Press C to cut along the horizontal plane at y=0")
         if len(sofa_pos) == 0:
             print("  [WARNING] SOFA MechanicalObject returned ZERO positions after init!")
-        else:
-            print(f"  SOFA init bbox  X[{sofa_pos[:,0].min():.4f}, {sofa_pos[:,0].max():.4f}]"
-                  f"  Y[{sofa_pos[:,1].min():.4f}, {sofa_pos[:,1].max():.4f}]"
-                  f"  Z[{sofa_pos[:,2].min():.4f}, {sofa_pos[:,2].max():.4f}]")
 
     def on_update_entity(self, ts: float, entity, components):
         sofa_comp: SofaSimulationComponent
@@ -167,12 +163,22 @@ class SofaSimulationSystem(System):
 
         import Sofa
 
+        # --- One-shot cut detection (C key, rising edge only) ---
+        c_now = InputManager().get_key_down(glfw.KEY_C)
+        if c_now and not getattr(self, '_c_was_pressed', False):
+            sofa_comp.should_cut = True
+        self._c_was_pressed = c_now
+
+        if sofa_comp.should_cut:
+            sofa_comp.should_cut = False
+            _perform_cut(sofa_comp, mesh_comp)
+
         # --- SOFA simulation step ---
         t0 = time.perf_counter()
         Sofa.Simulation.animate(sofa_comp.sofa_root, sofa_comp.time_step)
         t1 = time.perf_counter()
 
-        # --- Read positions back from SOFA (Vec3d → float64 → float32) ---
+        # --- Read positions back from SOFA ---
         new_positions = np.array(sofa_comp.mechanical_object.position.value, dtype=np.float32)
         t2 = time.perf_counter()
 
@@ -189,14 +195,7 @@ class SofaSimulationSystem(System):
             self._frame_count = 0
         self._frame_count += 1
 
-        # On frame 1, dump the position bbox to confirm SOFA is returning good values.
-        if self._frame_count == 1:
-            print(f"[Frame 1] SOFA positions bbox:"
-                  f"  X[{new_positions[:,0].min():.4f}, {new_positions[:,0].max():.4f}]"
-                  f"  Y[{new_positions[:,1].min():.4f}, {new_positions[:,1].max():.4f}]"
-                  f"  Z[{new_positions[:,2].min():.4f}, {new_positions[:,2].max():.4f}]")
-
-        if self._frame_count % 20 == 0:
+        if self._frame_count % 60 == 0:
             print(
                 f"[Frame {self._frame_count:4d}] "
                 f"SOFA: {(t1-t0)*1000:7.1f}ms | "
@@ -210,6 +209,77 @@ class SofaSimulationSystem(System):
 # ---------------------------------------------------------------------------
 # Module-level helpers (also imported by test files for mesh preparation)
 # ---------------------------------------------------------------------------
+
+def _perform_cut(sofa_comp: SofaSimulationComponent, mesh_comp: StaticMeshComponent):
+    """
+    Remove all tetrahedra that straddle or sit above the cutting plane.
+
+    The cut is performed entirely in Python against sofa_comp.current_tetrahedra
+    (SOFA's Python bindings do not expose topology modifier methods directly).
+    SOFA continues simulating the full mesh for dynamics; only the rendered
+    surface is updated here.
+    """
+    current_tets = sofa_comp.current_tetrahedra
+    if current_tets is None or len(current_tets) == 0:
+        print("[Cut] No tetrahedra remaining.")
+        return
+
+    positions = np.array(sofa_comp.mechanical_object.position.value, dtype=np.float32)
+
+    origin = np.array(sofa_comp.cut_plane_origin, dtype=np.float32)
+    normal = np.array(sofa_comp.cut_plane_normal, dtype=np.float32)
+    normal /= np.linalg.norm(normal)
+
+    # Signed distance of each vertex from the plane (positive = above).
+    signed_dist = (positions - origin) @ normal  # (N_verts,)
+
+    # For each tet collect the signed distances of its 4 vertices.
+    tet_dists = signed_dist[current_tets]  # (N_tets, 4)
+
+    any_above = np.any(tet_dists > 0, axis=1)
+    any_below = np.any(tet_dists < 0, axis=1)
+
+    # Keep only tets with NO vertex above the plane.
+    keep_mask = ~any_above
+
+    n_removed = int((~keep_mask).sum())
+    if n_removed == 0:
+        print("[Cut] No tetrahedra are above the cutting plane.")
+        return
+
+    print(f"[Cut] Removing {n_removed:,} / {len(current_tets):,} tetrahedra...")
+    new_tets = current_tets[keep_mask]
+    sofa_comp.current_tetrahedra = new_tets
+    print(f"[Cut] Remaining tetrahedra: {len(new_tets):,}")
+
+    if len(new_tets) == 0:
+        print("[Cut] All tetrahedra removed — nothing to render.")
+        return
+
+    # Re-extract boundary faces from the surviving tetrahedra.
+    new_surface = _extract_boundary_faces(new_tets, positions)
+    sofa_comp.surface_indices = new_surface
+    print(f"[Cut] New surface triangles: {len(new_surface):,}")
+
+    new_normals = _compute_normals(positions, new_surface)
+
+    # Update the EBO — size changes so glBufferData (full reallocation) is required.
+    flat_indices = new_surface.flatten().astype(np.uint32)
+    mesh_comp.indices = new_surface  # .size drives the draw_indexed call count
+
+    gl.glBindVertexArray(mesh_comp.render_pipeline)
+    gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, mesh_comp.index_buffer)
+    gl.glBufferData(
+        gl.GL_ELEMENT_ARRAY_BUFFER,
+        flat_indices.nbytes,
+        flat_indices.ctypes.data_as(ctypes.POINTER(gl.GLuint)),
+        gl.GL_DYNAMIC_DRAW,
+    )
+    gl.glBindVertexArray(0)
+
+    _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[1], new_normals)
+    print("[Cut] GPU buffers updated.")
+
 
 def _extract_boundary_faces(tetrahedra: np.ndarray,
                             vertices: np.ndarray = None) -> np.ndarray:
@@ -240,19 +310,14 @@ def _extract_boundary_faces(tetrahedra: np.ndarray,
     boundary_faces = all_faces[is_boundary].copy()
 
     if vertices is not None:
-        # For each boundary face use the 4th vertex of its own tetrahedron as
-        # the interior reference — this vertex is always on the inside regardless
-        # of mesh concavity (ears, underside, etc.).  The centroid approach fails
-        # for concave regions and causes holes due to incorrect backface culling.
-        boundary_positions = np.where(is_boundary)[0]   # index into all_faces
-        tet_indices        = boundary_positions // 4     # which tet owns this face
+        boundary_positions = np.where(is_boundary)[0]
+        tet_indices        = boundary_positions // 4
 
-        face_verts = all_faces[boundary_positions]       # (M, 3) vertex indices
-        tet_verts  = tetrahedra[tet_indices]             # (M, 4) vertex indices
+        face_verts = all_faces[boundary_positions]
+        tet_verts  = tetrahedra[tet_indices]
 
-        # Find the one vertex in each tet that is NOT in the face.
         in_face = (tet_verts[:, :, np.newaxis] == face_verts[:, np.newaxis, :]).any(axis=2)
-        fourth_vertex_idx = tet_verts[~in_face].reshape(-1)   # (M,)
+        fourth_vertex_idx = tet_verts[~in_face].reshape(-1)
 
         v0     = vertices[boundary_faces[:, 0]]
         v1     = vertices[boundary_faces[:, 1]]
@@ -260,9 +325,9 @@ def _extract_boundary_faces(tetrahedra: np.ndarray,
         fourth = vertices[fourth_vertex_idx]
 
         face_normals = np.cross(v1 - v0, v2 - v0)
-        to_fourth    = fourth - (v0 + v1 + v2) / 3.0   # face-centre → 4th vertex (inward)
+        to_fourth    = fourth - (v0 + v1 + v2) / 3.0
         dot          = np.einsum('ij,ij->i', face_normals, to_fourth)
-        inward       = dot > 0   # normal points toward inside → flip
+        inward       = dot > 0
         boundary_faces[inward] = boundary_faces[inward][:, [0, 2, 1]]
         print(f"[_extract_boundary_faces] Flipped {inward.sum():,} / {len(boundary_faces):,} "
               f"faces to ensure outward winding.")

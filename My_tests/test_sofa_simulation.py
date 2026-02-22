@@ -1,12 +1,13 @@
 """
 SOFA Physics Simulation Test
 
-Loads the bunny tetrahedral mesh, hands it to SOFA for FEM simulation,
+Loads a tetrahedral sphere mesh, hands it to SOFA for spring-mass simulation,
 and renders the deforming surface in pyGandalf each frame.
 
 Controls:
-    Mouse - rotate camera
+    Mouse (right-click drag) - rotate camera
     WASD  - move camera
+    C     - cut the mesh along the horizontal plane at y=0
     Close window to exit
 """
 
@@ -70,7 +71,7 @@ def main():
     # --- Tetrahedral mesh ---
     print("="*50)
     print("Generating tetrahedral mesh...")
-    tet_mesh = MeshLib().build_tetrahedral('bunny_tet', MODELS_PATH / 'bunny.obj')  # only TetGen-compatible bunny we have
+    tet_mesh = MeshLib().build_tetrahedral('sphere_tet', MODELS_PATH / 'sphere.obj')
     print(f"  Vertices:   {len(tet_mesh.vertices):,}")
     print(f"  Tetrahedra: {len(tet_mesh.tetrahedra):,}")
 
@@ -100,14 +101,17 @@ def main():
         indices=surface_indices,
     ))
     scene.add_component(bunny, MaterialComponent('M_Bunny'))
-    scene.add_component(bunny, SofaSimulationComponent(
+    sofa_comp = SofaSimulationComponent(
         tet_mesh,
         time_step=0.001,
-        stiffness=10.0,
-        damping=1.0,
-        total_mass=1.0,
-        gravity=[0, 0, 0],   # zero gravity — confirm mesh is stable first
-    ))
+        stiffness=100.0,
+        damping=0.5,
+        total_mass=50.0,
+        gravity=[0, 0, 0],
+    )
+    sofa_comp.cut_plane_origin = [0.0, 0.0, 0.0]   # cut through centre of sphere
+    sofa_comp.cut_plane_normal = [0.0, 1.0, 0.0]   # horizontal cut (Y axis)
+    scene.add_component(bunny, sofa_comp)
 
     scene.add_component(light, InfoComponent('light'))
     scene.add_component(light, TransformComponent(glm.vec3(0, 5, 0), glm.vec3(0, 0, 0), glm.vec3(1, 1, 1)))
@@ -115,7 +119,7 @@ def main():
     scene.add_component(light, LightComponent(glm.vec3(1.0, 1.0, 1.0), 0.75))
 
     scene.add_component(camera, InfoComponent('camera'))
-    scene.add_component(camera, TransformComponent(glm.vec3(-0.25, 2, 5), glm.vec3(-15, 0, 0), glm.vec3(1, 1, 1)))
+    scene.add_component(camera, TransformComponent(glm.vec3(0, 0, 5), glm.vec3(0, 0, 0), glm.vec3(1, 1, 1)))
     scene.add_component(camera, LinkComponent(root))
     scene.add_component(camera, CameraComponent(45, 1.778, 0.1, 1000, 1.2, CameraComponent.Type.PERSPECTIVE))
     scene.add_component(camera, CameraControllerComponent())
