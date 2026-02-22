@@ -44,14 +44,17 @@ def generate_tetrahedral_mesh(surface_mesh: 'MeshInstance', preserve_surface_mes
     print(f"  Input vertices: {len(surface_mesh.vertices)}")
     print(f"  Input triangles: {len(surface_mesh.indices)}")
 
-    # Create TetGen object with surface mesh
+    # Pass raw vertices/faces directly — the original bunny.obj worked this way.
+    # Trimesh repair was tested but caused TetGen failures on decimated meshes.
     tg = tetgen.TetGen(surface_mesh.vertices, surface_mesh.indices)
 
     # Generate tetrahedral mesh
-    # 'pq1.2' = preserve surface, quality ratio 1.2 (good quality)
-    # 'a0.01' = maximum tet volume (smaller = more tets, higher quality)
+    # 'p'     = preserve surface only, no quality refinement (minimum tets)
+    # 'pq2.0' = quality ratio 2.0 (~370k tets on bunny.obj)
+    # 'pq1.2' = quality ratio 1.2 (~700k tets, best quality)
+    # Higher ratio = fewer tets, lower quality (fine for spring-mass simulation)
     print("  Running TetGen algorithm...")
-    tg.tetrahedralize(switches='pq1.2')
+    tg.tetrahedralize(switches='p')
 
     print(f"  Generated vertices: {len(tg.node)}")
     print(f"  Generated tetrahedra: {len(tg.elem)}")

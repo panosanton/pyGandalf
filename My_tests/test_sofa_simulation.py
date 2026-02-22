@@ -70,7 +70,7 @@ def main():
     # --- Tetrahedral mesh ---
     print("="*50)
     print("Generating tetrahedral mesh...")
-    tet_mesh = MeshLib().build_tetrahedral('bunny_tet', MODELS_PATH / 'bunny.obj')
+    tet_mesh = MeshLib().build_tetrahedral('bunny_tet', MODELS_PATH / 'bunny.obj')  # only TetGen-compatible bunny we have
     print(f"  Vertices:   {len(tet_mesh.vertices):,}")
     print(f"  Tetrahedra: {len(tet_mesh.tetrahedra):,}")
 
@@ -78,7 +78,7 @@ def main():
     # The VBO holds ALL tet vertices. Only boundary faces are drawn.
     # SOFA updates positions in-place, so VBO vertex count never changes.
     print("Extracting surface faces...")
-    surface_indices  = _extract_boundary_faces(tet_mesh.tetrahedra)
+    surface_indices  = _extract_boundary_faces(tet_mesh.tetrahedra, tet_mesh.vertices)
     initial_normals  = _compute_normals(tet_mesh.vertices, surface_indices)
     texcoords        = np.zeros((len(tet_mesh.vertices), 2), dtype=np.float32)
     print(f"  Surface triangles: {len(surface_indices):,}")
@@ -102,10 +102,11 @@ def main():
     scene.add_component(bunny, MaterialComponent('M_Bunny'))
     scene.add_component(bunny, SofaSimulationComponent(
         tet_mesh,
-        time_step=0.01,
-        young_modulus=5000.0,
-        poisson_ratio=0.45,
+        time_step=0.001,
+        stiffness=10.0,
+        damping=1.0,
         total_mass=1.0,
+        gravity=[0, 0, 0],   # zero gravity — confirm mesh is stable first
     ))
 
     scene.add_component(light, InfoComponent('light'))
