@@ -60,19 +60,13 @@ def main():
     tet_mesh = MeshLib().build_tetrahedral('bunny_tet', MODELS_PATH / 'bunny.usdc')
     print(f"Generated {len(tet_mesh.tetrahedra):,} tetrahedra")
 
-    # Extract all faces using hybrid rendering (smooth surface + interior structure)
-    print("\nExtracting tetrahedral faces with hybrid normals...")
-    print("(Smooth surface shading + visible interior structure)")
-    tet_faces_mesh = tet_mesh.extract_interior_and_surface_hybrid()
+    # Extract the outer surface for rendering
+    print("\nExtracting surface mesh from tetrahedra...")
+    tet_faces_mesh = tet_mesh.extract_surface()
 
     # Register the mesh with MeshLib so it can be used for rendering
     MeshLib().instance.meshes['tet_faces'] = tet_faces_mesh
     MeshLib().instance.meshes_names['tet_faces'] = 'tet_faces'
-
-    print("\nUsing hybrid rendering:")
-    print("  - Surface: smooth normals (natural shading)")
-    print("  - Interior: visible tetrahedral structure")
-    print("  - No boundary face overlap (clean rendering)")
 
     # Register components to root
     scene.add_component(root, TransformComponent(glm.vec3(0, 0, 0), glm.vec3(0, 0, 0), glm.vec3(1, 1, 1)))

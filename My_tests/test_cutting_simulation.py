@@ -1,12 +1,8 @@
 """
-SOFA FEM Simulation Test
+Taichi Spring-Mass Simulation Test
 
-Loads a tetrahedral sphere mesh and runs SOFA's corotational FEM simulation,
-rendering the deforming surface in pyGandalf each frame.
-
-Physics uses TetrahedralCorotationalFEMForceField which is physically more
-accurate than the earlier spring-mass model: it preserves volume correctly
-and uses standard material parameters (Young's modulus, Poisson ratio).
+Loads a tetrahedral sphere mesh and runs a GPU-accelerated spring-mass
+simulation in Taichi, rendering the deforming surface in pyGandalf each frame.
 
 Controls:
     Mouse (right-click drag) - rotate camera
@@ -39,9 +35,9 @@ from pyGandalf.utilities.mesh_lib import MeshLib
 from pyGandalf.utilities.definitions import SHADERS_PATH, MODELS_PATH
 from pyGandalf.utilities.logger import logger
 
-from pyGandalf.thesis_utilities.sofa_simulation_system import (
-    SofaSimulationComponent,
-    SofaSimulationSystem,
+from pyGandalf.thesis_utilities.taichi_simulation_system import (
+    TaichiSimulationComponent,
+    TaichiSimulationSystem,
     _extract_boundary_faces,
     _compute_normals,
 )
@@ -53,9 +49,9 @@ import glm
 def main():
     logger.setLevel(logger.INFO)
 
-    Application().create(OpenGLWindow('SOFA FEM Simulation - Bunny', 1280, 720, True), OpenGLRenderer)
+    Application().create(OpenGLWindow('Taichi Spring-Mass Simulation', 1280, 720, True), OpenGLRenderer)
 
-    scene = Scene('SOFA Simulation')
+    scene = Scene('Taichi Simulation')
 
     root   = scene.enroll_entity()
     camera = scene.enroll_entity()
@@ -76,7 +72,7 @@ def main():
     # --- Tetrahedral mesh ---
     print("=" * 50)
     print("Generating tetrahedral mesh...")
-    tet_mesh = MeshLib().build_tetrahedral('bunny_tet', MODELS_PATH / 'bunny.obj')
+    tet_mesh = MeshLib().build_tetrahedral('sphere_tet', MODELS_PATH / 'sphere.obj')
     print(f"  Vertices:   {len(tet_mesh.vertices):,}")
     print(f"  Tetrahedra: {len(tet_mesh.tetrahedra):,}")
 
@@ -103,19 +99,20 @@ def main():
     ))
     scene.add_component(sphere, MaterialComponent('M_Sphere'))
 
-    sofa_comp = SofaSimulationComponent(
+    taichi_comp = TaichiSimulationComponent(
         tet_mesh,
-        time_step     = 0.01,       # implicit solver — stable at larger timesteps
-        young_modulus = 1000.0,     # Pa, very soft — visible deformation on poke/cut
-        poisson_ratio = 0.3,        # standard incompressibility
-        total_mass    = 1.0,        # kg
+        time_step     = 0.005,
+        substeps      = 4,      # sub_dt = 0.00125 s, ~2.8x safety margin below dt_crit
+        stiffness     = 50.0,   # stiff enough to resist poke without self-intersection
+        damping       = 0.5,    # light damping so oscillation lasts several seconds
+        total_mass    = 100.0,  # heavier → slower oscillation, visible at 60fps
         gravity       = [0.0, 0.0, 0.0],
-        use_cuda      = False,      # CudaTetrahedronFEMForceField not in this SOFA build
-        poke_speed    = 2.0,        # m/s downward impulse on F key
+        opening_speed = 2.0,
+        poke_speed    = 2.0,    # m/s applied to top 5% — gives visible but bounded dent
     )
-    sofa_comp.cut_plane_origin = [0.0, 0.0, 0.0]   # cut through sphere centre
-    sofa_comp.cut_plane_normal = [0.0, 1.0, 0.0]   # horizontal cut
-    scene.add_component(sphere, sofa_comp)
+    taichi_comp.cut_plane_origin = [0.0, 0.0, 0.0]  # cut through sphere centre
+    taichi_comp.cut_plane_normal = [0.0, 1.0, 0.0]  # horizontal cut
+    scene.add_component(sphere, taichi_comp)
 
     scene.add_component(light, InfoComponent('light'))
     scene.add_component(light, TransformComponent(glm.vec3(0, 5, 0), glm.vec3(0, 0, 0), glm.vec3(1, 1, 1)))
@@ -129,13 +126,13 @@ def main():
     scene.add_component(camera, CameraControllerComponent())
 
     # --- Systems ---
-    # SofaSimulationSystem must run before OpenGLStaticMeshRenderingSystem
+    # TaichiSimulationSystem must run before OpenGLStaticMeshRenderingSystem
     # so updated positions are in the VBO before the draw call.
     scene.register_system(TransformSystem([TransformComponent]))
     scene.register_system(LinkSystem([LinkComponent, TransformComponent]))
     scene.register_system(CameraSystem([CameraComponent, TransformComponent]))
     scene.register_system(LightSystem([LightComponent, TransformComponent]))
-    scene.register_system(SofaSimulationSystem([SofaSimulationComponent, StaticMeshComponent]))
+    scene.register_system(TaichiSimulationSystem([TaichiSimulationComponent, StaticMeshComponent]))
     scene.register_system(OpenGLStaticMeshRenderingSystem([StaticMeshComponent, MaterialComponent, TransformComponent]))
     scene.register_system(CameraControllerSystem([CameraControllerComponent, CameraComponent, TransformComponent]))
 

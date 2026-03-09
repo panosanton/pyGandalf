@@ -22,13 +22,83 @@ class MeshInstance:
         self.texcoords = texcoords
         
 class TetrahedralMeshInstance:
-    def __init__(self, name, path, vertices, tetrahedra, original_surface_mesh=None):
+    def __init__(self, name, path, vertices, tetrahedra):
         self.name = name
         self.path = path
         self.vertices = vertices        # Nx3 array of vertex positions
         self.tetrahedra = tetrahedra    # Mx4 array of tet indices
-        self.original_surface_mesh = original_surface_mesh  # Store original mesh for normal preservation
-        # Could add more later: boundary faces, vertex markers, etc.
+
+    def extract_surface(self) -> 'MeshInstance':
+        """
+        Extract only the outer surface triangles from the tetrahedral mesh.
+
+        Boundary faces are those that appear in exactly one tetrahedron.
+        Each face's winding order is corrected so normals point outward:
+        the face normal is checked against the opposite vertex of its tet —
+        if it points toward the interior, the winding is flipped.
+
+        Returns:
+            MeshInstance with surface triangles and smooth vertex normals
+        """
+        print(f"Extracting surface from {len(self.tetrahedra):,} tetrahedra...")
+
+        # face_combos[i] are the 3 local indices making up face i of a tet.
+        # opposite[i] is the local index of the vertex NOT in face i.
+        face_combos = np.array([[0,1,2],[0,1,3],[0,2,3],[1,2,3]], dtype=np.int32)
+        opposite    = np.array([3, 2, 1, 0], dtype=np.int32)
+
+        # all_faces[i]    — global vertex indices of face i  (N_tets*4, 3)
+        # all_opposite[i] — global index of the opposite vertex for face i  (N_tets*4,)
+        all_faces    = self.tetrahedra[:, face_combos].reshape(-1, 3)
+        all_opposite = self.tetrahedra[:, opposite].reshape(-1)
+
+        # Find boundary faces (appear in exactly one tet)
+        all_faces_sorted = np.sort(all_faces, axis=1)
+        _, inverse_indices, counts = np.unique(
+            all_faces_sorted, axis=0, return_inverse=True, return_counts=True
+        )
+        is_boundary = counts[inverse_indices] == 1
+
+        surface_faces    = all_faces[is_boundary].copy()     # (M, 3)
+        surface_opposite = all_opposite[is_boundary]         # (M,)
+
+        # Fix winding order: normal must point AWAY from the opposite vertex.
+        v0  = self.vertices[surface_faces[:, 0]]
+        v1  = self.vertices[surface_faces[:, 1]]
+        v2  = self.vertices[surface_faces[:, 2]]
+        opp = self.vertices[surface_opposite]
+
+        face_normal = np.cross(v1 - v0, v2 - v0)           # (M, 3), unnormalised
+        to_interior = opp - v0                               # points into the tet
+
+        # If dot > 0 the normal faces inward — swap two vertices to flip it
+        inward = np.sum(face_normal * to_interior, axis=1) > 0
+        surface_faces[inward] = surface_faces[inward][:, [0, 2, 1]]
+
+        surface_triangles = surface_faces.astype(np.uint32)
+
+        print(f"  Surface faces: {len(surface_triangles):,} ({inward.sum()} windings corrected)")
+        print(f"  Computing normals...")
+        normals = _compute_normals_taichi(self.vertices, surface_triangles)
+
+        return MeshInstance(
+            name=f"{self.name}_surface",
+            path=self.path,
+            vertices=self.vertices,
+            indices=surface_triangles,
+            normals=normals,
+            texcoords=np.zeros((len(self.vertices), 2), dtype=np.float32)
+        )
+
+    # ------------------------------------------------------------------
+    # LEGACY — kept for reference only.
+    # These methods were written to visualise interior tetrahedra by
+    # duplicating surface vertices so each region could have independent
+    # normals.  The duplication made TetGen report non-manifold input
+    # whenever those meshes were reused.  Current rendering uses plain
+    # boundary-face extraction (extract_surface above) with no vertex
+    # duplication.
+    # ------------------------------------------------------------------
 
     def extract_all_faces(self) -> 'MeshInstance':
         """
@@ -304,15 +374,17 @@ class MeshLib(object):
     
         return submeshes, face_vertex_count
     
-    def build_tetrahedral(cls, name: str, surface_mesh_path: Path):
+    def build_tetrahedral(cls, name: str, surface_mesh_path: Path,
+                          target_faces: int = None):
 
         from pyGandalf.thesis_utilities.tet_generator import generate_tetrahedral_mesh
 
         # 1. Load surface mesh using existing build()
         surface_mesh = cls.build(name, surface_mesh_path)
 
-        # 2. Generate tetrahedral mesh (passing original surface mesh for normal preservation)
-        tet_mesh = generate_tetrahedral_mesh(surface_mesh, preserve_surface_mesh=True)
+        # 2. Generate tetrahedral mesh (optionally simplified first)
+        tet_mesh = generate_tetrahedral_mesh(surface_mesh,
+                                             target_faces=target_faces)
 
         # 3. Store and return
         return tet_mesh

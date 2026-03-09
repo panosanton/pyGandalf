@@ -14,7 +14,8 @@ from pathlib import Path
 ti.init(arch=ti.gpu, default_fp=ti.f32)
 
 
-def explode_tetrahedral_mesh(tet_mesh: TetrahedralMeshInstance, explosion_factor: float = 0.3, use_hybrid_normals: bool = True) -> MeshInstance:
+def explode_tetrahedral_mesh(tet_mesh: TetrahedralMeshInstance, explosion_factor: float = 0.3,
+                              use_hybrid_normals: bool = False) -> MeshInstance:
     """
     Create an exploded view of a tetrahedral mesh for visualization.
 
@@ -24,22 +25,15 @@ def explode_tetrahedral_mesh(tet_mesh: TetrahedralMeshInstance, explosion_factor
     Args:
         tet_mesh: Input tetrahedral mesh
         explosion_factor: How far to move tetrahedra (0.0 = no movement, 1.0 = full explosion)
-        use_hybrid_normals: If True and original surface mesh available, uses smooth normals
-                           for boundary faces and flat normals for interior faces
+        use_hybrid_normals: If True, boundary faces get smooth normals (nice outer surface)
+                            and interior faces get flat normals (visible tet structure).
 
     Returns:
         MeshInstance with all tetrahedral faces as triangles
     """
 
-    # Compute model center
     model_center = np.mean(tet_mesh.vertices, axis=0)
 
-    # Each tetrahedron has 4 triangular faces
-    # Face indices for a tetrahedron with vertices [v0, v1, v2, v3]:
-    # Face 0: [v0, v2, v1]  (base, CCW from outside)
-    # Face 1: [v0, v1, v3]  (side)
-    # Face 2: [v0, v3, v2]  (side)
-    # Face 3: [v1, v2, v3]  (top)
     tet_face_indices = np.array([
         [0, 2, 1],  # Base
         [0, 1, 3],  # Side 1
@@ -49,141 +43,98 @@ def explode_tetrahedral_mesh(tet_mesh: TetrahedralMeshInstance, explosion_factor
 
     num_tets = len(tet_mesh.tetrahedra)
 
-    # Step 1: Identify boundary faces if hybrid normals requested
-    boundary_faces_set = None
-    if use_hybrid_normals and tet_mesh.original_surface_mesh is not None:
+    # Pre-identify boundary faces when hybrid normals are requested
+    boundary_face_set = None
+    if use_hybrid_normals:
         print("Identifying boundary faces for hybrid normals...")
-        boundary_faces_set = _identify_boundary_faces(tet_mesh.tetrahedra)
-        print(f"  Found {len(boundary_faces_set):,} boundary faces")
+        boundary_face_set = _identify_boundary_faces(tet_mesh.tetrahedra)
+        print(f"  Found {len(boundary_face_set):,} boundary faces")
 
-    # Pre-allocate arrays for tetrahedral interior faces
+    # Pre-compute all exploded vertex positions on GPU
+    print(f"Exploding {num_tets:,} tetrahedra on GPU...")
+    exploded_all_tets = np.zeros((num_tets, 4, 3), dtype=np.float32)
+    model_center_ti = [model_center[0], model_center[1], model_center[2]]
+    _explode_tetrahedra_kernel(tet_mesh.vertices.astype(np.float32),
+                               tet_mesh.tetrahedra.astype(np.int32),
+                               model_center_ti, explosion_factor, exploded_all_tets)
+
+    print(f"Building face lists for {num_tets:,} tetrahedra...")
+
     tet_vertices_list = []
     tet_triangles_list = []
     tet_vertex_offset = 0
 
-    # Pre-allocate arrays for boundary surface faces (separate geometry)
+    # Separate lists for boundary geometry (only used when use_hybrid_normals=True)
     boundary_vertices_list = []
     boundary_triangles_list = []
+    boundary_orig_indices = []   # original tet vertex index for each boundary vertex
     boundary_vertex_offset = 0
-    boundary_vertex_to_original = []  # Map boundary vertex index -> original tet vertex index
-
-    exploded_to_original_vertex_map = []  # Map exploded vertex index -> original tet vertex index
-
-    # Pre-compute all exploded vertex positions using GPU
-    print(f"Exploding {num_tets:,} tetrahedra on GPU...")
-    exploded_all_tets = np.zeros((num_tets, 4, 3), dtype=np.float32)
-
-    # Convert model_center to Taichi vector
-    model_center_ti = [model_center[0], model_center[1], model_center[2]]
-
-    # Call Taichi kernel to explode all tetrahedra in parallel
-    _explode_tetrahedra_kernel(tet_mesh.vertices.astype(np.float32),
-                               tet_mesh.tetrahedra.astype(np.int32),
-                               model_center_ti,
-                               explosion_factor,
-                               exploded_all_tets)
-
-    print(f"Building face lists for {num_tets:,} tetrahedra...")
 
     for tet_idx, tet in enumerate(tet_mesh.tetrahedra):
         if tet_idx % 100000 == 0 and tet_idx > 0:
             print(f"  Processing tetrahedron {tet_idx:,}/{num_tets:,}...")
 
-        # Get pre-computed exploded vertices for this tetrahedron
         exploded_vertices = exploded_all_tets[tet_idx]
-
-        # Add vertices for this tetrahedron (for interior faces)
         tet_vertices_list.append(exploded_vertices)
 
-        # Track mapping from exploded vertex indices to original tet vertex indices
-        # tet[0], tet[1], tet[2], tet[3] are the original vertex indices in the tetrahedral mesh
-        for local_idx in range(4):
-            exploded_to_original_vertex_map.append(tet[local_idx])
-
-        # Process the 4 faces
         for face_local_indices in tet_face_indices:
-            # Check if this face is a boundary face
-            is_boundary = False
-            if boundary_faces_set is not None:
-                # Get original vertex indices for this face
-                original_face = tuple(sorted([tet[face_local_indices[0]],
-                                             tet[face_local_indices[1]],
-                                             tet[face_local_indices[2]]]))
-                is_boundary = original_face in boundary_faces_set
-
-            if use_hybrid_normals and boundary_faces_set is not None:
-                if is_boundary:
-                    # Boundary face: create separate vertices for this face
-                    face_verts = exploded_vertices[face_local_indices]  # Shape: (3, 3)
+            if boundary_face_set is not None:
+                orig_face = tuple(sorted([tet[face_local_indices[0]],
+                                          tet[face_local_indices[1]],
+                                          tet[face_local_indices[2]]]))
+                if orig_face in boundary_face_set:
+                    # Boundary face: duplicated vertices for independent smooth normals
+                    face_verts = exploded_vertices[face_local_indices]
                     boundary_vertices_list.append(face_verts)
-
-                    # Track which original tet vertices these boundary vertices came from
-                    for local_idx in face_local_indices:
-                        original_tet_vertex_idx = tet[local_idx]
-                        boundary_vertex_to_original.append(original_tet_vertex_idx)
-
-                    # Add triangle using separate boundary vertex indices
-                    triangle = [boundary_vertex_offset, boundary_vertex_offset + 1, boundary_vertex_offset + 2]
-                    boundary_triangles_list.append(triangle)
+                    for li in face_local_indices:
+                        boundary_orig_indices.append(tet[li])
+                    boundary_triangles_list.append([boundary_vertex_offset,
+                                                    boundary_vertex_offset + 1,
+                                                    boundary_vertex_offset + 2])
                     boundary_vertex_offset += 3
-                else:
-                    # Interior face: use shared tetrahedron vertices
-                    triangle = [tet_vertex_offset + face_local_indices[0],
-                               tet_vertex_offset + face_local_indices[1],
-                               tet_vertex_offset + face_local_indices[2]]
-                    tet_triangles_list.append(triangle)
-            else:
-                # Not using hybrid normals - add all faces to tet geometry
-                triangle = [tet_vertex_offset + face_local_indices[0],
-                           tet_vertex_offset + face_local_indices[1],
-                           tet_vertex_offset + face_local_indices[2]]
-                tet_triangles_list.append(triangle)
+                    continue
+
+            # Interior face (or all faces when not using hybrid normals)
+            tet_triangles_list.append([tet_vertex_offset + face_local_indices[0],
+                                       tet_vertex_offset + face_local_indices[1],
+                                       tet_vertex_offset + face_local_indices[2]])
 
         tet_vertex_offset += 4
 
-    # Combine tetrahedral and boundary geometry
-    if use_hybrid_normals and boundary_faces_set is not None and len(boundary_vertices_list) > 0:
-        print("Combining tetrahedral interior and boundary surface geometry...")
-
-        # Combine tet vertices
+    # Combine geometry and compute normals
+    if boundary_face_set is not None and len(boundary_vertices_list) > 0:
         tet_vertices = np.vstack(tet_vertices_list).astype(np.float32)
-        tet_indices = np.array(tet_triangles_list, dtype=np.uint32)
+        tet_indices  = np.array(tet_triangles_list, dtype=np.uint32).reshape(-1, 3)
+        bnd_vertices = np.vstack(boundary_vertices_list).astype(np.float32)
+        bnd_indices  = np.array(boundary_triangles_list, dtype=np.uint32).reshape(-1, 3)
 
-        # Combine boundary vertices
-        boundary_vertices = np.vstack(boundary_vertices_list).astype(np.float32)
-        boundary_indices = np.array(boundary_triangles_list, dtype=np.uint32)
+        print(f"  Interior faces: {len(tet_indices):,}  |  Boundary faces: {len(bnd_indices):,}")
 
-        # Merge both geometries: boundary vertices come after tet vertices
-        # Offset boundary indices to account for tet vertices
-        boundary_indices_offset = boundary_indices + len(tet_vertices)
+        # Flat normals for interior tet structure (shows tet shape clearly)
+        print("Computing flat normals for interior faces on GPU...")
+        tet_normals = np.zeros_like(tet_vertices)
+        _compute_flat_normals_kernel(tet_vertices, tet_indices.astype(np.int32), tet_normals)
 
-        vertices = np.vstack([tet_vertices, boundary_vertices]).astype(np.float32)
-        indices = np.vstack([tet_indices.reshape(-1, 3), boundary_indices_offset.reshape(-1, 3)]).astype(np.uint32)
+        # Smooth normals for boundary surface (nice outer shading)
+        print("Computing smooth normals for boundary faces...")
+        bnd_normals = _compute_boundary_smooth_normals(
+            bnd_vertices, bnd_indices,
+            np.array(boundary_orig_indices, dtype=np.int32),
+            len(tet_mesh.vertices))
 
-        print(f"Created exploded mesh: {len(vertices):,} vertices, {len(indices):,} triangles")
-        print(f"  Tetrahedral interior: {len(tet_vertices):,} vertices, {len(tet_indices)//3:,} triangles")
-        print(f"  Boundary surface: {len(boundary_vertices):,} vertices, {len(boundary_indices):,} triangles")
-
-        # Compute normals
-        print("Computing hybrid normals (smooth boundary + flat interior)...")
-        normals = _compute_hybrid_normals_separate(tet_vertices, tet_indices,
-                                                   boundary_vertices, boundary_indices_offset,
-                                                   tet_mesh.original_surface_mesh,
-                                                   boundary_vertex_to_original)
+        bnd_indices_offset = bnd_indices + len(tet_vertices)
+        vertices = np.vstack([tet_vertices, bnd_vertices]).astype(np.float32)
+        indices  = np.vstack([tet_indices, bnd_indices_offset]).astype(np.uint32)
+        normals  = np.vstack([tet_normals, bnd_normals]).astype(np.float32)
     else:
-        # Standard approach: all faces together
         vertices = np.vstack(tet_vertices_list).astype(np.float32)
-        indices = np.array(tet_triangles_list, dtype=np.uint32)
-
-        print(f"Created exploded mesh: {len(vertices):,} vertices, {len(indices):,} triangles")
-
+        indices  = np.array(tet_triangles_list, dtype=np.uint32)
         print("Computing normals on GPU...")
         normals = _compute_normals_taichi(vertices, indices)
 
-    print("Normals computed!")
+    print(f"Created exploded mesh: {len(vertices):,} vertices, {len(indices):,} triangles")
 
-    # Create MeshInstance for pyGandalf rendering
-    exploded_mesh = MeshInstance(
+    return MeshInstance(
         name=f"{tet_mesh.name}_exploded",
         path=tet_mesh.path,
         vertices=vertices,
@@ -192,7 +143,42 @@ def explode_tetrahedral_mesh(tet_mesh: TetrahedralMeshInstance, explosion_factor
         texcoords=None
     )
 
-    return exploded_mesh
+
+def _compute_boundary_smooth_normals(boundary_verts: np.ndarray, boundary_indices: np.ndarray,
+                                     orig_indices: np.ndarray, num_orig_verts: int) -> np.ndarray:
+    """
+    Compute smooth normals for boundary face vertices.
+
+    Accumulates face normals per original vertex index across all boundary faces,
+    then assigns each boundary vertex its accumulated smooth normal.  This gives
+    smooth shading on the outer surface without needing the original surface mesh.
+
+    Args:
+        boundary_verts:   (N, 3) exploded positions of boundary vertices
+        boundary_indices: (M, 3) triangle indices into boundary_verts
+        orig_indices:     (N,) original tet vertex index for each boundary vertex
+        num_orig_verts:   total number of vertices in the tet mesh
+
+    Returns:
+        (N, 3) smooth normals for each boundary vertex
+    """
+    v0 = boundary_verts[boundary_indices[:, 0]]
+    v1 = boundary_verts[boundary_indices[:, 1]]
+    v2 = boundary_verts[boundary_indices[:, 2]]
+    face_normals = np.cross(v1 - v0, v2 - v0).astype(np.float32)  # (M, 3)
+
+    # Accumulate face normals per original vertex index
+    smooth = np.zeros((num_orig_verts, 3), dtype=np.float32)
+    for k in range(3):
+        orig_k = orig_indices[boundary_indices[:, k]]
+        np.add.at(smooth, orig_k, face_normals)
+
+    # Normalise
+    lengths = np.linalg.norm(smooth, axis=1, keepdims=True)
+    smooth /= np.maximum(lengths, 1e-8)
+
+    # Look up the smooth normal for each boundary vertex
+    return smooth[orig_indices]
 
 
 def _identify_boundary_faces(tetrahedra: np.ndarray) -> set:

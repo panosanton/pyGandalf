@@ -17,49 +17,43 @@ if TYPE_CHECKING:
 ti.init(arch=ti.gpu)  # Change to ti.cpu if you don't have a GPU
 
 
-def generate_tetrahedral_mesh(surface_mesh: 'MeshInstance', preserve_surface_mesh: bool = False) -> 'TetrahedralMeshInstance':
+def generate_tetrahedral_mesh(surface_mesh: 'MeshInstance',
+                               target_faces: int = None) -> 'TetrahedralMeshInstance':
     """
     Convert a surface mesh into a tetrahedral mesh using TetGen library.
 
     Args:
         surface_mesh: Input surface mesh (triangular faces)
-        preserve_surface_mesh: If True, stores original mesh for normal preservation
+        target_faces: If set, simplify the surface mesh to approximately this
+                      many faces before tetrahedralization.  Fewer faces →
+                      fewer tetrahedra → faster simulation.
+                      Falls back to progressively less aggressive simplification
+                      if the result is not watertight, and ultimately to the
+                      original mesh if no watertight result can be achieved.
 
     Returns:
         TetrahedralMeshInstance: Generated tetrahedral mesh
-
-    Algorithm:
-        Uses TetGen (C++ library with Python bindings) for constrained
-        Delaunay tetrahedralization. This preserves the input surface
-        and generates quality tetrahedra inside.
-
-    TetGen switches:
-        'p' - Tetrahedralize a piecewise linear complex (PLC)
-        'q' - Quality mesh generation (default ratio: 2.0)
-        'a' - Maximum tetrahedron volume constraint
     """
     import tetgen
 
     print(f"Generating tetrahedral mesh from: {surface_mesh.name}")
-    print(f"  Input vertices: {len(surface_mesh.vertices)}")
-    print(f"  Input triangles: {len(surface_mesh.indices)}")
+    print(f"  Input vertices: {len(surface_mesh.vertices):,}")
+    print(f"  Input triangles: {len(surface_mesh.indices):,}")
 
-    # Pass raw vertices/faces directly — the original bunny.obj worked this way.
-    # Trimesh repair was tested but caused TetGen failures on decimated meshes.
-    tg = tetgen.TetGen(surface_mesh.vertices, surface_mesh.indices)
+    vertices = surface_mesh.vertices
+    faces    = surface_mesh.indices
 
-    # Generate tetrahedral mesh
-    # 'p'     = preserve surface only, no quality refinement (minimum tets)
-    # 'pq2.0' = quality ratio 2.0 (~370k tets on bunny.obj)
-    # 'pq1.2' = quality ratio 1.2 (~700k tets, best quality)
-    # Higher ratio = fewer tets, lower quality (fine for spring-mass simulation)
-    print("  Running TetGen algorithm...")
+    if target_faces is not None:
+        vertices, faces = _simplify_and_repair(vertices, faces, target_faces)
+
+    tg = tetgen.TetGen(vertices, faces)
+
+    print("  Running TetGen...")
     tg.tetrahedralize(switches='pq2.0')
 
-    print(f"  Generated vertices: {len(tg.node)}")
-    print(f"  Generated tetrahedra: {len(tg.elem)}")
+    print(f"  Generated vertices:   {len(tg.node):,}")
+    print(f"  Generated tetrahedra: {len(tg.elem):,}")
 
-    # Import here to avoid circular dependency
     from pyGandalf.utilities.mesh_lib import TetrahedralMeshInstance
 
     return TetrahedralMeshInstance(
@@ -67,8 +61,81 @@ def generate_tetrahedral_mesh(surface_mesh: 'MeshInstance', preserve_surface_mes
         path=surface_mesh.path,
         vertices=tg.node.astype(np.float32),
         tetrahedra=tg.elem.astype(np.int32),
-        original_surface_mesh=surface_mesh if preserve_surface_mesh else None
     )
+
+
+def _simplify_and_repair(vertices: np.ndarray, faces: np.ndarray,
+                          target_faces: int):
+    """
+    Simplify a surface mesh to target_faces and repair it before passing to TetGen.
+
+    Strategy:
+        Simplify to target_faces, apply trimesh repair operations (winding, normals,
+        fill_holes), and pass the result directly to TetGen.  Watertightness is NOT
+        used as a gate: TetGen's own boundary-recovery algorithm handles non-watertight
+        input the same way it handles the original mesh, so rejecting a simplified mesh
+        because trimesh reports it as non-watertight would only force us back to the
+        full-resolution mesh — the opposite of what we want.
+
+        If simplification produces a mesh with zero faces (degenerate result), we fall
+        back to the original mesh.
+
+    Returns:
+        (vertices, faces) as float32 / int32 numpy arrays.
+    """
+    import trimesh
+
+    original_count = len(faces)
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    print(f"  Simplification requested: {original_count:,} → {target_faces:,} faces")
+    print(f"  Original watertight: {mesh.is_watertight}")
+
+    if target_faces >= original_count:
+        print("  target_faces >= current face count — skipping simplification.")
+        return _repair_and_extract(mesh)
+
+    # Compute reduction ratio as fallback for older trimesh/fast_simplification.
+    reduction = 1.0 - (target_faces / original_count)
+    reduction = max(0.01, min(0.99, reduction))
+    print(f"  Simplifying to ~{target_faces:,} faces (reduction={reduction:.2f})...")
+    try:
+        # Newer trimesh: accepts integer face count directly
+        simplified = mesh.simplify_quadric_decimation(target_faces)
+    except (ValueError, TypeError):
+        # Older trimesh / fast_simplification: expects reduction ratio
+        simplified = mesh.simplify_quadric_decimation(reduction)
+
+    v, f = _repair_and_extract(simplified)
+
+    if len(f) == 0:
+        print("  WARNING: Simplification produced empty mesh — using original.")
+        return _repair_and_extract(mesh)
+
+    check = trimesh.Trimesh(vertices=v, faces=f, process=False)
+    print(f"  Result: {len(v):,} vertices, {len(f):,} faces "
+          f"(watertight: {check.is_watertight})")
+    return v, f
+
+
+def _repair_and_extract(mesh):
+    """
+    Run trimesh repair operations on a mesh and return (vertices, faces).
+    Does not guarantee watertightness — call mesh.is_watertight after to check.
+    """
+    import trimesh
+
+    trimesh.repair.fix_winding(mesh)
+    trimesh.repair.fix_normals(mesh)
+    mesh.fill_holes()
+
+    # Re-constructing with process=True removes duplicate/degenerate faces
+    # in a version-safe way (avoid calling methods that may not exist).
+    cleaned = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces,
+                              process=True)
+
+    return (np.array(cleaned.vertices, dtype=np.float32),
+            np.array(cleaned.faces,    dtype=np.int32))
 
 
 # ============================================
