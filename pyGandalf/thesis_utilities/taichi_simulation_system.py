@@ -579,22 +579,50 @@ def _perform_cut(comp: TaichiSimulationComponent,
     # exactly on the cut plane → smooth, flat incision.
     raw_surface = _extract_boundary_faces(all_tets, final_pos)
 
-    # Filter out spurious interior faces that got exposed by the tet split.
-    # A face is spurious if:
-    #   - all three vertex indices are original (< n_orig) — no new verts, AND
-    #   - it was NOT on the original outer surface before the cut.
-    # Faces that pass either check (new vertex OR was original surface) are kept.
+    # Filter faces into three categories:
+    #   1. All-orig faces that are in orig_surf_set → original outer surface, keep as-is.
+    #   2. All-orig faces NOT in orig_surf_set → interior faces exposed by split, discard.
+    #   3. Any face with at least one new/dup vert → wound surface or collar face.
+    #      Collar faces close the seam gap between the outer surface and the wound disc.
+    #      Their winding is enforced explicitly (above half faces down, below half faces up).
+    # n_split is the vertex count BEFORE duplication, i.e. n_orig + n_inter.
+    # [n_orig, n_split)  → above-half intersection vertices (original indices)
+    # [n_split, ...)     → below-half duplicate intersection vertices
+    # For the above half the wound surface faces DOWNWARD (normal dot < 0).
+    # For the below half the wound surface faces UPWARD   (normal dot > 0).
     keep = []
     for f in raw_surface:
         v0, v1, v2 = int(f[0]), int(f[1]), int(f[2])
         all_orig = v0 < n_orig and v1 < n_orig and v2 < n_orig
-        all_new  = v0 >= n_orig and v1 >= n_orig and v2 >= n_orig
 
-        if all_new:
-            keep.append(f)   # wound surface (all intersection / duplicate verts)
-        elif all_orig and tuple(sorted((v0, v1, v2))) in orig_surf_set:
-            keep.append(f)   # original outer sphere surface face
-        # else: collar face (mixed original + new) → these are the internal fins → discard
+        if all_orig:
+            if tuple(sorted((v0, v1, v2))) in orig_surf_set:
+                keep.append(f)   # original outer sphere surface face
+            # else: interior all-orig face → discard
+        else:
+            # wound surface face OR collar face (mixed orig+new)
+            # Determine which half: any dup vert (>= n_split) → below half.
+            is_below = v0 >= n_split or v1 >= n_split or v2 >= n_split
+
+            p0 = final_pos[v0]; p1 = final_pos[v1]; p2 = final_pos[v2]
+            fn = np.cross(p1 - p0, p2 - p0)
+            dot = float(np.dot(fn, normal))
+
+            if abs(dot) < 1e-12:
+                continue   # degenerate face (zero area) — skip
+
+            if is_below:
+                # Below half wound surface faces upward (dot > 0).
+                if dot < 0:
+                    keep.append([v0, v2, v1])   # flip
+                else:
+                    keep.append(f)
+            else:
+                # Above half wound surface faces downward (dot < 0).
+                if dot > 0:
+                    keep.append([v0, v2, v1])   # flip
+                else:
+                    keep.append(f)
 
     new_surface = (np.array(keep, dtype=np.uint32)
                    if keep else np.zeros((0, 3), dtype=np.uint32))
