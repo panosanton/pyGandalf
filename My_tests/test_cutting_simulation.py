@@ -1,5 +1,5 @@
 """
-Taichi Spring-Mass Simulation Test
+Taichi Spring-Mass Simulation — Progressive Blade Cut
 
 Loads a tetrahedral sphere mesh and runs a GPU-accelerated spring-mass
 simulation in Taichi, rendering the deforming surface in pyGandalf each frame.
@@ -8,7 +8,8 @@ Controls:
     Mouse (right-click drag) - rotate camera
     WASD  - move camera
     F     - poke the top of the mesh downward (watch it spring back)
-    C     - cut the mesh along the horizontal plane at y=0
+    B     - start / pause progressive blade cut (blade moves left-to-right)
+    C     - one-shot cut at y=0 (testing only, disabled once B is used)
     Close window to exit
 """
 
@@ -101,17 +102,20 @@ def main():
 
     taichi_comp = TaichiSimulationComponent(
         tet_mesh,
-        time_step     = 0.005,
-        substeps      = 4,      # sub_dt = 0.00125 s, ~2.8x safety margin below dt_crit
-        stiffness     = 50.0,   # stiff enough to resist poke without self-intersection
-        damping       = 0.5,    # light damping so oscillation lasts several seconds
-        total_mass    = 100.0,  # heavier → slower oscillation, visible at 60fps
-        gravity       = [0.0, 0.0, 0.0],
-        opening_speed = 2.0,
-        poke_speed    = 2.0,    # m/s applied to top 5% — gives visible but bounded dent
+        time_step        = 0.005,
+        substeps         = 4,       # sub_dt = 0.00125 s, ~2.8x safety margin
+        stiffness        = 50.0,
+        damping          = 0.5,
+        total_mass       = 100.0,
+        gravity          = [0.0, 0.0, 0.0],
+        opening_speed    = 2.0,
+        poke_speed       = 2.0,
+        blade_travel_dir = [1.0, 0.0, 0.0],  # blade moves left → right
+        blade_speed      = 0.5,               # 0.5 m/s; sphere is ~2 units wide → ~4 s cut
     )
-    taichi_comp.cut_plane_origin = [0.0, 0.0, 0.0]  # cut through sphere centre
-    taichi_comp.cut_plane_normal = [0.0, 1.0, 0.0]  # horizontal cut
+    # Horizontal cut at y=0 (equator); blade moves along +X within the cut plane.
+    taichi_comp.cut_plane_origin = [0.0, 0.0, 0.0]
+    taichi_comp.cut_plane_normal = [0.0, 1.0, 0.0]
     scene.add_component(sphere, taichi_comp)
 
     scene.add_component(light, InfoComponent('light'))

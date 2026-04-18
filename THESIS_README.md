@@ -57,15 +57,26 @@ pip install fast-simplification
 **Added (Task 2 main file):**
 - `_SpringMassSimulator` (@ti.data_oriented) - GPU spring-mass physics
   - Explicit Euler integration with substeps for stability
+  - Per-spring stiffness array `_sk` (replaces scalar) — allows individual springs to be broken by zeroing stiffness without topology rebuild
   - `rebuild_springs()` - swaps spring network after topology change (cut)
-  - Kernels: `_clear_forces`, `_spring_forces` (atomic adds), `_integrate`
+  - `extend_springs()` - appends new springs (used for cutting springs) and returns start index
+  - Kernels: `_clear_forces`, `_spring_forces` (atomic adds, uses per-spring `sk` array), `_integrate`
 - `TaichiSimulationComponent` - stores params and runtime state
 - `TaichiSimulationSystem` - ECS system, runs each frame
 - GPU-accelerated normal computation (replaces slow `np.add.at` — 50ms → 4ms on bunny)
-- `_perform_cut()` - removes tets above cut plane, rebuilds springs, applies wound-opening velocity
+- `_cut_topology()` - shared helper: splits tetrahedra at the cut plane, duplicates seam vertices, rewires tets to use original (above) or duplicate (below) vertices
+- `_filter_surface_faces()` - partitions raw boundary faces into outer (original surface) and wound (cut face) sets, enforcing correct winding for each half
+- `_setup_progressive_cut()` - called once on first B press; splits mesh via `_cut_topology`, adds cutting springs between seam pairs (stiffness = k/2, rest length = 0), builds sorted seam-pair manifest and wound-face manifest, initialises blade cursor just before first seam pair
+- `_advance_progressive_blade()` - called every frame while blade is active; advances blade cursor at `blade_speed` m/s, breaks springs behind cursor (zeroes `_sk`), applies opening velocity to separated pairs (batched), reveals wound faces behind cursor by updating the index buffer
+- `_perform_cut()` - one-shot cut (C key): removes tets above plane, rebuilds springs, applies wound-opening velocity
 - `_apply_poke()` - applies downward velocity impulse to top 5% of vertices
 - `_extract_boundary_faces()` - with outward winding correction using opposite-vertex test
 - `_build_springs()` - deduplicates 6 edges per tet into unique spring list
+
+**Controls:**
+- **F** — poke (downward impulse on top vertices)
+- **B** — first press: initialise and start progressive blade cut; subsequent presses: pause/resume blade
+- **C** — one-shot cut at the configured plane (disabled once B has been used)
 
 **Performance notes:**
 - `substeps=4`, `time_step=0.005` gives ~30 FPS on bunny with GPU
@@ -106,10 +117,11 @@ pip install fast-simplification
 
 ## Test Files
 
-### `My_tests/test_sofa_simulation copy.py` — **ACTIVE DEVELOPMENT FILE**
-- Taichi spring-mass simulation on bunny.obj
-- Controls: F = poke, C = cut along horizontal plane
+### `My_tests/test_cutting_simulation.py` — **ACTIVE DEVELOPMENT FILE**
+- Taichi spring-mass simulation on sphere.obj with progressive blade cutting
+- Controls: F = poke, B = start/pause progressive blade cut (left → right), C = one-shot cut (disabled once B used)
 - Current params: stiffness=50, damping=0.5, total_mass=100, substeps=4, time_step=0.005
+- Cut plane: y=0 (horizontal equator); blade travels along +X at 0.5 m/s
 
 ### `My_tests/test_sofa_simulation.py`
 - SOFA FEM simulation (bunny.obj). Uses `SofaSimulationSystem`. Kept for reference.
@@ -139,10 +151,11 @@ Takes OBJ/USD surface mesh files as input and converts them into tetrahedral vol
 Implements spring-mass dynamics on the tetrahedral mesh to simulate cutting forces, deformation, and separation.
 
 **Status:** In progress
-- GPU spring-mass simulation working on bunny (~30 FPS)
+- GPU spring-mass simulation working on sphere.obj (~30 FPS)
 - Poke deformation (F key) working
-- Crude cut (C key) working — removes tets above plane, updates surface, applies wound-opening velocity
-- Performance ceiling reached with explicit Euler; XPBD considered as next step for real-time simulation speed
+- One-shot cut (C key) working — removes tets above plane, updates surface, applies wound-opening velocity
+- Progressive blade cut (B key) implemented — virtual node algorithm: duplicates seam vertices, adds cutting springs (k/2, rest=0), breaks them progressively as blade cursor advances; wound surface revealed face-by-face in sync with blade position
+- Per-spring stiffness array enables spring breaking without topology rebuild (GPU-friendly)
 - Mesh simplification pipeline added to reduce tet count and improve FPS
 
 ### Task 3 - Module 3: Surface Reconstruction
@@ -169,8 +182,8 @@ Structures and packages simulation parameters alongside results into standardise
 ## Running the Code
 
 ```bash
-# Active simulation test (bunny, Taichi spring-mass)
-python "My_tests/test_sofa_simulation copy.py"
+# Active simulation test (sphere, Taichi spring-mass + progressive cutting)
+python My_tests/test_cutting_simulation.py
 
 # Static surface rendering
 python My_tests/test_tet_rendering.py
