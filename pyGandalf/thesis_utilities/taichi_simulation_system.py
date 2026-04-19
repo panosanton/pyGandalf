@@ -356,12 +356,17 @@ class TaichiSimulationSystem(System):
 
 def _apply_poke(comp: TaichiSimulationComponent):
     """Apply a downward impulse to the top 5% of vertices."""
-    if comp.poke_mask is None or comp.simulator is None:
+    if comp.simulator is None:
         return
+    pos = comp.simulator.positions.to_numpy()
+    y = pos[:, 1]
+    poke_threshold = y.max() - (y.max() - y.min()) * 0.05
+    fixed = comp.simulator._fixed.to_numpy()
+    poke_mask = (y >= poke_threshold) & (fixed == 0)
     vels = comp.simulator.velocities.to_numpy()
-    vels[comp.poke_mask, 1] -= comp.poke_speed
+    vels[poke_mask, 1] -= comp.poke_speed
     comp.simulator.velocities.from_numpy(vels.astype(np.float32))
-    print(f"[Poke] Applied {comp.poke_speed} m/s downward to {int(comp.poke_mask.sum())} verts")
+    print(f"[Poke] Applied {comp.poke_speed} m/s downward to {int(poke_mask.sum())} verts")
 
 
 # ---------------------------------------------------------------------------
