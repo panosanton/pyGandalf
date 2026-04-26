@@ -586,22 +586,21 @@ def _cut_topology(comp: TaichiSimulationComponent,
 
 
 def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
-                           orig_surf_set):
+                           orig_surf_set, mesh_centroid=None):
     """
     Partition raw boundary faces into outer faces and wound faces, applying
-    correct winding to wound faces.
+    correct winding to each.
 
-    Faces with all-original vertices that are not in orig_surf_set are dropped
-    — they are interior tet faces exposed by the split, not part of the actual
-    wound surface, and including them produces visual noise.
+    Faces with all-original vertices not in orig_surf_set are dropped — they
+    are interior tet faces exposed by the split.
 
-    Winding rule for wound faces:
-        above-half (no vertex >= n_split) → normal must oppose cut normal (dot < 0)
-        below-half (any vertex >= n_split) → normal must align with cut normal (dot > 0)
-
-    Returns:
-        outer_faces  — np.ndarray (K1, 3) uint32  original sphere surface
-        wound_faces  — list of np.ndarray (3,) uint32  cut / collar faces
+    Winding rules:
+      outer (all_orig): centroid test — normal must point away from mesh_centroid.
+        Needed because split tets have intersection vertices as their 4th vertex,
+        which can fool the opposite-vertex test in _extract_boundary_faces.
+      wound/collar (any non-orig vertex): cut-normal test.
+        above-half (no vertex >= n_split) → dot(fn, normal) < 0
+        below-half (any vertex >= n_split) → dot(fn, normal) > 0
     """
     outer = []
     wound = []
@@ -612,20 +611,24 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
 
         if all_orig:
             if tuple(sorted((v0, v1, v2))) in orig_surf_set:
+                if mesh_centroid is not None:
+                    p0 = final_pos[v0]; p1 = final_pos[v1]; p2 = final_pos[v2]
+                    fn = np.cross(p1 - p0, p2 - p0)
+                    to_face = (p0 + p1 + p2) / 3.0 - mesh_centroid
+                    if float(np.dot(fn, to_face)) < 0:
+                        f = np.array([v0, v2, v1], dtype=np.uint32)
                 outer.append(f)
             # else: interior tet face exposed by split — drop
         else:
-            # Wound surface or collar face — enforce winding explicitly.
-            # [n_orig, n_split)  = above-half intersection verts → faces downward
-            # [n_split, ...)     = below-half dup verts           → faces upward
+            # Wound face or collar face — enforce winding via cut normal.
+            # Collar faces (original + intersection/dup vertices) also use this
+            # rule; centroid winding is wrong for faces near the cut plane.
             is_below = v0 >= n_split or v1 >= n_split or v2 >= n_split
             p0 = final_pos[v0]; p1 = final_pos[v1]; p2 = final_pos[v2]
             fn  = np.cross(p1 - p0, p2 - p0)
             dot = float(np.dot(fn, normal))
-
             if abs(dot) < 1e-12:
-                continue   # degenerate face
-
+                continue
             if is_below:
                 face = f if dot > 0 else np.array([v0, v2, v1], dtype=np.uint32)
             else:
@@ -674,8 +677,9 @@ def _perform_cut(comp: TaichiSimulationComponent,
 
     # --- Surface ---
     raw_surface = _extract_boundary_faces(all_tets, final_pos)
+    mesh_centroid = final_pos[:n_orig].mean(axis=0)
     outer_faces, wound_faces = _filter_surface_faces(
-        raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set)
+        raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set, mesh_centroid)
 
     all_faces = (np.vstack([outer_faces,
                              np.array(wound_faces, dtype=np.uint32)])
@@ -762,8 +766,9 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
 
     # --- Build progressive wound surface ---
     raw_surface = _extract_boundary_faces(all_tets, final_pos)
+    mesh_centroid = final_pos[:n_orig].mean(axis=0)
     outer_faces, wound_faces = _filter_surface_faces(
-        raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set)
+        raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set, mesh_centroid)
 
     comp._outer_faces = outer_faces
 
