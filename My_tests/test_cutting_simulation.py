@@ -104,12 +104,13 @@ def main():
         tet_mesh,
         time_step        = 0.005,
         substeps         = 4,       # sub_dt = 0.00125 s, ~2.8x safety margin
-        stiffness        = 50.0,
-        damping          = 0.5,
+        stiffness        = 200.0,
+        damping          = 3.5,
         total_mass       = 100.0,
         gravity          = [0.0, 0.0, 0.0],
         opening_speed    = 2.0,
         poke_speed       = 2.0,
+        v_max            = 3.0,   # m/s per substep cap — prevents rim tangling from opening impulse
         blade_travel_dir = [1.0, 0.0, 0.0],  # blade moves left → right
         blade_speed      = 0.5,               # 0.5 m/s; sphere is ~2 units wide → ~4 s cut
     )

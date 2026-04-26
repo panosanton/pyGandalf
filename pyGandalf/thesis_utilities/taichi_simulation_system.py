@@ -110,10 +110,10 @@ class _SpringMassSimulator:
         self._sk = np.concatenate([self._sk, sk_new.astype(np.float32)])
         return start
 
-    def step(self, dt: float, damping: float):
+    def step(self, dt: float, damping: float, v_max: float = 10.0):
         self._clear_forces()
         self._spring_forces(self._sa, self._sb, self._sr, self._sk)
-        self._integrate(float(dt), float(damping), self._gravity)
+        self._integrate(float(dt), float(damping), self._gravity, float(v_max))
 
     # --- Taichi kernels ---
 
@@ -142,17 +142,22 @@ class _SpringMassSimulator:
 
     @ti.kernel
     def _integrate(self,
-                   dt:      ti.f32,
-                   damping: ti.f32,
-                   gravity: ti.types.ndarray(dtype=ti.f32, ndim=1)):
+                   dt:       ti.f32,
+                   damping:  ti.f32,
+                   gravity:  ti.types.ndarray(dtype=ti.f32, ndim=1),
+                   v_max:    ti.f32):
         grav = ti.Vector([gravity[0], gravity[1], gravity[2]])
         for i in self.positions:
             if self._fixed[i] == 0:
                 acc = self._forces[i] / self._masses[i] + grav
-                self.velocities[i] = (
-                    self.velocities[i] * (1.0 - damping * dt) + acc * dt
-                )
-                self.positions[i] += self.velocities[i] * dt
+                v = self.velocities[i] * (1.0 - damping * dt) + acc * dt
+                # Clamp speed so vertices cannot travel far enough in one step
+                # to cross over neighbours, regardless of impulse magnitude.
+                speed = v.norm()
+                if speed > v_max:
+                    v = v * (v_max / speed)
+                self.velocities[i] = v
+                self.positions[i] += v * dt
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +191,7 @@ class TaichiSimulationComponent(Component):
                  total_mass:         float = 1.0,
                  opening_speed:      float = 1.0,
                  poke_speed:         float = 3.0,
+                 v_max:              float = 1.5,
                  blade_travel_dir:   list  = None,
                  blade_speed:        float = 0.5):
         super().__init__()
@@ -198,6 +204,7 @@ class TaichiSimulationComponent(Component):
         self.total_mass    = total_mass
         self.opening_speed = opening_speed
         self.poke_speed    = poke_speed
+        self.v_max         = v_max
 
         # Populated by TaichiSimulationSystem.on_create_entity
         self.simulator:           _SpringMassSimulator = None
@@ -323,7 +330,7 @@ class TaichiSimulationSystem(System):
         t0 = time.perf_counter()
         sub_dt = comp.time_step / comp.substeps
         for _ in range(comp.substeps):
-            comp.simulator.step(sub_dt, comp.damping)
+            comp.simulator.step(sub_dt, comp.damping, comp.v_max)
         t1 = time.perf_counter()
 
         new_positions = comp.simulator.positions.to_numpy()
@@ -582,7 +589,15 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
                            orig_surf_set):
     """
     Partition raw boundary faces into outer faces and wound faces, applying
-    correct winding to all non-outer faces.
+    correct winding to wound faces.
+
+    Faces with all-original vertices that are not in orig_surf_set are dropped
+    — they are interior tet faces exposed by the split, not part of the actual
+    wound surface, and including them produces visual noise.
+
+    Winding rule for wound faces:
+        above-half (no vertex >= n_split) → normal must oppose cut normal (dot < 0)
+        below-half (any vertex >= n_split) → normal must align with cut normal (dot > 0)
 
     Returns:
         outer_faces  — np.ndarray (K1, 3) uint32  original sphere surface
@@ -598,6 +613,7 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
         if all_orig:
             if tuple(sorted((v0, v1, v2))) in orig_surf_set:
                 outer.append(f)
+            # else: interior tet face exposed by split — drop
         else:
             # Wound surface or collar face — enforce winding explicitly.
             # [n_orig, n_split)  = above-half intersection verts → faces downward
