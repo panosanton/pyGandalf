@@ -586,13 +586,21 @@ def _cut_topology(comp: TaichiSimulationComponent,
 
 
 def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
-                           orig_surf_set, mesh_centroid=None):
+                           orig_surf_set, mesh_centroid=None,
+                           inter_data=None, shared_list=None):
     """
     Partition raw boundary faces into outer faces and wound faces, applying
     correct winding to each.
 
     Faces with all-original vertices not in orig_surf_set are dropped — they
     are interior tet faces exposed by the split.
+
+    Collar faces (original + intersection/dup vertices) are checked the same
+    way: each intersection/dup vertex is replaced by its original parent (the
+    vertex on the opposite side of the cut from the face's half), giving back
+    the pre-cut tet face.  If that face is not in orig_surf_set it was interior
+    and gets dropped — this removes fins that point into the disc interior when
+    TetGen edges run from a surface vertex to an interior vertex.
 
     Winding rules:
       outer (all_orig): centroid test — normal must point away from mesh_centroid.
@@ -602,12 +610,50 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
         above-half (no vertex >= n_split) → dot(fn, normal) < 0
         below-half (any vertex >= n_split) → dot(fn, normal) > 0
     """
+    # inter_data: list of (new_idx, vi_above, vj_below, t)
+    # inter_parent maps intersection vertex index → (vi_above, vj_below)
+    inter_parent: dict = {}
+    if inter_data is not None:
+        for new_id, vi, vj, _t in inter_data:
+            inter_parent[int(new_id)] = (int(vi), int(vj))
+
+    def _orig_face_key(v0, v1, v2):
+        """
+        Replace each intersection/dup vertex with the original vertex on the
+        opposite side of the cut, yielding the pre-cut tet face for orig_surf_set
+        lookup.  Intersection vertices → their below parent; dup vertices →
+        their above parent (symmetric, so both halves map to the same key).
+        Returns None if the mapping is unavailable for any vertex.
+        """
+        orig = []
+        for v in (v0, v1, v2):
+            if v < n_orig:
+                orig.append(v)
+            elif v < n_split:                  # intersection vertex (above-half)
+                entry = inter_parent.get(v)
+                if entry is None:
+                    return None
+                orig.append(entry[1])          # vj_below
+            else:                              # dup vertex (below-half)
+                if shared_list is None:
+                    return None
+                seam_idx = v - n_split
+                if seam_idx >= len(shared_list):
+                    return None
+                entry = inter_parent.get(int(shared_list[seam_idx]))
+                if entry is None:
+                    return None
+                orig.append(entry[0])          # vi_above
+        return tuple(sorted(orig))
+
     outer = []
     wound = []
+    dropped_collar = 0
 
     for f in raw_surface:
         v0, v1, v2 = int(f[0]), int(f[1]), int(f[2])
         all_orig = v0 < n_orig and v1 < n_orig and v2 < n_orig
+        any_orig = v0 < n_orig or v1 < n_orig or v2 < n_orig
 
         if all_orig:
             if tuple(sorted((v0, v1, v2))) in orig_surf_set:
@@ -620,9 +666,14 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
                 outer.append(f)
             # else: interior tet face exposed by split — drop
         else:
-            # Wound face or collar face — enforce winding via cut normal.
-            # Collar faces (original + intersection/dup vertices) also use this
-            # rule; centroid winding is wrong for faces near the cut plane.
+            # Collar face: has original vertices + intersection/dup vertices.
+            # Drop it if the reconstructed pre-cut face was interior.
+            if any_orig and inter_data is not None:
+                key = _orig_face_key(v0, v1, v2)
+                if key is not None and key not in orig_surf_set:
+                    dropped_collar += 1
+                    continue
+
             is_below = v0 >= n_split or v1 >= n_split or v2 >= n_split
             p0 = final_pos[v0]; p1 = final_pos[v1]; p2 = final_pos[v2]
             fn  = np.cross(p1 - p0, p2 - p0)
@@ -634,6 +685,9 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
             else:
                 face = f if dot < 0 else np.array([v0, v2, v1], dtype=np.uint32)
             wound.append(face)
+
+    if dropped_collar > 0:
+        print(f"[Cut] Dropped {dropped_collar} interior collar faces")
 
     outer_arr = (np.array(outer, dtype=np.uint32)
                  if outer else np.zeros((0, 3), dtype=np.uint32))
@@ -679,7 +733,8 @@ def _perform_cut(comp: TaichiSimulationComponent,
     raw_surface = _extract_boundary_faces(all_tets, final_pos)
     mesh_centroid = final_pos[:n_orig].mean(axis=0)
     outer_faces, wound_faces = _filter_surface_faces(
-        raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set, mesh_centroid)
+        raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set, mesh_centroid,
+        inter_data=inter_data, shared_list=shared_list)
 
     all_faces = (np.vstack([outer_faces,
                              np.array(wound_faces, dtype=np.uint32)])
@@ -768,7 +823,8 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     raw_surface = _extract_boundary_faces(all_tets, final_pos)
     mesh_centroid = final_pos[:n_orig].mean(axis=0)
     outer_faces, wound_faces = _filter_surface_faces(
-        raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set, mesh_centroid)
+        raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set, mesh_centroid,
+        inter_data=inter_data, shared_list=shared_list)
 
     comp._outer_faces = outer_faces
 
