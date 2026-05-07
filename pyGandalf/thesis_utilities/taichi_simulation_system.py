@@ -8,6 +8,7 @@ Controls:
   B — start / pause progressive blade cut
   F — poke the top of the mesh downward
   C — one-shot cut at the plane defined by cut_plane_origin/normal (kept for testing)
+  P — pause / resume physics simulation (cut still runs)
 
 Progressive cutting (virtual-node algorithm):
   When B is pressed the mesh topology is split once along the cut plane.
@@ -232,6 +233,9 @@ class TaichiSimulationComponent(Component):
         self._wound_faces_by_dist = []   # [(travel_dist:float, face:np.ndarray(3,))]
         self._wound_face_ptr      = 0    # pointer into _wound_faces_by_dist
 
+        # Physics pause (P key) — cut and blade still advance when paused
+        self.sim_paused = False
+
 
 # ---------------------------------------------------------------------------
 # System
@@ -283,6 +287,7 @@ class TaichiSimulationSystem(System):
         print("  F — poke top of mesh downward")
         print("  B — start / pause progressive blade cut")
         print("  C — one-shot cut (testing only)")
+        print("  P — pause / resume physics simulation")
 
     def on_update_entity(self, ts: float, entity, components):
         comp: TaichiSimulationComponent
@@ -326,11 +331,19 @@ class TaichiSimulationSystem(System):
             _apply_poke(comp)
         self._f_prev = f_now
 
+        # --- P key: pause / resume physics ---
+        p_now = InputManager().get_key_down(glfw.KEY_P)
+        if p_now and not getattr(self, '_p_prev', False):
+            comp.sim_paused = not comp.sim_paused
+            print(f"[Sim] Physics {'paused' if comp.sim_paused else 'resumed'}")
+        self._p_prev = p_now
+
         # --- Simulation sub-steps ---
         t0 = time.perf_counter()
-        sub_dt = comp.time_step / comp.substeps
-        for _ in range(comp.substeps):
-            comp.simulator.step(sub_dt, comp.damping, comp.v_max)
+        if not comp.sim_paused:
+            sub_dt = comp.time_step / comp.substeps
+            for _ in range(comp.substeps):
+                comp.simulator.step(sub_dt, comp.damping, comp.v_max)
         t1 = time.perf_counter()
 
         new_positions = comp.simulator.positions.to_numpy()
