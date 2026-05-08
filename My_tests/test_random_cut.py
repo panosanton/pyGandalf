@@ -153,6 +153,7 @@ def main():
         v_max            = 3.0,
         blade_travel_dir = blade_dir.tolist(),
         blade_speed      = 0.5,
+        split_disc_verts = True,   # set False to disable rim vertex duplication
     )
     taichi_comp.cut_plane_origin = origin.tolist()
     taichi_comp.cut_plane_normal = normal.tolist()

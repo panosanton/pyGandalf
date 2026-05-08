@@ -194,7 +194,8 @@ class TaichiSimulationComponent(Component):
                  poke_speed:         float = 3.0,
                  v_max:              float = 1.5,
                  blade_travel_dir:   list  = None,
-                 blade_speed:        float = 0.5):
+                 blade_speed:        float = 0.5,
+                 split_disc_verts:   bool  = True):
         super().__init__()
         self.tet_mesh      = tet_mesh
         self.time_step     = time_step
@@ -235,6 +236,17 @@ class TaichiSimulationComponent(Component):
 
         # Physics pause (P key) — cut and blade still advance when paused
         self.sim_paused = False
+
+        # Rendering option
+        self.split_disc_verts = split_disc_verts  # duplicate rim verts for correct disc/collar normals
+
+        # Set after a cut — used for correct normal computation on the cut mesh.
+        self._n_orig:            int        = None  # vertex count before splitting
+        self._n_split:           int        = None  # n_orig + intersection vertex count
+        self._inter_data:        list       = None  # [(new_id, vi_above, vj_below, t), ...]
+        self._shared_list:       list       = None  # seam vertex indices (above-half copies)
+        self._cut_normal:        np.ndarray = None  # normalized cut plane normal
+        self._disc_split_phys_idx: np.ndarray = None  # physics indices of rendering disc duplicates
 
 
 # ---------------------------------------------------------------------------
@@ -349,10 +361,23 @@ class TaichiSimulationSystem(System):
         new_positions = comp.simulator.positions.to_numpy()
         t2 = time.perf_counter()
 
-        new_normals = _compute_normals(new_positions, comp.surface_indices)
+        if comp._disc_split_phys_idx is not None and len(comp._disc_split_phys_idx) > 0:
+            render_positions = np.vstack(
+                [new_positions, new_positions[comp._disc_split_phys_idx]])
+        else:
+            render_positions = new_positions
+
+        if comp._n_orig is not None:
+            new_normals = _compute_normals_post_cut(
+                render_positions, comp.surface_indices,
+                comp._n_orig, comp._n_split,
+                comp._inter_data, comp._shared_list,
+                comp._cut_normal)
+        else:
+            new_normals = _compute_normals(render_positions, comp.surface_indices)
         t3 = time.perf_counter()
 
-        _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[0], new_positions)
+        _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[0], render_positions)
         _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[1], new_normals)
         t4 = time.perf_counter()
 
@@ -742,6 +767,44 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
     return outer_arr, wound
 
 
+def _split_disc_verts_for_rendering(outer_faces, wound_faces, n_phys, n_orig):
+    """
+    Create rendering-only duplicate vertices for intersection vertices that appear
+    in both disc (wound) faces and collar (outer) faces.
+
+    Without duplication a single vertex index cannot simultaneously carry a
+    sphere-surface normal (for collar shading) and a ±cut_normal (for disc
+    shading).  This function remaps the disc face index buffer so those shared
+    vertices use a fresh index backed by a duplicate position entry.
+
+    Returns:
+        remapped_wound  — list of wound face arrays; disc-boundary vertices
+                          replaced with new rendering-only indices >= n_phys.
+        split_phys_idx  — list of physics vertex indices for the duplicates
+                          (duplicate i lives at rendering index n_phys + i).
+    """
+    disc_verts = set()
+    for wf in wound_faces:
+        if all(int(v) >= n_orig for v in wf):
+            disc_verts.update(int(v) for v in wf)
+
+    if not disc_verts:
+        return wound_faces, []
+
+    collar_verts = set()
+    for f in outer_faces:
+        collar_verts.update(int(v) for v in f)
+
+    split_verts = sorted(disc_verts & collar_verts)
+    if not split_verts:
+        return wound_faces, []
+
+    remap = {v: n_phys + i for i, v in enumerate(split_verts)}
+    remapped = [np.array([remap.get(int(v), int(v)) for v in wf], dtype=np.uint32)
+                for wf in wound_faces]
+    return remapped, split_verts
+
+
 def _perform_cut(comp: TaichiSimulationComponent,
                  mesh_comp: StaticMeshComponent):
     """
@@ -763,6 +826,11 @@ def _perform_cut(comp: TaichiSimulationComponent,
     (final_pos, final_vel, final_mass, final_fixed,
      all_tets, n_orig, n_split, shared_list, remap, inter_data,
      orig_surf_set) = result
+    comp._n_orig      = n_orig
+    comp._n_split     = n_split
+    comp._inter_data  = inter_data
+    comp._shared_list = shared_list
+    comp._cut_normal  = normal
 
     # --- Opening velocity ---
     if comp.opening_speed > 0.0:
@@ -784,15 +852,27 @@ def _perform_cut(comp: TaichiSimulationComponent,
         raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set, mesh_centroid,
         inter_data=inter_data, shared_list=shared_list)
 
-    all_faces = (np.vstack([outer_faces,
-                             np.array(wound_faces, dtype=np.uint32)])
-                 if wound_faces else outer_faces)
+    if comp.split_disc_verts:
+        remapped_wound, split_phys = _split_disc_verts_for_rendering(
+            outer_faces, wound_faces, len(final_pos), n_orig)
+        comp._disc_split_phys_idx = np.array(split_phys, dtype=np.int32) if split_phys else None
+        render_pos = (np.vstack([final_pos, final_pos[split_phys]])
+                      if split_phys else final_pos)
+        disc_faces = remapped_wound
+    else:
+        comp._disc_split_phys_idx = None
+        render_pos = final_pos
+        disc_faces = wound_faces
+
+    all_faces = (np.vstack([outer_faces, np.array(disc_faces, dtype=np.uint32)])
+                 if disc_faces else outer_faces)
     comp.surface_indices = all_faces
-    new_normals  = _compute_normals(final_pos, all_faces)
-    new_texcoords = np.zeros((len(final_pos), 2), dtype=np.float32)
+    new_normals  = _compute_normals_post_cut(render_pos, all_faces,
+                                             n_orig, n_split, inter_data, shared_list, normal)
+    new_texcoords = np.zeros((len(render_pos), 2), dtype=np.float32)
     print(f"[Cut] Surface: {len(raw_surface):,} raw → {len(all_faces):,} kept")
 
-    _realloc_gpu_buffers(mesh_comp, final_pos, new_normals, new_texcoords, all_faces)
+    _realloc_gpu_buffers(mesh_comp, render_pos, new_normals, new_texcoords, all_faces)
     print("[Cut] GPU buffers updated.")
 
 
@@ -831,6 +911,11 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     (final_pos, _final_vel, _final_mass, _final_fixed,
      all_tets, n_orig, n_split, shared_list, remap, inter_data,
      orig_surf_set) = result
+    comp._n_orig      = n_orig
+    comp._n_split     = n_split
+    comp._inter_data  = inter_data
+    comp._shared_list = shared_list
+    comp._cut_normal  = normal
 
     # --- Add cutting springs between seam pairs ---
     # Each seam pair (v_above, v_below) gets one cutting spring.
@@ -876,24 +961,39 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
 
     comp._outer_faces = outer_faces
 
-    # Sort wound faces by their centroid's projection onto blade_dir.
+    if comp.split_disc_verts:
+        remapped_wound, split_phys = _split_disc_verts_for_rendering(
+            outer_faces, wound_faces, len(final_pos), n_orig)
+        comp._disc_split_phys_idx = np.array(split_phys, dtype=np.int32) if split_phys else None
+        render_pos = (np.vstack([final_pos, final_pos[split_phys]])
+                      if split_phys else final_pos)
+        wound_for_render = remapped_wound
+    else:
+        comp._disc_split_phys_idx = None
+        render_pos = final_pos
+        wound_for_render = wound_faces
+
+    # Sort wound faces by centroid distance along blade_dir.
+    # Centroid uses original wound_faces for correct position lookup;
+    # the stored face uses the (possibly remapped) rendering version.
     wound_by_dist = []
-    for wf in wound_faces:
-        centroid    = final_pos[[int(wf[0]), int(wf[1]), int(wf[2])]].mean(axis=0)
+    for orig_wf, rend_wf in zip(wound_faces, wound_for_render):
+        centroid    = final_pos[[int(orig_wf[0]), int(orig_wf[1]), int(orig_wf[2])]].mean(axis=0)
         travel_dist = float(np.dot(centroid - origin, blade_dir))
-        wound_by_dist.append((travel_dist, wf))
+        wound_by_dist.append((travel_dist, rend_wf))
     wound_by_dist.sort(key=lambda x: x[0])
     comp._wound_faces_by_dist = wound_by_dist
     comp._wound_face_ptr      = 0
 
     # Initial surface = outer faces only (wound hidden until blade reaches it).
     comp.surface_indices = outer_faces.copy()
-    new_normals   = _compute_normals(final_pos, comp.surface_indices)
-    new_texcoords = np.zeros((len(final_pos), 2), dtype=np.float32)
+    new_normals   = _compute_normals_post_cut(render_pos, comp.surface_indices,
+                                              n_orig, n_split, inter_data, shared_list, normal)
+    new_texcoords = np.zeros((len(render_pos), 2), dtype=np.float32)
     print(f"[Blade] Surface: {len(outer_faces):,} outer + "
           f"{len(wound_faces):,} wound faces (hidden until blade passes)")
 
-    _realloc_gpu_buffers(mesh_comp, final_pos, new_normals, new_texcoords,
+    _realloc_gpu_buffers(mesh_comp, render_pos, new_normals, new_texcoords,
                          comp.surface_indices)
 
     comp.blade_initialized = True
@@ -1109,6 +1209,71 @@ def _compute_normals(vertices: np.ndarray, indices: np.ndarray) -> np.ndarray:
     normals = np.zeros_like(vertices, dtype=np.float32)
     _accumulate_normals_kernel(vertices, indices.astype(np.int32), normals)
     _normalize_normals_kernel(normals)
+    return normals
+
+
+def _compute_normals_post_cut(vertices:    np.ndarray,
+                               indices:     np.ndarray,
+                               n_orig:      int,
+                               n_split:     int,
+                               inter_data:  list,
+                               shared_list: list,
+                               cut_normal:  np.ndarray) -> np.ndarray:
+    """
+    Normal computation for a cut mesh.
+
+    Original vertices use standard angle-weighted accumulation.
+
+    Intersection vertices are split into two groups:
+      - Collar-only (NOT in any disc face): lerped along their parent edge so
+        the collar shading blends smoothly with the rest of the sphere surface.
+      - Disc vertices (appear in a face where all indices >= n_orig): assigned
+        the cut-plane normal directly (±cut_normal).  Disc faces are flat, so
+        every point on them should have the same perpendicular normal.
+
+    inter_data:  [(new_id, vi_above, vj_below, t), ...]
+    shared_list: list of seam vertex indices (above-half copies), where the
+                 dup index is n_split + i for shared_list[i].
+    cut_normal:  normalized cut plane normal (points toward the "above" half).
+    """
+    normals = np.zeros_like(vertices, dtype=np.float32)
+    idx_i32 = indices.astype(np.int32)
+    _accumulate_normals_kernel(vertices, idx_i32, normals)
+    _normalize_normals_kernel(normals)
+
+    # Identify disc vertices: appear in any face where all three indices >= n_orig.
+    disc_mask  = np.all(idx_i32 >= n_orig, axis=1)
+    disc_verts = set(idx_i32[disc_mask].flatten().tolist()) if disc_mask.any() else set()
+
+    cut_n = (cut_normal / np.linalg.norm(cut_normal)).astype(np.float32)
+
+    # Lerp override for collar-only intersection vertices.
+    if inter_data:
+        for new_id, vi, vj, t in inter_data:
+            if new_id in disc_verts:
+                continue
+            n_vi     = normals[vi]
+            n_vj     = normals[vj]
+            n_interp = n_vi * (1.0 - float(t)) + n_vj * float(t)
+            length   = float(np.linalg.norm(n_interp))
+            normals[new_id] = (n_interp / length) if length > 1e-6 else n_vi
+
+    # Snap disc vertex normals to exactly ±cut_n.  The sign is inferred from
+    # the accumulated normal so this works regardless of which half (above /
+    # below) a disc vertex belongs to, and for rendering-only duplicates whose
+    # indices exceed the physics vertex range.
+    for v in disc_verts:
+        dot = float(np.dot(normals[v], cut_n))
+        if abs(dot) > 1e-6:
+            normals[v] = -cut_n if dot < 0.0 else cut_n
+
+    # Non-disc dup vertices share the collar-face normal of their seam partner.
+    if shared_list is not None:
+        for i, seam_v in enumerate(shared_list):
+            dup_v = n_split + i
+            if dup_v < len(normals) and dup_v not in disc_verts:
+                normals[dup_v] = normals[seam_v]
+
     return normals
 
 
