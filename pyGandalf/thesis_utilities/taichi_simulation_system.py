@@ -534,16 +534,28 @@ def _cut_topology(comp: TaichiSimulationComponent,
         print("[Cut] Plane doesn't divide mesh — aborting.")
         return None
 
-    # --- Snap rim vertices to cut plane ---
-    rim_set = set()
+    # --- Snap near-plane rim vertices to cut plane ---
+    # Only snap original vertices that are nearly on the cut plane already
+    # (floating-point tolerance fix).  Do NOT snap vertices that are genuinely
+    # far from the plane: those are structural surface vertices whose positions
+    # define the mesh shape, and moving them to the cut plane creates large
+    # distorted triangles (visible as the spike/flap artifact on off-center cuts).
+    # Intersection vertices from iv() already land exactly on the plane by
+    # construction, so no snapping is needed for them.
+    mesh_scale = float(np.linalg.norm(positions.max(axis=0) - positions.min(axis=0)))
+    snap_eps   = mesh_scale * 1e-4
+    rim_set    = set()
     for new_id, vi, vj, _ in inter_data:
         if vi < n_orig: rim_set.add(vi)
         if vj < n_orig: rim_set.add(vj)
     if rim_set:
-        rim_arr = np.array(sorted(rim_set), dtype=np.int32)
-        snap_d  = signed_dist[rim_arr]
-        split_pos[rim_arr] -= snap_d[:, np.newaxis] * normal
-        print(f"[Cut] Snapped {len(rim_arr)} rim vertices to cut plane")
+        rim_arr  = np.array(sorted(rim_set), dtype=np.int32)
+        snap_d   = signed_dist[rim_arr]
+        close    = np.abs(snap_d) < snap_eps
+        if close.any():
+            split_pos[rim_arr[close]] -= snap_d[close, np.newaxis] * normal
+            print(f"[Cut] Snapped {int(close.sum())} near-plane rim vertices "
+                  f"(threshold {snap_eps:.2e})")
 
     # --- Extend per-vertex arrays ---
     split_vel   = np.zeros((n_split, 3), dtype=np.float32)
@@ -608,18 +620,17 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
     Faces with all-original vertices not in orig_surf_set are dropped — they
     are interior tet faces exposed by the split.
 
-    Collar faces (original + intersection/dup vertices) are checked the same
-    way: each intersection/dup vertex is replaced by its original parent (the
-    vertex on the opposite side of the cut from the face's half), giving back
-    the pre-cut tet face.  If that face is not in orig_surf_set it was interior
-    and gets dropped — this removes fins that point into the disc interior when
-    TetGen edges run from a surface vertex to an interior vertex.
+    Collar faces (original + intersection/dup vertices) are classified by
+    mapping each non-original vertex back to its pre-cut parent, recovering the
+    original face key.  If that key is in orig_surf_set, the collar face is the
+    sliced remnant of an outer surface face (the original surface face no longer
+    exists in any tet after the split, so its collar remnant IS the outer surface)
+    → promoted to outer with centroid winding.  If the key is absent → interior,
+    dropped.  Pure disc faces (no original vertices) → wound surface.
 
     Winding rules:
-      outer (all_orig): centroid test — normal must point away from mesh_centroid.
-        Needed because split tets have intersection vertices as their 4th vertex,
-        which can fool the opposite-vertex test in _extract_boundary_faces.
-      wound/collar (any non-orig vertex): cut-normal test.
+      outer (all-orig or collar mapped to orig_surf_set): centroid test.
+      wound (pure disc, no original vertices): cut-normal test.
         above-half (no vertex >= n_split) → dot(fn, normal) < 0
         below-half (any vertex >= n_split) → dot(fn, normal) > 0
     """
@@ -632,22 +643,28 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
 
     def _orig_face_key(v0, v1, v2):
         """
-        Replace each intersection/dup vertex with the original vertex on the
-        opposite side of the cut, yielding the pre-cut tet face for orig_surf_set
-        lookup.  Intersection vertices → their below parent; dup vertices →
-        their above parent (symmetric, so both halves map to the same key).
-        Returns None if the mapping is unavailable for any vertex.
+        Map each non-original vertex back to a candidate original vertex and
+        return the pre-cut face key for orig_surf_set lookup.
+
+        A single fixed rule (always above or always below parent) breaks for
+        the 3+1 split: two intersection vertices on the face both come from
+        edges that go to the same single below vertex b, so the naive mapping
+        produces (a1, b, b) — a duplicate key not in orig_surf_set.
+
+        Instead, collect both candidate parents per non-original vertex and
+        try all combinations, returning the first one that forms three distinct
+        vertices whose sorted key is in orig_surf_set.
         """
-        orig = []
+        opts = []
         for v in (v0, v1, v2):
             if v < n_orig:
-                orig.append(v)
-            elif v < n_split:                  # intersection vertex (above-half)
+                opts.append((v,))
+            elif v < n_split:                        # intersection vertex
                 entry = inter_parent.get(v)
                 if entry is None:
                     return None
-                orig.append(entry[1])          # vj_below
-            else:                              # dup vertex (below-half)
+                opts.append((entry[1], entry[0]))    # vj_below first, vi_above fallback
+            else:                                    # dup vertex (below-half)
                 if shared_list is None:
                     return None
                 seam_idx = v - n_split
@@ -656,8 +673,15 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
                 entry = inter_parent.get(int(shared_list[seam_idx]))
                 if entry is None:
                     return None
-                orig.append(entry[0])          # vi_above
-        return tuple(sorted(orig))
+                opts.append((entry[0], entry[1]))    # vi_above first, vj_below fallback
+        for a in opts[0]:
+            for b in opts[1]:
+                for c in opts[2]:
+                    if a != b and b != c and a != c:
+                        key = tuple(sorted((a, b, c)))
+                        if key in orig_surf_set:
+                            return key
+        return None
 
     outer = []
     wound = []
@@ -679,14 +703,25 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
                 outer.append(f)
             # else: interior tet face exposed by split — drop
         else:
-            # Collar face: has original vertices + intersection/dup vertices.
-            # Drop it if the reconstructed pre-cut face was interior.
             if any_orig and inter_data is not None:
                 key = _orig_face_key(v0, v1, v2)
-                if key is not None and key not in orig_surf_set:
+                if key is None or key not in orig_surf_set:
+                    # Interior collar face (or unmappable) — drop.
                     dropped_collar += 1
                     continue
+                # Collar face whose pre-cut parent is an outer surface face.
+                # It is the sliced remnant of that face and belongs on the outer
+                # surface with outward winding, not on the wound surface.
+                if mesh_centroid is not None:
+                    p0 = final_pos[v0]; p1 = final_pos[v1]; p2 = final_pos[v2]
+                    fn = np.cross(p1 - p0, p2 - p0)
+                    to_face = (p0 + p1 + p2) / 3.0 - mesh_centroid
+                    if float(np.dot(fn, to_face)) < 0:
+                        f = np.array([v0, v2, v1], dtype=np.uint32)
+                outer.append(f)
+                continue
 
+            # Pure disc face (no original vertices) — genuine wound surface.
             is_below = v0 >= n_split or v1 >= n_split or v2 >= n_split
             p0 = final_pos[v0]; p1 = final_pos[v1]; p2 = final_pos[v2]
             fn  = np.cross(p1 - p0, p2 - p0)

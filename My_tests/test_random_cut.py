@@ -81,7 +81,7 @@ def _random_cut_plane(rng: np.random.Generator, depth_range: float = 0.7):
 def main():
     logger.setLevel(logger.INFO)
 
-    rng = np.random.default_rng()   # new seed each run
+    rng = np.random.default_rng(1)  # fixed seed — change to try different cuts
     normal, origin, blade_dir = _random_cut_plane(rng)
 
     print("=" * 50)
