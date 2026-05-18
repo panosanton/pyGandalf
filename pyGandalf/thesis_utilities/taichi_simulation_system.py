@@ -111,9 +111,9 @@ class _SpringMassSimulator:
         self._sk = np.concatenate([self._sk, sk_new.astype(np.float32)])
         return start
 
-    def step(self, dt: float, damping: float, v_max: float = 10.0):
+    def step(self, dt: float, damping: float, spring_damp: float = 0.0, v_max: float = 10.0):
         self._clear_forces()
-        self._spring_forces(self._sa, self._sb, self._sr, self._sk)
+        self._spring_forces(self._sa, self._sb, self._sr, self._sk, float(spring_damp))
         self._integrate(float(dt), float(damping), self._gravity, float(v_max))
 
     # --- Taichi kernels ---
@@ -125,10 +125,11 @@ class _SpringMassSimulator:
 
     @ti.kernel
     def _spring_forces(self,
-                       sa: ti.types.ndarray(dtype=ti.i32, ndim=1),
-                       sb: ti.types.ndarray(dtype=ti.i32, ndim=1),
-                       sr: ti.types.ndarray(dtype=ti.f32, ndim=1),
-                       sk: ti.types.ndarray(dtype=ti.f32, ndim=1)):
+                       sa:          ti.types.ndarray(dtype=ti.i32, ndim=1),
+                       sb:          ti.types.ndarray(dtype=ti.i32, ndim=1),
+                       sr:          ti.types.ndarray(dtype=ti.f32, ndim=1),
+                       sk:          ti.types.ndarray(dtype=ti.f32, ndim=1),
+                       spring_damp: ti.f32):
         for s in range(sa.shape[0]):
             a  = sa[s]
             b  = sb[s]
@@ -137,7 +138,13 @@ class _SpringMassSimulator:
             d  = pb - pa
             length = d.norm()
             if length > 1e-8:
-                f = sk[s] * (length - sr[s]) / length * d
+                spring_dir = d / length
+                # Hooke's law
+                f_spring = sk[s] * (length - sr[s])
+                # Spring damping: opposes relative velocity along the spring axis.
+                # Prevents overshoot/oscillation without slowing unrelated motion.
+                v_rel = (self.velocities[b] - self.velocities[a]).dot(spring_dir)
+                f = (f_spring + spring_damp * v_rel) * spring_dir
                 self._forces[a] += f
                 self._forces[b] -= f
 
@@ -193,6 +200,7 @@ class TaichiSimulationComponent(Component):
                  opening_speed:      float = 1.0,
                  poke_speed:         float = 3.0,
                  v_max:              float = 1.5,
+                 spring_damping:     float = 0.0,
                  blade_travel_dir:   list  = None,
                  blade_speed:        float = 0.5,
                  split_disc_verts:   bool  = True):
@@ -207,6 +215,7 @@ class TaichiSimulationComponent(Component):
         self.opening_speed = opening_speed
         self.poke_speed    = poke_speed
         self.v_max         = v_max
+        self.spring_damping = spring_damping
 
         # Populated by TaichiSimulationSystem.on_create_entity
         self.simulator:           _SpringMassSimulator = None
@@ -376,7 +385,7 @@ class TaichiSimulationSystem(System):
         if not comp.sim_paused:
             sub_dt = comp.time_step / comp.substeps
             for _ in range(comp.substeps):
-                comp.simulator.step(sub_dt, comp.damping, comp.v_max)
+                comp.simulator.step(sub_dt, comp.damping, comp.spring_damping, comp.v_max)
 
             # Force audit: runs once on the first simulated frame after a cut.
             if comp._pending_force_audit and comp._n_orig is not None:
@@ -384,7 +393,8 @@ class TaichiSimulationSystem(System):
                 comp.simulator._clear_forces()
                 comp.simulator._spring_forces(
                     comp.simulator._sa, comp.simulator._sb,
-                    comp.simulator._sr, comp.simulator._sk)
+                    comp.simulator._sr, comp.simulator._sk,
+                    float(comp.spring_damping))
                 _print_force_audit(
                     comp.simulator._forces.to_numpy(),
                     comp._n_orig,
