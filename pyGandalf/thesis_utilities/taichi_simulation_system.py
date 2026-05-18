@@ -248,7 +248,15 @@ class TaichiSimulationComponent(Component):
         self._cut_normal:        np.ndarray = None  # normalized cut plane normal
         self._disc_split_phys_idx: np.ndarray = None  # physics indices of rendering disc duplicates
 
-        # Debug coloring (D key) — stored so yellow overlay can be applied on top
+        # Unindexed (per-face) rendering — active after the first cut.
+        # Each triangle gets its own 3 private vertices so face colors never blend.
+        # comp.surface_indices keeps original vertex indices for normal computation.
+        # The GPU index buffer is trivial ([0,1,2,3,...]) and only covers visible faces.
+        self._face_expanded:    bool       = False
+        self._all_render_faces: np.ndarray = None  # (N_all_faces, 3) outer+ALL wound, for expansion
+        self._n_outer_faces:    int        = 0     # len(outer_faces) — constant after cut
+
+        # Per-face debug colors (N_all_faces, 3) — stored so yellow overlay stays persistent.
         self._debug_colors: np.ndarray = None
 
 
@@ -387,8 +395,17 @@ class TaichiSimulationSystem(System):
             new_normals = _compute_normals(render_positions, comp.surface_indices)
         t3 = time.perf_counter()
 
-        _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[0], render_positions)
-        _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[1], new_normals)
+        # In unindexed mode every face owns its 3 vertices — expand before upload.
+        if comp._face_expanded and comp._all_render_faces is not None:
+            flat = comp._all_render_faces.flatten()
+            upload_pos  = render_positions[flat].reshape(-1, 3)
+            upload_norm = new_normals[flat].reshape(-1, 3)
+        else:
+            upload_pos  = render_positions
+            upload_norm = new_normals
+
+        _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[0], upload_pos)
+        _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[1], upload_norm)
         t4 = time.perf_counter()
 
         if not hasattr(self, '_fc'):
@@ -906,16 +923,29 @@ def _perform_cut(comp: TaichiSimulationComponent,
 
     all_faces = (np.vstack([outer_faces, np.array(disc_faces, dtype=np.uint32)])
                  if disc_faces else outer_faces)
-    comp.surface_indices = all_faces
-    new_normals   = _compute_normals_post_cut(render_pos, all_faces,
-                                              n_orig, n_split, inter_data, shared_list, normal)
-    new_texcoords = np.zeros((len(render_pos), 2), dtype=np.float32)
-    debug_colors  = _compute_debug_colors(len(render_pos), all_faces, n_orig)
-    comp._debug_colors = debug_colors.copy()
-    print(f"[Cut] Surface: {len(raw_surface):,} raw → {len(all_faces):,} kept")
+    comp.surface_indices    = all_faces   # kept as original indices for normal computation
+    comp._all_render_faces  = all_faces   # one-shot cut: all faces visible immediately
+    comp._n_outer_faces     = len(outer_faces)
+    comp._face_expanded     = True
 
-    _realloc_gpu_buffers(mesh_comp, render_pos, new_normals, new_texcoords, all_faces,
-                         colors=debug_colors)
+    new_normals       = _compute_normals_post_cut(render_pos, all_faces,
+                                                  n_orig, n_split, inter_data, shared_list, normal)
+    face_colors       = _compute_debug_face_colors(all_faces, n_orig)
+    comp._debug_colors = face_colors.copy()
+
+    # Build expanded (unindexed) arrays — each face owns its 3 private vertices.
+    flat              = all_faces.flatten()
+    exp_pos           = render_pos[flat].reshape(-1, 3)
+    exp_norm          = new_normals[flat].reshape(-1, 3)
+    exp_tex           = np.zeros((len(all_faces) * 3, 2), dtype=np.float32)
+    exp_colors        = np.repeat(face_colors, 3, axis=0)
+    trivial_idx       = np.arange(len(all_faces) * 3, dtype=np.uint32).reshape(-1, 3)
+
+    print(f"[Cut] Surface: {len(raw_surface):,} raw → {len(all_faces):,} kept "
+          f"({len(exp_pos):,} expanded verts)")
+
+    _realloc_gpu_buffers(mesh_comp, exp_pos, exp_norm, exp_tex, trivial_idx,
+                         colors=exp_colors)
     print("[Cut] GPU buffers updated.")
 
 
@@ -1028,26 +1058,43 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     comp._wound_faces_by_dist = wound_by_dist
     comp._wound_face_ptr      = 0
 
-    # Initial surface = outer faces only (wound hidden until blade reaches it).
-    comp.surface_indices = outer_faces.copy()
-    new_normals   = _compute_normals_post_cut(render_pos, comp.surface_indices,
-                                              n_orig, n_split, inter_data, shared_list, normal)
-    new_texcoords = np.zeros((len(render_pos), 2), dtype=np.float32)
+    # Build the full face array (outer first, then ALL wound in travel order).
+    # This is the expansion template: outer faces occupy slots [0..n_outer-1],
+    # wound faces occupy [n_outer..n_outer+n_wound-1] in the same sorted order
+    # as _wound_faces_by_dist, so the trivial index buffer can simply grow.
+    wound_arr = (np.array([f for _, f in wound_by_dist], dtype=np.uint32)
+                 if wound_by_dist else np.zeros((0, 3), dtype=np.uint32))
+    all_render_faces = (np.vstack([outer_faces, wound_arr])
+                        if len(wound_arr) > 0 else outer_faces.copy())
 
-    # Compute debug colors over the FULL face set so collar/disc vertices are
-    # correctly identified even though wound faces start hidden.
-    wound_arr = (np.array(wound_for_render, dtype=np.uint32)
-                 if wound_for_render else np.zeros((0, 3), dtype=np.uint32))
-    full_faces   = (np.vstack([outer_faces, wound_arr])
-                    if len(wound_arr) > 0 else outer_faces)
-    debug_colors = _compute_debug_colors(len(render_pos), full_faces, n_orig)
-    comp._debug_colors = debug_colors.copy()
+    comp.surface_indices    = outer_faces.copy()   # original indices for normal computation
+    comp._all_render_faces  = all_render_faces      # full set for per-frame expansion
+    comp._n_outer_faces     = len(outer_faces)
+    comp._face_expanded     = True
+
+    # Per-face debug colors for the full set (wound faces pre-colored even while hidden).
+    face_colors        = _compute_debug_face_colors(all_render_faces, n_orig)
+    comp._debug_colors = face_colors.copy()
+
+    new_normals = _compute_normals_post_cut(render_pos, comp.surface_indices,
+                                            n_orig, n_split, inter_data, shared_list, normal)
+
+    # Build expanded (unindexed) arrays for the full face set.
+    flat_all   = all_render_faces.flatten()
+    exp_pos    = render_pos[flat_all].reshape(-1, 3)
+    exp_norm   = new_normals[flat_all].reshape(-1, 3)   # hidden wound normals = zero initially (OK)
+    exp_tex    = np.zeros((len(all_render_faces) * 3, 2), dtype=np.float32)
+    exp_colors = np.repeat(face_colors, 3, axis=0)
+
+    # Initially only outer faces visible — trivial index buffer covers first n_outer*3 verts.
+    trivial_outer = np.arange(len(outer_faces) * 3, dtype=np.uint32).reshape(-1, 3)
 
     print(f"[Blade] Surface: {len(outer_faces):,} outer + "
-          f"{len(wound_faces):,} wound faces (hidden until blade passes)")
+          f"{len(wound_faces):,} wound faces (hidden until blade passes) | "
+          f"{len(all_render_faces):,} total expanded faces")
 
-    _realloc_gpu_buffers(mesh_comp, render_pos, new_normals, new_texcoords,
-                         comp.surface_indices, colors=debug_colors)
+    _realloc_gpu_buffers(mesh_comp, exp_pos, exp_norm, exp_tex, trivial_outer,
+                         colors=exp_colors)
 
     comp.blade_initialized = True
     comp.blade_is_active   = True
@@ -1098,15 +1145,16 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
     if faces_added:
         comp._wound_face_ptr = ptr
         revealed = [f for _, f in wbd[:ptr]]
-        comp.surface_indices = (
+        comp.surface_indices = (                           # original indices for normals
             np.vstack([comp._outer_faces,
                        np.array(revealed, dtype=np.uint32)])
             if revealed else comp._outer_faces.copy()
         )
         mesh_comp.indices = comp.surface_indices
 
-        # Realloc index buffer (face count changed).
-        flat_idx = comp.surface_indices.flatten().astype(np.uint32)
+        # Trivial index buffer grows to cover outer + revealed wound face slots.
+        n_vis    = comp._n_outer_faces + ptr
+        flat_idx = np.arange(n_vis * 3, dtype=np.uint32)
         gl.glBindVertexArray(mesh_comp.render_pipeline)
         gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, mesh_comp.index_buffer)
         gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, flat_idx.nbytes, flat_idx,
@@ -1125,7 +1173,8 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
                 if revealed else comp._outer_faces.copy()
             )
             mesh_comp.indices = comp.surface_indices
-            flat_idx = comp.surface_indices.flatten().astype(np.uint32)
+            n_vis    = comp._n_outer_faces + len(wbd)
+            flat_idx = np.arange(n_vis * 3, dtype=np.uint32)
             gl.glBindVertexArray(mesh_comp.render_pipeline)
             gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, mesh_comp.index_buffer)
             gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, flat_idx.nbytes, flat_idx,
@@ -1189,98 +1238,85 @@ def _check_disc_parallelism(comp: TaichiSimulationComponent,
     below_mask = ~above_mask
 
     PARALLEL_THRESHOLD = 0.95  # |dot| below this ≈ more than ~18° off-plane
-    non_parallel_verts: set = set()
+
+    # Overlay yellow on non-parallel faces in the per-face color array.
+    all_render_faces = comp._all_render_faces
+    if comp._debug_colors is not None and all_render_faces is not None:
+        face_colors = comp._debug_colors.copy()   # (N_all_faces, 3)
+    else:
+        all_faces   = (np.vstack([comp._outer_faces, all_disc])
+                       if comp._outer_faces is not None and len(comp._outer_faces) > 0
+                       else all_disc)
+        face_colors = _compute_debug_face_colors(all_faces, n_orig)
+
+    YELLOW = np.array([0.95, 0.85, 0.1], dtype=np.float32)
+    # Map each non-parallel disc face back to its index in _all_render_faces.
+    # all_disc comes from _wound_faces_by_dist; wound faces start at _n_outer_faces in all_render_faces.
+    n_outer   = comp._n_outer_faces
+    disc_face_indices_in_all = np.where(
+        np.all(all_render_faces >= n_orig, axis=1)
+    )[0]   # indices of disc faces within all_render_faces
 
     for label, gmask in [("above", above_mask), ("below", below_mask)]:
         gfaces   = all_disc[gmask]
         gnormals = fn[gmask]
-
         if len(gfaces) < 2:
             print(f"[DiscCheck] {label}-half: only {len(gfaces)} face(s) — skipping.")
             continue
-
-        # Face centroids: render_pos[gfaces] is (K,3,3); mean over axis=1 → (K,3)
-        centroids  = render_pos[gfaces].mean(axis=1)
-        group_cen  = centroids.mean(axis=0)
-        ref_idx    = int(np.argmin(np.linalg.norm(centroids - group_cen, axis=1)))
-        ref_n      = gnormals[ref_idx]
-
-        abs_dots = np.abs(gnormals @ ref_n)
-        bad      = abs_dots < PARALLEL_THRESHOLD
-        n_bad    = int(bad.sum())
+        centroids = render_pos[gfaces].mean(axis=1)
+        group_cen = centroids.mean(axis=0)
+        ref_idx   = int(np.argmin(np.linalg.norm(centroids - group_cen, axis=1)))
+        ref_n     = gnormals[ref_idx]
+        abs_dots  = np.abs(gnormals @ ref_n)
+        bad       = abs_dots < PARALLEL_THRESHOLD
+        n_bad     = int(bad.sum())
         print(f"[DiscCheck] {label}-half: {len(gfaces)} faces, "
-              f"ref face idx {ref_idx} (centroid {centroids[ref_idx].round(3)}), "
+              f"ref centroid {centroids[ref_idx].round(3)}, "
               f"{n_bad} non-parallel (|dot|<{PARALLEL_THRESHOLD})")
 
+        # Find global face indices in all_render_faces for the bad faces in this half.
+        half_disc_global = disc_face_indices_in_all[gmask]
         for fi in np.where(bad)[0]:
-            for v in gfaces[fi]:
-                non_parallel_verts.add(int(v))
+            face_colors[half_disc_global[fi]] = YELLOW
 
-    # Overlay yellow on top of the stored green/blue/red base colors
-    if comp._debug_colors is not None:
-        debug_colors = comp._debug_colors.copy()
-    else:
-        all_faces    = (np.vstack([comp._outer_faces, all_disc])
-                        if comp._outer_faces is not None and len(comp._outer_faces) > 0
-                        else all_disc)
-        debug_colors = _compute_debug_colors(len(render_pos), all_faces, n_orig)
+    n_yellow = int(np.all(face_colors == YELLOW, axis=1).sum())
 
-    YELLOW = np.array([0.95, 0.85, 0.1], dtype=np.float32)
-    for v in non_parallel_verts:
-        if v < len(debug_colors):
-            debug_colors[v] = YELLOW
-
-    if len(mesh_comp.buffers) > 3:
-        flat_col = debug_colors.flatten().astype(np.float32)
+    if len(mesh_comp.buffers) > 3 and all_render_faces is not None:
+        exp_colors = np.repeat(face_colors, 3, axis=0).astype(np.float32)
+        flat_col   = exp_colors.flatten()
         gl.glBindVertexArray(mesh_comp.render_pipeline)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, mesh_comp.buffers[3])
         gl.glBufferData(gl.GL_ARRAY_BUFFER, flat_col.nbytes, flat_col, gl.GL_DYNAMIC_DRAW)
         gl.glBindVertexArray(0)
 
-    if non_parallel_verts:
-        print(f"[DiscCheck] {len(non_parallel_verts)} vertices colored yellow.")
+    if n_yellow > 0:
+        print(f"[DiscCheck] {n_yellow} non-parallel disc faces colored yellow.")
     else:
         print("[DiscCheck] All disc faces are parallel to their reference — no artifacts detected.")
 
 
-def _compute_debug_colors(n_verts: int,
-                           surface_faces: np.ndarray,
-                           n_orig: int) -> np.ndarray:
+def _compute_debug_face_colors(faces: np.ndarray, n_orig: int) -> np.ndarray:
     """
-    Assign per-vertex debug colors after a cut:
-      green (0.3, 0.7, 0.4) — regular outer face (all original vertices)
-      blue  (0.15, 0.35, 0.9) — collar vertex (original vertex touching the cut rim,
-                                 or intersection vertex in a collar face)
-      red   (0.85, 0.1, 0.1)  — disc vertex (wound face where all vertices >= n_orig)
-    Priority: red > blue > green.
+    Assign one color per face (not per vertex) for crisp unblended debug rendering.
+      green (0.3, 0.7, 0.4)  — regular outer face  (all vertices < n_orig)
+      blue  (0.15, 0.35, 0.9) — collar face         (mixed: some vertices >= n_orig)
+      red   (0.85, 0.1, 0.1)  — disc / wound face   (all vertices >= n_orig)
+    Returns (N_faces, 3) float32.
     """
-    COLOR_GREEN = np.array([0.3,  0.7,  0.4],  dtype=np.float32)
-    COLOR_BLUE  = np.array([0.15, 0.35, 0.9],  dtype=np.float32)
-    COLOR_RED   = np.array([0.85, 0.1,  0.1],  dtype=np.float32)
+    n = len(faces)
+    colors = np.tile([0.3, 0.7, 0.4], (n, 1)).astype(np.float32)
 
-    priority = np.zeros(n_verts, dtype=np.int32)
+    v = faces  # (N, 3)
+    all_new = np.all(v >= n_orig, axis=1)
+    any_new = np.any(v >= n_orig, axis=1)
 
-    for f in surface_faces:
-        v0, v1, v2 = int(f[0]), int(f[1]), int(f[2])
-        all_new = v0 >= n_orig and v1 >= n_orig and v2 >= n_orig
-        any_new = v0 >= n_orig or  v1 >= n_orig or  v2 >= n_orig
+    colors[any_new & ~all_new] = [0.15, 0.35, 0.9]   # blue — collar
+    colors[all_new]             = [0.85, 0.1,  0.1]   # red  — disc
 
-        if all_new:
-            for v in (v0, v1, v2):
-                if v < n_verts and priority[v] < 2:
-                    priority[v] = 2
-        elif any_new:
-            for v in (v0, v1, v2):
-                if v < n_verts and priority[v] < 1:
-                    priority[v] = 1
-
-    colors = np.tile(COLOR_GREEN, (n_verts, 1))
-    colors[priority == 1] = COLOR_BLUE
-    colors[priority == 2] = COLOR_RED
-    n_blue = int((priority == 1).sum())
-    n_red  = int((priority == 2).sum())
-    print(f"[Cut] Debug colors: {n_blue} collar (blue), {n_red} disc (red), "
-          f"{n_verts - n_blue - n_red} outer (green)")
+    n_blue = int((any_new & ~all_new).sum())
+    n_red  = int(all_new.sum())
+    print(f"[Cut] Debug colors: {n_blue} collar faces (blue), {n_red} disc faces (red), "
+          f"{n - n_blue - n_red} outer faces (green)")
     return colors
 
 

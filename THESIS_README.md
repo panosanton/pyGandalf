@@ -80,22 +80,21 @@ pip install fast-simplification
 - **P** — pause / resume physics simulation (blade still advances when paused)
 - **X** — disc parallelism check (see below)
 
-**Debug coloring (active in test_random_cut.py):**
-- Requires `lit_blinn_phong_debug.vs/.fs` shaders and a 4th vertex attribute (per-vertex color, location 3)
-- `_compute_debug_colors(n_verts, surface_faces, n_orig)` — classifies vertices by face type after cut:
-  - **Green** — regular outer surface (all-original vertices, index < n_orig)
-  - **Blue** — collar vertex (original vertex adjacent to cut rim, or intersection vertex in collar face)
-  - **Red** — disc vertex (wound surface face where all vertex indices >= n_orig)
-- Color priority: red > blue > green (a vertex appearing in both collar and disc faces gets red)
-- Colors computed over the full face set (outer + all wound faces) even though wound faces start hidden
-- Uploaded once to GPU buffer[3] at cut time; stored in `comp._debug_colors` for overlay use
+**Debug coloring + per-face unindexed rendering (active in test_random_cut.py):**
+- Requires `lit_blinn_phong_debug.vs/.fs` shaders and a 4th attribute (per-face color, location 3)
+- Rendering uses an **unindexed (exploded) layout**: each triangle owns 3 private vertices so face colors never interpolate across boundaries. Full wound-face buffer pre-allocated at cut time; trivial index buffer (`0,1,2, 3,4,5, …`) grows as blade reveals faces.
+- `_compute_debug_face_colors(faces, n_orig)` — assigns one color per face (vectorised):
+  - **Green** — all vertices are original (index < n_orig): regular outer surface
+  - **Blue** — mixed vertices (some original, some new): collar face at cut boundary
+  - **Red** — all vertices are new (index >= n_orig): disc (wound surface) face
+- Colors stored per-face in `comp._debug_colors` (shape `(N_faces, 3)`); uploaded to GPU as `np.repeat(face_colors, 3, axis=0)` to match the 3×private-vertex layout
 - `_check_disc_parallelism(comp, mesh_comp)` — **X key**, runs at any point after cut:
-  - Reads all wound faces from `comp._wound_faces_by_dist` (full disc regardless of blade progress)
+  - Collects all red (disc) faces from `comp._all_render_faces`
   - Computes per-face normals via cross product on current (post-simulation) positions
   - Separates above/below disc halves by sign of `dot(face_normal, cut_normal)`
   - For each half, picks the face nearest to the group centroid as reference
   - Colors **yellow** any disc face with `|dot(face_normal, ref_normal)| < 0.95` (~18° off-plane)
-  - Overlays yellow on top of the stored green/blue/red base colors without recomputing
+  - Overlays yellow on top of stored base colors; re-uploads only buffer[3]
 
 **Performance notes:**
 - `substeps=4`, `time_step=0.005` gives ~30 FPS on bunny with GPU
