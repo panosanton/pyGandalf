@@ -259,6 +259,9 @@ class TaichiSimulationComponent(Component):
         # Per-face debug colors (N_all_faces, 3) — stored so yellow overlay stays persistent.
         self._debug_colors: np.ndarray = None
 
+        # Set True after a cut; consumed on the next simulated frame to print a force audit.
+        self._pending_force_audit: bool = False
+
 
 # ---------------------------------------------------------------------------
 # System
@@ -374,6 +377,18 @@ class TaichiSimulationSystem(System):
             sub_dt = comp.time_step / comp.substeps
             for _ in range(comp.substeps):
                 comp.simulator.step(sub_dt, comp.damping, comp.v_max)
+
+            # Force audit: runs once on the first simulated frame after a cut.
+            if comp._pending_force_audit and comp._n_orig is not None:
+                comp._pending_force_audit = False
+                comp.simulator._clear_forces()
+                comp.simulator._spring_forces(
+                    comp.simulator._sa, comp.simulator._sb,
+                    comp.simulator._sr, comp.simulator._sk)
+                _print_force_audit(
+                    comp.simulator._forces.to_numpy(),
+                    comp._n_orig,
+                    comp.simulator.positions.shape[0])
         t1 = time.perf_counter()
 
         new_positions = comp.simulator.positions.to_numpy()
@@ -624,7 +639,10 @@ def _cut_topology(comp: TaichiSimulationComponent,
     # --- Vertex duplication (seam) ---
     above_vert_set = set(above_tets.flatten().tolist())
     below_vert_set = set(below_tets.flatten().tolist())
-    shared_list    = sorted(above_vert_set & below_vert_set)
+    # Only duplicate intersection vertices (idx >= n_orig).  Original vertices
+    # at signed_dist ≈ 0 appear in both sets but must NOT be duplicated — they
+    # sit on the cut plane and should stay shared between both halves.
+    shared_list    = sorted(v for v in (above_vert_set & below_vert_set) if v >= n_orig)
     n_shared       = len(shared_list)
     print(f"[Cut] Duplicating {n_shared} seam vertices")
 
@@ -655,37 +673,19 @@ def _cut_topology(comp: TaichiSimulationComponent,
     )
     comp.simulator.velocities.from_numpy(final_vel.astype(np.float32))
 
-    # --- Zero short collar-to-seam springs ---
-    # Original vertices close to the cut plane have very short springs to nearby
-    # intersection/seam-dup vertices.  When seam vertices receive opening velocity
-    # these short springs immediately tension and violently pull collar face
-    # original vertices, creating visible flap artifacts.  Zeroing them lets
-    # collar vertices remain in their natural positions (they stay constrained
-    # by their other structural springs to neighbouring original vertices).
-    #
-    # Threshold: the distance the seam vertex travels in one frame.  Any original
-    # vertex closer than this to the cut plane is effectively co-located with the
-    # seam vertex for the first few substeps, making the spring stiffness
-    # produce forces well beyond the CFL safety margin for that vertex.
-    sub_dt          = comp.time_step / comp.substeps
-    close_threshold = comp.opening_speed * sub_dt * 5.0
-    if close_threshold > 0.0:
-        sa_arr = comp.simulator._sa
-        sb_arr = comp.simulator._sb
-        is_orig_a   = sa_arr < n_orig
-        is_orig_b   = sb_arr < n_orig
-        is_new_a    = sa_arr >= n_orig
-        is_new_b    = sb_arr >= n_orig
-        orig_to_new = (is_orig_a & is_new_b) | (is_orig_b & is_new_a)
-        short_spring = comp.simulator._sr < close_threshold
-        bad_mask     = orig_to_new & short_spring
-        comp.simulator._sk[bad_mask] = 0.0
-        if bad_mask.any():
-            print(f"[Cut] Zeroed {int(bad_mask.sum())} short collar-seam springs "
-                  f"(threshold {close_threshold:.4f})")
+    # No spring zeroing: orig→new springs are structural tet edges that are
+    # needed for mesh connectivity.  Zeroing them disconnects the disc from
+    # the hemispheres (Fix 3 mistake — verified by force audit).
+    # Collar deformation from opening velocity is physically correct elastic
+    # behaviour; reduce opening_speed if it looks too violent.
 
     print(f"[Cut] Simulator: {len(final_pos):,} verts, "
           f"{len(all_tets):,} tets, {len(comp.simulator._sa):,} springs")
+
+    _print_spring_audit(
+        comp.simulator._sa, comp.simulator._sb,
+        comp.simulator._sr, comp.simulator._sk,
+        n_orig)
 
     return (final_pos, final_vel, final_mass, final_fixed,
             all_tets, n_orig, n_split, shared_list, remap, inter_data,
@@ -901,6 +901,7 @@ def _perform_cut(comp: TaichiSimulationComponent,
             vels[dup_indices]   -= comp.opening_speed * normal
         comp.simulator.velocities.from_numpy(vels.astype(np.float32))
         print(f"[Cut] Opening velocity on {len(inter_indices)} + {len(dup_indices)} verts")
+    comp._pending_force_audit = True
 
     # --- Surface ---
     raw_surface = _extract_boundary_faces(all_tets, final_pos)
@@ -1126,6 +1127,9 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
                     if not p['broken'] and p['travel_dist'] <= comp.blade_travel]
 
     if newly_broken:
+        first_break = not any(p['broken'] for p in comp._seam_pairs)
+        if first_break:
+            comp._pending_force_audit = True
         # Batch the velocity round-trip.
         vels = comp.simulator.velocities.to_numpy()
         for p in newly_broken:
@@ -1184,6 +1188,75 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
         comp.blade_is_active = False
         n_broken = sum(1 for p in comp._seam_pairs if p['broken'])
         print(f"[Blade] Cut complete — {n_broken:,} seam springs broken.")
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic helpers (Analysis 1 + 2)
+# ---------------------------------------------------------------------------
+
+def _print_spring_audit(sa: np.ndarray, sb: np.ndarray,
+                        sr: np.ndarray, sk: np.ndarray,
+                        n_orig: int):
+    """
+    Analysis 2 — rest-length distribution of orig→new springs after Fix 2.
+
+    Prints how many such springs exist, their rest-length histogram, and how
+    many were left active (not zeroed by Fix 2).  Run immediately after
+    _cut_topology so the state reflects the fix that was applied.
+    """
+    orig_to_new = ((sa < n_orig) & (sb >= n_orig)) | ((sb < n_orig) & (sa >= n_orig))
+    count = int(orig_to_new.sum())
+    print(f"[SpringAudit] orig→new springs total: {count}")
+    if count == 0:
+        return
+
+    rls      = sr[orig_to_new]
+    active   = sk[orig_to_new] != 0.0
+    n_active = int(active.sum())
+    n_zeroed = count - n_active
+
+    print(f"[SpringAudit] rest_len  min={rls.min():.4f}  mean={rls.mean():.4f}  "
+          f"max={rls.max():.4f}  std={rls.std():.4f}")
+    print(f"[SpringAudit] zeroed by Fix 2: {n_zeroed}   still active: {n_active}")
+
+    bins   = [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, float('inf')]
+    labels = ['<0.01', '0.01-0.02', '0.02-0.05', '0.05-0.1',
+              '0.1-0.2', '0.2-0.5', '>0.5']
+    for lo, hi, label in zip(bins[:-1], bins[1:], labels):
+        n_all = int(((rls >= lo) & (rls < hi)).sum())
+        n_act = int(((rls[active] >= lo) & (rls[active] < hi)).sum()) if n_active > 0 else 0
+        print(f"  {label:>12s}: {n_all:4d} total  {n_act:4d} active")
+
+
+def _print_force_audit(forces: np.ndarray, n_orig: int, n_total: int):
+    """
+    Analysis 1 — net force magnitudes on the first simulated frame after a cut.
+
+    Prints per-category statistics (original vertices vs new vertices) and the
+    top-10 vertices by net force magnitude.  Called once after the first batch
+    of substeps runs, so opening velocity has already been applied and spring
+    forces from the compressed/stretched orig→new springs are visible.
+    """
+    mags = np.linalg.norm(forces, axis=1)
+    orig_mags = mags[:n_orig]
+    new_mags  = mags[n_orig:n_total] if n_total > n_orig else np.zeros(0)
+
+    print(f"[ForceAudit] Net forces on frame 1 after cut:")
+    top5_orig = np.sort(orig_mags)[::-1][:5]
+    print(f"  Original verts ({n_orig}):  "
+          f"max={orig_mags.max():.4f}  mean={orig_mags.mean():.5f}  "
+          f"top5={top5_orig.round(4).tolist()}")
+    if len(new_mags) > 0:
+        top5_new = np.sort(new_mags)[::-1][:5]
+        print(f"  New verts     ({len(new_mags)}):  "
+              f"max={new_mags.max():.4f}  mean={new_mags.mean():.5f}  "
+              f"top5={top5_new.round(4).tolist()}")
+
+    top10_idx = np.argsort(mags)[::-1][:10]
+    print(f"[ForceAudit] Top 10 vertices by |F|:")
+    for rank, idx in enumerate(top10_idx):
+        cat = "orig" if idx < n_orig else "new "
+        print(f"  #{rank+1:2d}: vertex {idx:5d} ({cat})  |F|={mags[idx]:.5f}")
 
 
 # ---------------------------------------------------------------------------

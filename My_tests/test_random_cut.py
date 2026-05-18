@@ -149,7 +149,7 @@ def main():
         damping          = 3.5,
         total_mass       = 100.0,
         gravity          = [0.0, 0.0, 0.0],
-        opening_speed    = 2.0,
+        opening_speed    = 0.5,
         poke_speed       = 2.0,
         v_max            = 3.0,
         blade_travel_dir = blade_dir.tolist(),
