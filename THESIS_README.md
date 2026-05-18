@@ -77,11 +77,36 @@ pip install fast-simplification
 - **F** — poke (downward impulse on top vertices)
 - **B** — first press: initialise and start progressive blade cut; subsequent presses: pause/resume blade
 - **C** — one-shot cut at the configured plane (disabled once B has been used)
+- **P** — pause / resume physics simulation (blade still advances when paused)
+- **X** — disc parallelism check (see below)
+
+**Debug coloring (active in test_random_cut.py):**
+- Requires `lit_blinn_phong_debug.vs/.fs` shaders and a 4th vertex attribute (per-vertex color, location 3)
+- `_compute_debug_colors(n_verts, surface_faces, n_orig)` — classifies vertices by face type after cut:
+  - **Green** — regular outer surface (all-original vertices, index < n_orig)
+  - **Blue** — collar vertex (original vertex adjacent to cut rim, or intersection vertex in collar face)
+  - **Red** — disc vertex (wound surface face where all vertex indices >= n_orig)
+- Color priority: red > blue > green (a vertex appearing in both collar and disc faces gets red)
+- Colors computed over the full face set (outer + all wound faces) even though wound faces start hidden
+- Uploaded once to GPU buffer[3] at cut time; stored in `comp._debug_colors` for overlay use
+- `_check_disc_parallelism(comp, mesh_comp)` — **X key**, runs at any point after cut:
+  - Reads all wound faces from `comp._wound_faces_by_dist` (full disc regardless of blade progress)
+  - Computes per-face normals via cross product on current (post-simulation) positions
+  - Separates above/below disc halves by sign of `dot(face_normal, cut_normal)`
+  - For each half, picks the face nearest to the group centroid as reference
+  - Colors **yellow** any disc face with `|dot(face_normal, ref_normal)| < 0.95` (~18° off-plane)
+  - Overlays yellow on top of the stored green/blue/red base colors without recomputing
 
 **Performance notes:**
 - `substeps=4`, `time_step=0.005` gives ~30 FPS on bunny with GPU
 - Normals: moved from NumPy `np.add.at` (50ms) to Taichi GPU kernels (4ms)
 - Stability limit: `sub_dt < dt_crit = 2*sqrt(m_vertex / k_effective)`
+
+### `pyGandalf/resources/shaders/opengl/lit_blinn_phong_debug.vs` / `.fs`
+
+**Added (debug coloring for cut investigation):**
+- Vertex shader: same as `lit_blinn_phong.vs` plus `layout(location = 3) in vec3 a_Color` passed through as `v_Color`
+- Fragment shader: same as `lit_blinn_phong.fs` but uses `v_Color` per-vertex instead of the `u_Color` material uniform
 
 ### `pyGandalf/thesis_utilities/sofa_simulation_system.py`
 
@@ -117,11 +142,15 @@ pip install fast-simplification
 
 ## Test Files
 
-### `My_tests/test_cutting_simulation.py` — **ACTIVE DEVELOPMENT FILE**
-- Taichi spring-mass simulation on sphere.obj with progressive blade cutting
-- Controls: F = poke, B = start/pause progressive blade cut (left → right), C = one-shot cut (disabled once B used)
-- Current params: stiffness=50, damping=0.5, total_mass=100, substeps=4, time_step=0.005
-- Cut plane: y=0 (horizontal equator); blade travels along +X at 0.5 m/s
+### `My_tests/test_random_cut.py` — **ACTIVE DEVELOPMENT FILE**
+- Taichi spring-mass simulation on sphere.obj with randomised progressive blade cut
+- Random cut plane angle and depth each run (fixed seed=5 for reproducibility; change seed to explore)
+- Controls: F = poke, B = start/pause progressive blade cut, C = one-shot cut (disabled once B used), P = pause/resume physics
+- Current params: stiffness=200, damping=3.5, total_mass=100, substeps=4, time_step=0.005, opening_speed=2.0
+- Uses `debug_mesh` shader (lit_blinn_phong_debug) + per-vertex debug colors (green/blue/red) for cut debugging
+
+### `My_tests/test_cutting_simulation.py`
+- Earlier version with fixed horizontal cut plane — superseded by test_random_cut.py
 
 ### `My_tests/test_sofa_simulation.py`
 - SOFA FEM simulation (bunny.obj). Uses `SofaSimulationSystem`. Kept for reference.
