@@ -111,9 +111,9 @@ class _SpringMassSimulator:
         self._sk = np.concatenate([self._sk, sk_new.astype(np.float32)])
         return start
 
-    def step(self, dt: float, damping: float, v_max: float = 10.0):
+    def step(self, dt: float, damping: float, spring_damp: float = 0.0, v_max: float = 10.0):
         self._clear_forces()
-        self._spring_forces(self._sa, self._sb, self._sr, self._sk)
+        self._spring_forces(self._sa, self._sb, self._sr, self._sk, float(spring_damp))
         self._integrate(float(dt), float(damping), self._gravity, float(v_max))
 
     # --- Taichi kernels ---
@@ -125,10 +125,11 @@ class _SpringMassSimulator:
 
     @ti.kernel
     def _spring_forces(self,
-                       sa: ti.types.ndarray(dtype=ti.i32, ndim=1),
-                       sb: ti.types.ndarray(dtype=ti.i32, ndim=1),
-                       sr: ti.types.ndarray(dtype=ti.f32, ndim=1),
-                       sk: ti.types.ndarray(dtype=ti.f32, ndim=1)):
+                       sa:          ti.types.ndarray(dtype=ti.i32, ndim=1),
+                       sb:          ti.types.ndarray(dtype=ti.i32, ndim=1),
+                       sr:          ti.types.ndarray(dtype=ti.f32, ndim=1),
+                       sk:          ti.types.ndarray(dtype=ti.f32, ndim=1),
+                       spring_damp: ti.f32):
         for s in range(sa.shape[0]):
             a  = sa[s]
             b  = sb[s]
@@ -137,7 +138,13 @@ class _SpringMassSimulator:
             d  = pb - pa
             length = d.norm()
             if length > 1e-8:
-                f = sk[s] * (length - sr[s]) / length * d
+                spring_dir = d / length
+                # Hooke's law
+                f_spring = sk[s] * (length - sr[s])
+                # Spring damping: opposes relative velocity along the spring axis.
+                # Prevents overshoot/oscillation without slowing unrelated motion.
+                v_rel = (self.velocities[b] - self.velocities[a]).dot(spring_dir)
+                f = (f_spring + spring_damp * v_rel) * spring_dir
                 self._forces[a] += f
                 self._forces[b] -= f
 
@@ -193,6 +200,7 @@ class TaichiSimulationComponent(Component):
                  opening_speed:      float = 1.0,
                  poke_speed:         float = 3.0,
                  v_max:              float = 1.5,
+                 spring_damping:     float = 0.0,
                  blade_travel_dir:   list  = None,
                  blade_speed:        float = 0.5,
                  split_disc_verts:   bool  = True):
@@ -207,6 +215,7 @@ class TaichiSimulationComponent(Component):
         self.opening_speed = opening_speed
         self.poke_speed    = poke_speed
         self.v_max         = v_max
+        self.spring_damping = spring_damping
 
         # Populated by TaichiSimulationSystem.on_create_entity
         self.simulator:           _SpringMassSimulator = None
@@ -247,6 +256,20 @@ class TaichiSimulationComponent(Component):
         self._shared_list:       list       = None  # seam vertex indices (above-half copies)
         self._cut_normal:        np.ndarray = None  # normalized cut plane normal
         self._disc_split_phys_idx: np.ndarray = None  # physics indices of rendering disc duplicates
+
+        # Unindexed (per-face) rendering — active after the first cut.
+        # Each triangle gets its own 3 private vertices so face colors never blend.
+        # comp.surface_indices keeps original vertex indices for normal computation.
+        # The GPU index buffer is trivial ([0,1,2,3,...]) and only covers visible faces.
+        self._face_expanded:    bool       = False
+        self._all_render_faces: np.ndarray = None  # (N_all_faces, 3) outer+ALL wound, for expansion
+        self._n_outer_faces:    int        = 0     # len(outer_faces) — constant after cut
+
+        # Per-face debug colors (N_all_faces, 3) — stored so yellow overlay stays persistent.
+        self._debug_colors: np.ndarray = None
+
+        # Set True after a cut; consumed on the next simulated frame to print a force audit.
+        self._pending_force_audit: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +323,7 @@ class TaichiSimulationSystem(System):
         print("  B — start / pause progressive blade cut")
         print("  C — one-shot cut (testing only)")
         print("  P — pause / resume physics simulation")
+        print("  X — disc parallelism check (colors non-parallel disc faces yellow)")
 
     def on_update_entity(self, ts: float, entity, components):
         comp: TaichiSimulationComponent
@@ -350,12 +374,31 @@ class TaichiSimulationSystem(System):
             print(f"[Sim] Physics {'paused' if comp.sim_paused else 'resumed'}")
         self._p_prev = p_now
 
+        # --- X key: disc parallelism check ---
+        x_now = InputManager().get_key_down(glfw.KEY_X)
+        if x_now and not getattr(self, '_x_prev', False):
+            _check_disc_parallelism(comp, mesh_comp)
+        self._x_prev = x_now
+
         # --- Simulation sub-steps ---
         t0 = time.perf_counter()
         if not comp.sim_paused:
             sub_dt = comp.time_step / comp.substeps
             for _ in range(comp.substeps):
-                comp.simulator.step(sub_dt, comp.damping, comp.v_max)
+                comp.simulator.step(sub_dt, comp.damping, comp.spring_damping, comp.v_max)
+
+            # Force audit: runs once on the first simulated frame after a cut.
+            if comp._pending_force_audit and comp._n_orig is not None:
+                comp._pending_force_audit = False
+                comp.simulator._clear_forces()
+                comp.simulator._spring_forces(
+                    comp.simulator._sa, comp.simulator._sb,
+                    comp.simulator._sr, comp.simulator._sk,
+                    float(comp.spring_damping))
+                _print_force_audit(
+                    comp.simulator._forces.to_numpy(),
+                    comp._n_orig,
+                    comp.simulator.positions.shape[0])
         t1 = time.perf_counter()
 
         new_positions = comp.simulator.positions.to_numpy()
@@ -377,8 +420,17 @@ class TaichiSimulationSystem(System):
             new_normals = _compute_normals(render_positions, comp.surface_indices)
         t3 = time.perf_counter()
 
-        _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[0], render_positions)
-        _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[1], new_normals)
+        # In unindexed mode every face owns its 3 vertices — expand before upload.
+        if comp._face_expanded and comp._all_render_faces is not None:
+            flat = comp._all_render_faces.flatten()
+            upload_pos  = render_positions[flat].reshape(-1, 3)
+            upload_norm = new_normals[flat].reshape(-1, 3)
+        else:
+            upload_pos  = render_positions
+            upload_norm = new_normals
+
+        _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[0], upload_pos)
+        _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[1], upload_norm)
         t4 = time.perf_counter()
 
         if not hasattr(self, '_fc'):
@@ -569,7 +621,7 @@ def _cut_topology(comp: TaichiSimulationComponent,
     # construction, so no snapping is needed for them.
     mesh_scale = float(np.linalg.norm(positions.max(axis=0) - positions.min(axis=0)))
     snap_eps   = mesh_scale * 1e-4
-    rim_set    = set()
+    rim_set = set()
     for new_id, vi, vj, _ in inter_data:
         if vi < n_orig: rim_set.add(vi)
         if vj < n_orig: rim_set.add(vj)
@@ -597,7 +649,10 @@ def _cut_topology(comp: TaichiSimulationComponent,
     # --- Vertex duplication (seam) ---
     above_vert_set = set(above_tets.flatten().tolist())
     below_vert_set = set(below_tets.flatten().tolist())
-    shared_list    = sorted(above_vert_set & below_vert_set)
+    # Only duplicate intersection vertices (idx >= n_orig).  Original vertices
+    # at signed_dist ≈ 0 appear in both sets but must NOT be duplicated — they
+    # sit on the cut plane and should stay shared between both halves.
+    shared_list    = sorted(v for v in (above_vert_set & below_vert_set) if v >= n_orig)
     n_shared       = len(shared_list)
     print(f"[Cut] Duplicating {n_shared} seam vertices")
 
@@ -627,8 +682,20 @@ def _cut_topology(comp: TaichiSimulationComponent,
         per_vertex_mass = final_mass,
     )
     comp.simulator.velocities.from_numpy(final_vel.astype(np.float32))
+
+    # No spring zeroing: orig→new springs are structural tet edges that are
+    # needed for mesh connectivity.  Zeroing them disconnects the disc from
+    # the hemispheres (Fix 3 mistake — verified by force audit).
+    # Collar deformation from opening velocity is physically correct elastic
+    # behaviour; reduce opening_speed if it looks too violent.
+
     print(f"[Cut] Simulator: {len(final_pos):,} verts, "
           f"{len(all_tets):,} tets, {len(comp.simulator._sa):,} springs")
+
+    _print_spring_audit(
+        comp.simulator._sa, comp.simulator._sb,
+        comp.simulator._sr, comp.simulator._sk,
+        n_orig)
 
     return (final_pos, final_vel, final_mass, final_fixed,
             all_tets, n_orig, n_split, shared_list, remap, inter_data,
@@ -844,6 +911,7 @@ def _perform_cut(comp: TaichiSimulationComponent,
             vels[dup_indices]   -= comp.opening_speed * normal
         comp.simulator.velocities.from_numpy(vels.astype(np.float32))
         print(f"[Cut] Opening velocity on {len(inter_indices)} + {len(dup_indices)} verts")
+    comp._pending_force_audit = True
 
     # --- Surface ---
     raw_surface = _extract_boundary_faces(all_tets, final_pos)
@@ -866,13 +934,29 @@ def _perform_cut(comp: TaichiSimulationComponent,
 
     all_faces = (np.vstack([outer_faces, np.array(disc_faces, dtype=np.uint32)])
                  if disc_faces else outer_faces)
-    comp.surface_indices = all_faces
-    new_normals  = _compute_normals_post_cut(render_pos, all_faces,
-                                             n_orig, n_split, inter_data, shared_list, normal)
-    new_texcoords = np.zeros((len(render_pos), 2), dtype=np.float32)
-    print(f"[Cut] Surface: {len(raw_surface):,} raw → {len(all_faces):,} kept")
+    comp.surface_indices    = all_faces   # kept as original indices for normal computation
+    comp._all_render_faces  = all_faces   # one-shot cut: all faces visible immediately
+    comp._n_outer_faces     = len(outer_faces)
+    comp._face_expanded     = True
 
-    _realloc_gpu_buffers(mesh_comp, render_pos, new_normals, new_texcoords, all_faces)
+    new_normals       = _compute_normals_post_cut(render_pos, all_faces,
+                                                  n_orig, n_split, inter_data, shared_list, normal)
+    face_colors       = _compute_debug_face_colors(all_faces, n_orig)
+    comp._debug_colors = face_colors.copy()
+
+    # Build expanded (unindexed) arrays — each face owns its 3 private vertices.
+    flat              = all_faces.flatten()
+    exp_pos           = render_pos[flat].reshape(-1, 3)
+    exp_norm          = new_normals[flat].reshape(-1, 3)
+    exp_tex           = np.zeros((len(all_faces) * 3, 2), dtype=np.float32)
+    exp_colors        = np.repeat(face_colors, 3, axis=0)
+    trivial_idx       = np.arange(len(all_faces) * 3, dtype=np.uint32).reshape(-1, 3)
+
+    print(f"[Cut] Surface: {len(raw_surface):,} raw → {len(all_faces):,} kept "
+          f"({len(exp_pos):,} expanded verts)")
+
+    _realloc_gpu_buffers(mesh_comp, exp_pos, exp_norm, exp_tex, trivial_idx,
+                         colors=exp_colors)
     print("[Cut] GPU buffers updated.")
 
 
@@ -985,16 +1069,43 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     comp._wound_faces_by_dist = wound_by_dist
     comp._wound_face_ptr      = 0
 
-    # Initial surface = outer faces only (wound hidden until blade reaches it).
-    comp.surface_indices = outer_faces.copy()
-    new_normals   = _compute_normals_post_cut(render_pos, comp.surface_indices,
-                                              n_orig, n_split, inter_data, shared_list, normal)
-    new_texcoords = np.zeros((len(render_pos), 2), dtype=np.float32)
-    print(f"[Blade] Surface: {len(outer_faces):,} outer + "
-          f"{len(wound_faces):,} wound faces (hidden until blade passes)")
+    # Build the full face array (outer first, then ALL wound in travel order).
+    # This is the expansion template: outer faces occupy slots [0..n_outer-1],
+    # wound faces occupy [n_outer..n_outer+n_wound-1] in the same sorted order
+    # as _wound_faces_by_dist, so the trivial index buffer can simply grow.
+    wound_arr = (np.array([f for _, f in wound_by_dist], dtype=np.uint32)
+                 if wound_by_dist else np.zeros((0, 3), dtype=np.uint32))
+    all_render_faces = (np.vstack([outer_faces, wound_arr])
+                        if len(wound_arr) > 0 else outer_faces.copy())
 
-    _realloc_gpu_buffers(mesh_comp, render_pos, new_normals, new_texcoords,
-                         comp.surface_indices)
+    comp.surface_indices    = outer_faces.copy()   # original indices for normal computation
+    comp._all_render_faces  = all_render_faces      # full set for per-frame expansion
+    comp._n_outer_faces     = len(outer_faces)
+    comp._face_expanded     = True
+
+    # Per-face debug colors for the full set (wound faces pre-colored even while hidden).
+    face_colors        = _compute_debug_face_colors(all_render_faces, n_orig)
+    comp._debug_colors = face_colors.copy()
+
+    new_normals = _compute_normals_post_cut(render_pos, comp.surface_indices,
+                                            n_orig, n_split, inter_data, shared_list, normal)
+
+    # Build expanded (unindexed) arrays for the full face set.
+    flat_all   = all_render_faces.flatten()
+    exp_pos    = render_pos[flat_all].reshape(-1, 3)
+    exp_norm   = new_normals[flat_all].reshape(-1, 3)   # hidden wound normals = zero initially (OK)
+    exp_tex    = np.zeros((len(all_render_faces) * 3, 2), dtype=np.float32)
+    exp_colors = np.repeat(face_colors, 3, axis=0)
+
+    # Initially only outer faces visible — trivial index buffer covers first n_outer*3 verts.
+    trivial_outer = np.arange(len(outer_faces) * 3, dtype=np.uint32).reshape(-1, 3)
+
+    print(f"[Blade] Surface: {len(outer_faces):,} outer + "
+          f"{len(wound_faces):,} wound faces (hidden until blade passes) | "
+          f"{len(all_render_faces):,} total expanded faces")
+
+    _realloc_gpu_buffers(mesh_comp, exp_pos, exp_norm, exp_tex, trivial_outer,
+                         colors=exp_colors)
 
     comp.blade_initialized = True
     comp.blade_is_active   = True
@@ -1026,6 +1137,9 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
                     if not p['broken'] and p['travel_dist'] <= comp.blade_travel]
 
     if newly_broken:
+        first_break = not any(p['broken'] for p in comp._seam_pairs)
+        if first_break:
+            comp._pending_force_audit = True
         # Batch the velocity round-trip.
         vels = comp.simulator.velocities.to_numpy()
         for p in newly_broken:
@@ -1045,15 +1159,16 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
     if faces_added:
         comp._wound_face_ptr = ptr
         revealed = [f for _, f in wbd[:ptr]]
-        comp.surface_indices = (
+        comp.surface_indices = (                           # original indices for normals
             np.vstack([comp._outer_faces,
                        np.array(revealed, dtype=np.uint32)])
             if revealed else comp._outer_faces.copy()
         )
         mesh_comp.indices = comp.surface_indices
 
-        # Realloc index buffer (face count changed).
-        flat_idx = comp.surface_indices.flatten().astype(np.uint32)
+        # Trivial index buffer grows to cover outer + revealed wound face slots.
+        n_vis    = comp._n_outer_faces + ptr
+        flat_idx = np.arange(n_vis * 3, dtype=np.uint32)
         gl.glBindVertexArray(mesh_comp.render_pipeline)
         gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, mesh_comp.index_buffer)
         gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, flat_idx.nbytes, flat_idx,
@@ -1072,7 +1187,8 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
                 if revealed else comp._outer_faces.copy()
             )
             mesh_comp.indices = comp.surface_indices
-            flat_idx = comp.surface_indices.flatten().astype(np.uint32)
+            n_vis    = comp._n_outer_faces + len(wbd)
+            flat_idx = np.arange(n_vis * 3, dtype=np.uint32)
             gl.glBindVertexArray(mesh_comp.render_pipeline)
             gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, mesh_comp.index_buffer)
             gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, flat_idx.nbytes, flat_idx,
@@ -1085,14 +1201,214 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic helpers (Analysis 1 + 2)
+# ---------------------------------------------------------------------------
+
+def _print_spring_audit(sa: np.ndarray, sb: np.ndarray,
+                        sr: np.ndarray, sk: np.ndarray,
+                        n_orig: int):
+    """
+    Analysis 2 — rest-length distribution of orig→new springs after Fix 2.
+
+    Prints how many such springs exist, their rest-length histogram, and how
+    many were left active (not zeroed by Fix 2).  Run immediately after
+    _cut_topology so the state reflects the fix that was applied.
+    """
+    orig_to_new = ((sa < n_orig) & (sb >= n_orig)) | ((sb < n_orig) & (sa >= n_orig))
+    count = int(orig_to_new.sum())
+    print(f"[SpringAudit] orig→new springs total: {count}")
+    if count == 0:
+        return
+
+    rls      = sr[orig_to_new]
+    active   = sk[orig_to_new] != 0.0
+    n_active = int(active.sum())
+    n_zeroed = count - n_active
+
+    print(f"[SpringAudit] rest_len  min={rls.min():.4f}  mean={rls.mean():.4f}  "
+          f"max={rls.max():.4f}  std={rls.std():.4f}")
+    print(f"[SpringAudit] zeroed by Fix 2: {n_zeroed}   still active: {n_active}")
+
+    bins   = [0.0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, float('inf')]
+    labels = ['<0.01', '0.01-0.02', '0.02-0.05', '0.05-0.1',
+              '0.1-0.2', '0.2-0.5', '>0.5']
+    for lo, hi, label in zip(bins[:-1], bins[1:], labels):
+        n_all = int(((rls >= lo) & (rls < hi)).sum())
+        n_act = int(((rls[active] >= lo) & (rls[active] < hi)).sum()) if n_active > 0 else 0
+        print(f"  {label:>12s}: {n_all:4d} total  {n_act:4d} active")
+
+
+def _print_force_audit(forces: np.ndarray, n_orig: int, n_total: int):
+    """
+    Analysis 1 — net force magnitudes on the first simulated frame after a cut.
+
+    Prints per-category statistics (original vertices vs new vertices) and the
+    top-10 vertices by net force magnitude.  Called once after the first batch
+    of substeps runs, so opening velocity has already been applied and spring
+    forces from the compressed/stretched orig→new springs are visible.
+    """
+    mags = np.linalg.norm(forces, axis=1)
+    orig_mags = mags[:n_orig]
+    new_mags  = mags[n_orig:n_total] if n_total > n_orig else np.zeros(0)
+
+    print(f"[ForceAudit] Net forces on frame 1 after cut:")
+    top5_orig = np.sort(orig_mags)[::-1][:5]
+    print(f"  Original verts ({n_orig}):  "
+          f"max={orig_mags.max():.4f}  mean={orig_mags.mean():.5f}  "
+          f"top5={top5_orig.round(4).tolist()}")
+    if len(new_mags) > 0:
+        top5_new = np.sort(new_mags)[::-1][:5]
+        print(f"  New verts     ({len(new_mags)}):  "
+              f"max={new_mags.max():.4f}  mean={new_mags.mean():.5f}  "
+              f"top5={top5_new.round(4).tolist()}")
+
+    top10_idx = np.argsort(mags)[::-1][:10]
+    print(f"[ForceAudit] Top 10 vertices by |F|:")
+    for rank, idx in enumerate(top10_idx):
+        cat = "orig" if idx < n_orig else "new "
+        print(f"  #{rank+1:2d}: vertex {idx:5d} ({cat})  |F|={mags[idx]:.5f}")
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+def _check_disc_parallelism(comp: TaichiSimulationComponent,
+                             mesh_comp: StaticMeshComponent):
+    """
+    X key — for each disc half (above and below), pick the face nearest to the
+    group's centroid as a reference, then color yellow every disc face whose
+    normal is not parallel to that reference (|dot| < 0.95).
+
+    Uses the FULL wound-face set (all seam pairs, even if not yet revealed by
+    the blade) so the check works at any point during or after cutting.
+    Separates above/below halves by dotting each face's geometric normal with
+    the stored cut_normal: above-half faces point in -cut_normal direction,
+    below-half faces point in +cut_normal direction.
+    """
+    if comp._n_orig is None or not comp._wound_faces_by_dist:
+        print("[DiscCheck] No cut data available — press B first.")
+        return
+
+    n_orig   = comp._n_orig
+    cut_n    = comp._cut_normal
+
+    # Current render positions (physics + rendering disc duplicates)
+    sim_pos = comp.simulator.positions.to_numpy()
+    if comp._disc_split_phys_idx is not None and len(comp._disc_split_phys_idx) > 0:
+        render_pos = np.vstack([sim_pos, sim_pos[comp._disc_split_phys_idx]])
+    else:
+        render_pos = sim_pos
+
+    # Full disc face set (rendering indices, both halves, all faces regardless of blade progress)
+    all_disc = np.array([f for _, f in comp._wound_faces_by_dist], dtype=np.uint32)
+    if len(all_disc) == 0:
+        print("[DiscCheck] No disc faces found.")
+        return
+
+    # Compute normalised face normals via cross product
+    p0 = render_pos[all_disc[:, 0]]
+    p1 = render_pos[all_disc[:, 1]]
+    p2 = render_pos[all_disc[:, 2]]
+    fn = np.cross(p1 - p0, p2 - p0)
+    lengths = np.linalg.norm(fn, axis=1, keepdims=True)
+    lengths = np.where(lengths < 1e-10, 1.0, lengths)
+    fn = fn / lengths  # (K, 3)
+
+    # Separate halves: above (fn · cut_n < 0) vs below (fn · cut_n > 0)
+    dots_cut   = fn @ cut_n
+    above_mask = dots_cut < 0.0
+    below_mask = ~above_mask
+
+    PARALLEL_THRESHOLD = 0.95  # |dot| below this ≈ more than ~18° off-plane
+
+    # Overlay yellow on non-parallel faces in the per-face color array.
+    all_render_faces = comp._all_render_faces
+    if comp._debug_colors is not None and all_render_faces is not None:
+        face_colors = comp._debug_colors.copy()   # (N_all_faces, 3)
+    else:
+        all_faces   = (np.vstack([comp._outer_faces, all_disc])
+                       if comp._outer_faces is not None and len(comp._outer_faces) > 0
+                       else all_disc)
+        face_colors = _compute_debug_face_colors(all_faces, n_orig)
+
+    YELLOW = np.array([0.95, 0.85, 0.1], dtype=np.float32)
+    # Map each non-parallel disc face back to its index in _all_render_faces.
+    # all_disc comes from _wound_faces_by_dist; wound faces start at _n_outer_faces in all_render_faces.
+    n_outer   = comp._n_outer_faces
+    disc_face_indices_in_all = np.where(
+        np.all(all_render_faces >= n_orig, axis=1)
+    )[0]   # indices of disc faces within all_render_faces
+
+    for label, gmask in [("above", above_mask), ("below", below_mask)]:
+        gfaces   = all_disc[gmask]
+        gnormals = fn[gmask]
+        if len(gfaces) < 2:
+            print(f"[DiscCheck] {label}-half: only {len(gfaces)} face(s) — skipping.")
+            continue
+        centroids = render_pos[gfaces].mean(axis=1)
+        group_cen = centroids.mean(axis=0)
+        ref_idx   = int(np.argmin(np.linalg.norm(centroids - group_cen, axis=1)))
+        ref_n     = gnormals[ref_idx]
+        abs_dots  = np.abs(gnormals @ ref_n)
+        bad       = abs_dots < PARALLEL_THRESHOLD
+        n_bad     = int(bad.sum())
+        print(f"[DiscCheck] {label}-half: {len(gfaces)} faces, "
+              f"ref centroid {centroids[ref_idx].round(3)}, "
+              f"{n_bad} non-parallel (|dot|<{PARALLEL_THRESHOLD})")
+
+        # Find global face indices in all_render_faces for the bad faces in this half.
+        half_disc_global = disc_face_indices_in_all[gmask]
+        for fi in np.where(bad)[0]:
+            face_colors[half_disc_global[fi]] = YELLOW
+
+    n_yellow = int(np.all(face_colors == YELLOW, axis=1).sum())
+
+    if len(mesh_comp.buffers) > 3 and all_render_faces is not None:
+        exp_colors = np.repeat(face_colors, 3, axis=0).astype(np.float32)
+        flat_col   = exp_colors.flatten()
+        gl.glBindVertexArray(mesh_comp.render_pipeline)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, mesh_comp.buffers[3])
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, flat_col.nbytes, flat_col, gl.GL_DYNAMIC_DRAW)
+        gl.glBindVertexArray(0)
+
+    if n_yellow > 0:
+        print(f"[DiscCheck] {n_yellow} non-parallel disc faces colored yellow.")
+    else:
+        print("[DiscCheck] All disc faces are parallel to their reference — no artifacts detected.")
+
+
+def _compute_debug_face_colors(faces: np.ndarray, n_orig: int) -> np.ndarray:
+    """
+    Assign one color per face (not per vertex) for crisp unblended debug rendering.
+      green (0.3, 0.7, 0.4)  — regular outer face  (all vertices < n_orig)
+      blue  (0.15, 0.35, 0.9) — collar face         (mixed: some vertices >= n_orig)
+      red   (0.85, 0.1, 0.1)  — disc / wound face   (all vertices >= n_orig)
+    Returns (N_faces, 3) float32.
+    """
+    n = len(faces)
+    colors = np.tile([0.3, 0.7, 0.4], (n, 1)).astype(np.float32)
+
+    v = faces  # (N, 3)
+    all_new = np.all(v >= n_orig, axis=1)
+    any_new = np.any(v >= n_orig, axis=1)
+
+    colors[any_new & ~all_new] = [0.15, 0.35, 0.9]   # blue — collar
+    colors[all_new]             = [0.85, 0.1,  0.1]   # red  — disc
+
+    n_blue = int((any_new & ~all_new).sum())
+    n_red  = int(all_new.sum())
+    print(f"[Cut] Debug colors: {n_blue} collar faces (blue), {n_red} disc faces (red), "
+          f"{n - n_blue - n_red} outer faces (green)")
+    return colors
+
 
 def _realloc_gpu_buffers(mesh_comp: StaticMeshComponent,
                           positions:  np.ndarray,
                           normals:    np.ndarray,
                           texcoords:  np.ndarray,
-                          indices:    np.ndarray):
+                          indices:    np.ndarray,
+                          colors:     np.ndarray = None):
     """Reallocate all GPU buffers with new data (called after topology changes)."""
     flat_pos  = positions.flatten().astype(np.float32)
     flat_norm = normals.flatten().astype(np.float32)
@@ -1110,6 +1426,11 @@ def _realloc_gpu_buffers(mesh_comp: StaticMeshComponent,
     if len(mesh_comp.buffers) > 2:
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, mesh_comp.buffers[2])
         gl.glBufferData(gl.GL_ARRAY_BUFFER, flat_tex.nbytes, flat_tex, gl.GL_DYNAMIC_DRAW)
+
+    if colors is not None and len(mesh_comp.buffers) > 3:
+        flat_col = colors.flatten().astype(np.float32)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, mesh_comp.buffers[3])
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, flat_col.nbytes, flat_col, gl.GL_DYNAMIC_DRAW)
 
     gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, mesh_comp.index_buffer)
     gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, flat_idx.nbytes, flat_idx,

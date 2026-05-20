@@ -81,7 +81,7 @@ def _random_cut_plane(rng: np.random.Generator, depth_range: float = 0.7):
 def main():
     logger.setLevel(logger.INFO)
 
-    rng = np.random.default_rng(1)  # fixed seed — change to try different cuts
+    rng = np.random.default_rng(5)  # fixed seed — change to try different cuts
     normal, origin, blade_dir = _random_cut_plane(rng)
 
     print("=" * 50)
@@ -104,12 +104,12 @@ def main():
     OpenGLTextureLib().build('white_texture', TextureData(
         image_bytes=0xffffffff.to_bytes(4, byteorder='big'), width=1, height=1))
 
-    OpenGLShaderLib().build('default_mesh',
-        SHADERS_PATH / 'opengl' / 'lit_blinn_phong.vs',
-        SHADERS_PATH / 'opengl' / 'lit_blinn_phong.fs')
+    OpenGLShaderLib().build('debug_mesh',
+        SHADERS_PATH / 'opengl' / 'lit_blinn_phong_debug.vs',
+        SHADERS_PATH / 'opengl' / 'lit_blinn_phong_debug.fs')
 
     OpenGLMaterialLib().build('M_Sphere', MaterialData(
-        'default_mesh', ['white_texture'], glm.vec4(0.3, 0.7, 0.4, 1.0), 1.0))
+        'debug_mesh', ['white_texture'], glm.vec4(0.3, 0.7, 0.4, 1.0), 1.0))
 
     # --- Tetrahedral mesh ---
     print("Generating tetrahedral mesh...")
@@ -121,6 +121,7 @@ def main():
     surface_indices = _extract_boundary_faces(tet_mesh.tetrahedra, tet_mesh.vertices)
     initial_normals = _compute_normals(tet_mesh.vertices, surface_indices)
     texcoords       = np.zeros((len(tet_mesh.vertices), 2), dtype=np.float32)
+    initial_colors  = np.tile([0.3, 0.7, 0.4], (len(tet_mesh.vertices), 1)).astype(np.float32)
     print(f"  Surface triangles: {len(surface_indices):,}")
     print("=" * 50)
 
@@ -135,7 +136,7 @@ def main():
     scene.add_component(sphere, LinkComponent(root))
     scene.add_component(sphere, StaticMeshComponent(
         'sphere_surface',
-        attributes=[tet_mesh.vertices.copy(), initial_normals, texcoords],
+        attributes=[tet_mesh.vertices.copy(), initial_normals, texcoords, initial_colors],
         indices=surface_indices,
     ))
     scene.add_component(sphere, MaterialComponent('M_Sphere'))
@@ -148,9 +149,10 @@ def main():
         damping          = 3.5,
         total_mass       = 100.0,
         gravity          = [0.0, 0.0, 0.0],
-        opening_speed    = 2.0,
+        opening_speed    = 4.0,
         poke_speed       = 2.0,
-        v_max            = 3.0,
+        v_max            = 4.0,
+        spring_damping   = 2.0,
         blade_travel_dir = blade_dir.tolist(),
         blade_speed      = 0.5,
         split_disc_verts = True,   # set False to disable rim vertex duplication
