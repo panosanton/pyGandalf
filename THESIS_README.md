@@ -184,6 +184,8 @@ Implements spring-mass dynamics on the tetrahedral mesh to simulate cutting forc
 - One-shot cut (C key) working — removes tets above plane, updates surface, applies wound-opening velocity
 - Progressive blade cut (B key) implemented — virtual node algorithm: duplicates seam vertices, adds cutting springs (k/2, rest=0), breaks them progressively as blade cursor advances; wound surface revealed face-by-face in sync with blade position
 - Per-spring stiffness array enables spring breaking without topology rebuild (GPU-friendly)
+- Spring damping added (`spring_damp * v_rel` term per spring) — resists oscillation without global velocity overdamping
+- Opening velocity ramp — impulse spread over N frames instead of one step, prevents instability at cut time
 - Mesh simplification pipeline added to reduce tet count and improve FPS
 
 ### Task 3 - Module 3: Surface Reconstruction
@@ -191,10 +193,27 @@ Extracts the outer surface from the damaged tetrahedral mesh and exports it as a
 
 **Status:** Not started
 
-### Task 4 - Module 4: Data Export Pipeline
-Structures and packages simulation parameters alongside results into standardised formats.
+### Task 4 - Module 4: GNN Surrogate Model
+Trains a graph neural network on spring-mass trajectories to predict soft-tissue cutting deformation in real-time, without running the physics simulation.
 
-**Status:** Not started
+**Novel contribution:** Existing simulators (SOFA, spring-mass) are too slow for real-time applications requiring sub-millisecond response. The GNN learns the per-frame physics step and runs in pyGandalf as a drop-in replacement for the spring-mass backend.
+
+**Status:** In progress
+- Headless simulation runner implemented (`headless_sim.py`) — strips OpenGL/ECS, exposes pure physics
+- Dataset generation script implemented (`generate_dataset.py`) — randomised cuts, ~11.5h for 3000 runs
+- Data format validated: (T, N, 3) trajectory + post-cut graph per .npz, ~20 MB/file
+- GNN model and training script: not yet written
+
+### Task 5 - Module 5: Simulation Method API
+Abstract interface (`SimulationMethod`) making the ECS system and headless runner backend-agnostic.
+
+**Status:** In progress
+- Abstract base class written (`simulation_method.py`) with full docstrings
+- Three planned implementations documented: `SpringMassMethod`, `FEMMethod`, `NeuralMethod`
+- `SpringMassMethod` skeleton written (maps existing functions to interface)
+- ECS refactor (wiring `TaichiSimulationSystem` to use the interface) not yet done
+- `FEMMethod` (corotational FEM) planned for future work
+- `NeuralMethod` depends on Task 4 GNN training completing
 
 ---
 

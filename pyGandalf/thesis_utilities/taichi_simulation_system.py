@@ -203,7 +203,8 @@ class TaichiSimulationComponent(Component):
                  spring_damping:     float = 0.0,
                  blade_travel_dir:   list  = None,
                  blade_speed:        float = 0.5,
-                 split_disc_verts:   bool  = True):
+                 split_disc_verts:   bool  = True,
+                 opening_ramp_frames: int  = 20):
         super().__init__()
         self.tet_mesh      = tet_mesh
         self.time_step     = time_step
@@ -216,6 +217,7 @@ class TaichiSimulationComponent(Component):
         self.poke_speed    = poke_speed
         self.v_max         = v_max
         self.spring_damping = spring_damping
+        self.opening_ramp_frames = max(1, int(opening_ramp_frames))
 
         # Populated by TaichiSimulationSystem.on_create_entity
         self.simulator:           _SpringMassSimulator = None
@@ -270,6 +272,11 @@ class TaichiSimulationComponent(Component):
 
         # Set True after a cut; consumed on the next simulated frame to print a force audit.
         self._pending_force_audit: bool = False
+
+        # Opening velocity ramp queue — each entry applies a small velocity increment
+        # per frame for opening_ramp_frames frames instead of one large impulse.
+        # Format: {'above': np.ndarray, 'below': np.ndarray, 'step_speed': float, 'left': int}
+        self._opening_ramp_queue: list = []
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +386,21 @@ class TaichiSimulationSystem(System):
         if x_now and not getattr(self, '_x_prev', False):
             _check_disc_parallelism(comp, mesh_comp)
         self._x_prev = x_now
+
+        # --- Opening velocity ramp ---
+        if comp._opening_ramp_queue:
+            vels = comp.simulator.velocities.to_numpy()
+            normal = np.array(comp._cut_normal, dtype=np.float32)
+            still_active = []
+            for entry in comp._opening_ramp_queue:
+                ss = entry['step_speed']
+                vels[entry['above']] += ss * normal
+                vels[entry['below']] -= ss * normal
+                entry['left'] -= 1
+                if entry['left'] > 0:
+                    still_active.append(entry)
+            comp.simulator.velocities.from_numpy(vels.astype(np.float32))
+            comp._opening_ramp_queue = still_active
 
         # --- Simulation sub-steps ---
         t0 = time.perf_counter()
@@ -899,18 +921,20 @@ def _perform_cut(comp: TaichiSimulationComponent,
     comp._shared_list = shared_list
     comp._cut_normal  = normal
 
-    # --- Opening velocity ---
+    # --- Opening velocity (ramped over opening_ramp_frames frames) ---
     if comp.opening_speed > 0.0:
         inter_indices = np.array([d[0] for d in inter_data], dtype=np.int32)
         dup_indices   = np.array([remap[v] for v in inter_indices
                                   if remap[v] >= n_split], dtype=np.int32)
-        vels = comp.simulator.velocities.to_numpy()
-        if len(inter_indices) > 0:
-            vels[inter_indices] += comp.opening_speed * normal
-        if len(dup_indices) > 0:
-            vels[dup_indices]   -= comp.opening_speed * normal
-        comp.simulator.velocities.from_numpy(vels.astype(np.float32))
-        print(f"[Cut] Opening velocity on {len(inter_indices)} + {len(dup_indices)} verts")
+        step_speed = comp.opening_speed / comp.opening_ramp_frames
+        comp._opening_ramp_queue.append({
+            'above': inter_indices,
+            'below': dup_indices,
+            'step_speed': step_speed,
+            'left': comp.opening_ramp_frames,
+        })
+        print(f"[Cut] Opening ramp queued: {len(inter_indices)} + {len(dup_indices)} verts "
+              f"over {comp.opening_ramp_frames} frames ({step_speed:.4f} m/s/frame)")
     comp._pending_force_audit = True
 
     # --- Surface ---
@@ -1140,14 +1164,19 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
         first_break = not any(p['broken'] for p in comp._seam_pairs)
         if first_break:
             comp._pending_force_audit = True
-        # Batch the velocity round-trip.
-        vels = comp.simulator.velocities.to_numpy()
         for p in newly_broken:
             comp.simulator._sk[p['spring_idx']] = 0.0
-            vels[p['v_above']] += comp.opening_speed * normal
-            vels[p['v_below']] -= comp.opening_speed * normal
             p['broken'] = True
-        comp.simulator.velocities.from_numpy(vels.astype(np.float32))
+        # Queue a ramped opening impulse for all pairs broken this frame.
+        step_speed = comp.opening_speed / comp.opening_ramp_frames
+        above = np.array([p['v_above'] for p in newly_broken], dtype=np.int32)
+        below = np.array([p['v_below'] for p in newly_broken], dtype=np.int32)
+        comp._opening_ramp_queue.append({
+            'above': above,
+            'below': below,
+            'step_speed': step_speed,
+            'left': comp.opening_ramp_frames,
+        })
 
     # --- Reveal wound faces behind the cursor ---
     ptr = comp._wound_face_ptr
