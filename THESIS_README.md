@@ -13,6 +13,7 @@ pip install taichi
 pip install tetgen
 pip install trimesh
 pip install fast-simplification
+pip install PyGLM
 ```
 
 **Dependencies:**
@@ -21,6 +22,7 @@ pip install fast-simplification
 - **trimesh** - Surface mesh loading, repair, and simplification
 - **fast-simplification** - Backend for trimesh quadric decimation
 - **pyvista** (0.46+) - 3D visualization (installed automatically with tetgen)
+- **PyGLM** - Python bindings for GLM (OpenGL Mathematics); imported as `glm`
 - **numpy** (>=2.0) - Already included in pyGandalf
 
 ---
