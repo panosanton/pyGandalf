@@ -332,7 +332,8 @@ class TaichiSimulationSystem(System):
         print("[TaichiSimulationSystem] Initialized:")
         print(f"  Vertices:        {len(tet.vertices):,}")
         print(f"  Tetrahedra:      {len(tet.tetrahedra):,}")
-        print(f"  Springs:         {len(comp.simulator._sa):,}")
+        if hasattr(comp.simulator, '_sa'):
+            print(f"  Springs:         {len(comp.simulator._sa):,}")
         print(f"  Surface faces:   {len(comp.surface_indices):,}")
         print(f"  Fixed vertices:  {int(fixed_mask.sum())}")
         print(f"  Sub-steps/frame: {comp.substeps}  (sub_dt = {sub_dt:.5f} s)")
@@ -733,7 +734,9 @@ def _cut_topology(comp: TaichiSimulationComponent,
     comp.simulator          = new_sim
     comp.current_tetrahedra = all_tets
     comp.fixed_mask         = final_fixed
-    if comp.method is not None:
+    # Only sync method._simulator when types match — avoids replacing a
+    # _FEMSimulator with the _SpringMassSimulator _cut_topology_physics returns.
+    if comp.method is not None and type(comp.method._simulator) is type(new_sim):
         comp.method._simulator = new_sim
 
     return (final_pos, final_vel, final_mass, final_fixed,
@@ -1028,57 +1031,30 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     blade_dir = np.array(comp.blade_travel_dir, dtype=np.float32)
     blade_dir /= np.linalg.norm(blade_dir)
 
-    result = _cut_topology(comp, origin, normal)
-    if result is None:
+    # Delegate topology split, simulator rebuild, and cutting springs to the method.
+    # Each backend (SpringMassMethod, FEMMethod) handles its own physics correctly.
+    if not comp.method.setup_cut(normal, origin, blade_dir):
+        print("[Blade] Cut plane does not intersect the mesh.")
         return
 
-    (final_pos, _final_vel, _final_mass, _final_fixed,
+    # Sync ECS-level aliases — method holds the authoritative new simulator.
+    comp.simulator          = comp.method._simulator
+    comp.current_tetrahedra = comp.method._current_tets
+
+    # Extract topology data from the cached result tuple for surface computation.
+    (_new_sim, final_pos, _final_vel, _final_mass, _final_fixed,
      all_tets, n_orig, n_split, shared_list, remap, inter_data,
-     orig_surf_set) = result
+     orig_surf_set) = comp.method._topology_result
+
     comp._n_orig      = n_orig
     comp._n_split     = n_split
     comp._inter_data  = inter_data
     comp._shared_list = shared_list
     comp._cut_normal  = normal
 
-    # --- Add cutting springs between seam pairs ---
-    # Each seam pair (v_above, v_below) gets one cutting spring.
-    # The spring holds the two halves together until the blade passes it.
-    n_structural = len(comp.simulator._sa)
-
-    sa_cut = np.array([v      for v in shared_list], dtype=np.int32)
-    sb_cut = np.array([remap[v] for v in shared_list], dtype=np.int32)
-    sr_cut = np.zeros(len(shared_list), dtype=np.float32)   # rest length = 0
-    sk_cut = np.full(len(shared_list), comp.stiffness * 0.5, dtype=np.float32)
-
-    comp.simulator.extend_springs(sa_cut, sb_cut, sr_cut, sk_cut)
-
-    # Build seam-pair manifest with travel distances for ordered spring breaking.
-    seam_pairs = []
-    for i, v_above in enumerate(shared_list):
-        v_below     = int(remap[v_above])
-        spring_idx  = n_structural + i
-        pos_seam    = final_pos[v_above]
-        travel_dist = float(np.dot(pos_seam - origin, blade_dir))
-        seam_pairs.append({
-            'v_above':    v_above,
-            'v_below':    v_below,
-            'spring_idx': spring_idx,
-            'travel_dist': travel_dist,
-            'broken':     False,
-        })
-    seam_pairs.sort(key=lambda p: p['travel_dist'])
-    comp._seam_pairs = seam_pairs
-
-    if comp.method is not None:
-        comp.method._seam_pairs         = comp._seam_pairs   # shared list — mutations visible to both
-        comp.method._n_orig_val         = n_orig
-        comp.method._n_split            = n_split
-        comp.method._cut_normal         = normal
-        comp.method._cut_origin         = origin
-        comp.method._blade_dir          = blade_dir
-        comp.method._current_tets       = all_tets
-        comp.method._opening_ramp_queue = []
+    # Share the seam_pairs list so _advance_progressive_blade can observe broken flags.
+    comp._seam_pairs = comp.method._seam_pairs
+    seam_pairs       = comp._seam_pairs
 
     # Blade cursor starts just before the first seam pair.
     if seam_pairs:

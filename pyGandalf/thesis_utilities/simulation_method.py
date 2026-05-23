@@ -331,13 +331,14 @@ class SpringMassMethod(SimulationMethod):
         (new_sim, final_pos, _final_vel, _final_mass, _final_fixed,
          all_tets, n_orig, n_split, shared_list, remap, _inter_data, _orig_surf_set) = result
 
-        self._simulator    = new_sim
-        self._current_tets = all_tets
-        self._n_orig_val   = n_orig
-        self._n_split      = n_split
-        self._cut_normal   = normal
-        self._cut_origin   = origin
-        self._blade_dir    = blade_dir
+        self._simulator       = new_sim
+        self._current_tets    = all_tets
+        self._n_orig_val      = n_orig
+        self._n_split         = n_split
+        self._cut_normal      = normal
+        self._cut_origin      = origin
+        self._blade_dir       = blade_dir
+        self._topology_result = result  # cached for ECS surface computation
 
         # Add a zero-rest-length cutting spring for every seam pair.
         n_structural = len(new_sim._sa)
@@ -362,7 +363,8 @@ class SpringMassMethod(SimulationMethod):
                 'broken':      False,
             })
         seam_pairs.sort(key=lambda p: p['travel_dist'])
-        self._seam_pairs = seam_pairs
+        self._seam_pairs         = seam_pairs
+        self._opening_ramp_queue = []
 
         return True
 
