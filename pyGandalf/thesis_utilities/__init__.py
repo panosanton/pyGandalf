@@ -9,6 +9,7 @@ from .tet_generator import generate_tetrahedral_mesh, analyze_tetrahedral_mesh
 from .tet_exploder import explode_tetrahedral_mesh
 from .animated_tet_exploder import AnimatedTetExplosion
 from .animated_explosion_system import AnimatedExplosionSystem, AnimatedExplosionComponent
+from .simulation_method import SimulationMethod, SpringMassMethod, FEMMethod, NeuralMethod
 
 __all__ = [
     'generate_tetrahedral_mesh',
@@ -17,4 +18,8 @@ __all__ = [
     'AnimatedTetExplosion',
     'AnimatedExplosionSystem',
     'AnimatedExplosionComponent',
+    'SimulationMethod',
+    'SpringMassMethod',
+    'FEMMethod',
+    'NeuralMethod',
 ]

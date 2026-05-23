@@ -579,35 +579,29 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
     return new_pos, above_arr, below_arr, inter_data
 
 
-def _cut_topology(comp: TaichiSimulationComponent,
-                  origin: np.ndarray,
-                  normal: np.ndarray):
+def _cut_topology_physics(
+        current_tets: np.ndarray,
+        positions:    np.ndarray,
+        velocities:   np.ndarray,
+        masses:       np.ndarray,
+        fixed:        np.ndarray,
+        stiffness:    float,
+        gravity:      np.ndarray,
+        origin:       np.ndarray,
+        normal:       np.ndarray):
     """
-    Shared topology-change logic used by both the one-shot cut and the
-    progressive cut setup.
+    Pure topology-change computation — no Component dependency.
 
-    Splits crossed tets, snaps rim vertices, extends vel/mass/fixed arrays,
-    duplicates seam vertices, and rebuilds the simulator.
+    Splits tetrahedra along the cut plane, duplicates seam vertices, and
+    rebuilds the spring-mass simulator.  Used by both the ECS wrapper
+    (_cut_topology) and SpringMassMethod.setup_cut().
 
-    Returns:
-        final_pos      (N_final, 3)
-        final_vel      (N_final, 3)
-        final_mass     (N_final,)
-        final_fixed    (N_final,)
-        all_tets       (T_final, 4)
-        n_orig         int   — number of vertices before split
-        n_split        int   — n_orig + intersection verts (before duplication)
-        shared_list    list  — intersection vertex indices (above-half)
-        remap          (n_split,) int32  — maps above indices to below dup indices
-        inter_data     list of (new_idx, vi, vj, t)
-        orig_surf_set  set of sorted (v0,v1,v2) tuples for original outer faces
+    Returns
+    -------
+    (new_sim, final_pos, final_vel, final_mass, final_fixed,
+     all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set)
+    or None if the cut plane does not divide the mesh.
     """
-    current_tets = comp.current_tetrahedra
-    positions    = comp.simulator.positions.to_numpy()
-    velocities   = comp.simulator.velocities.to_numpy()
-    masses       = comp.simulator._masses.to_numpy()
-    fixed        = comp.simulator._fixed.to_numpy()
-
     signed_dist  = (positions - origin) @ normal
 
     # --- Original outer surface set (to detect interior-exposed faces later) ---
@@ -691,19 +685,16 @@ def _cut_topology(comp: TaichiSimulationComponent,
     new_below_tets = remap[below_tets]
     all_tets       = np.vstack([above_tets, new_below_tets])
 
-    comp.current_tetrahedra = all_tets
-    comp.fixed_mask         = final_fixed
-
     # --- Rebuild simulator ---
-    comp.simulator = _SpringMassSimulator(
+    new_sim = _SpringMassSimulator(
         vertices        = final_pos,
         tetrahedra      = all_tets,
         fixed_mask      = final_fixed,
-        stiffness       = comp.stiffness,
-        gravity         = np.array(comp.gravity, dtype=np.float32),
+        stiffness       = stiffness,
+        gravity         = gravity,
         per_vertex_mass = final_mass,
     )
-    comp.simulator.velocities.from_numpy(final_vel.astype(np.float32))
+    new_sim.velocities.from_numpy(final_vel.astype(np.float32))
 
     # No spring zeroing: orig→new springs are structural tet edges that are
     # needed for mesh connectivity.  Zeroing them disconnects the disc from
@@ -712,16 +703,46 @@ def _cut_topology(comp: TaichiSimulationComponent,
     # behaviour; reduce opening_speed if it looks too violent.
 
     print(f"[Cut] Simulator: {len(final_pos):,} verts, "
-          f"{len(all_tets):,} tets, {len(comp.simulator._sa):,} springs")
+          f"{len(all_tets):,} tets, {len(new_sim._sa):,} springs")
 
-    _print_spring_audit(
-        comp.simulator._sa, comp.simulator._sb,
-        comp.simulator._sr, comp.simulator._sk,
-        n_orig)
+    _print_spring_audit(new_sim._sa, new_sim._sb, new_sim._sr, new_sim._sk, n_orig)
+
+    return (new_sim, final_pos, final_vel, final_mass, final_fixed,
+            all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set)
+
+
+def _cut_topology(comp: TaichiSimulationComponent,
+                  origin: np.ndarray,
+                  normal: np.ndarray):
+    """
+    ECS wrapper for _cut_topology_physics.
+
+    Reads arrays from comp, runs the pure computation, and writes the new
+    simulator / tetrahedra / fixed_mask back to comp.
+    Returns the same 11-tuple callers expect, or None on failure.
+    """
+    result = _cut_topology_physics(
+        comp.current_tetrahedra,
+        comp.simulator.positions.to_numpy(),
+        comp.simulator.velocities.to_numpy(),
+        comp.simulator._masses.to_numpy(),
+        comp.simulator._fixed.to_numpy(),
+        comp.stiffness,
+        np.array(comp.gravity, dtype=np.float32),
+        origin, normal,
+    )
+    if result is None:
+        return None
+
+    (new_sim, final_pos, final_vel, final_mass, final_fixed,
+     all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set) = result
+
+    comp.simulator          = new_sim
+    comp.current_tetrahedra = all_tets
+    comp.fixed_mask         = final_fixed
 
     return (final_pos, final_vel, final_mass, final_fixed,
-            all_tets, n_orig, n_split, shared_list, remap, inter_data,
-            orig_surf_set)
+            all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set)
 
 
 def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
