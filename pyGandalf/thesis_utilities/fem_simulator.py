@@ -63,10 +63,12 @@ class _FEMSimulator:
         self._fixed     = ti.field(dtype=ti.i32,  shape=N)
 
         # CG work fields
-        self._mul_ans   = ti.Vector.field(3, dtype=ti.f32, shape=N)
-        self._b         = ti.Vector.field(3, dtype=ti.f32, shape=N)
-        self._r         = ti.Vector.field(3, dtype=ti.f32, shape=N)
-        self._p         = ti.Vector.field(3, dtype=ti.f32, shape=N)
+        self._mul_ans    = ti.Vector.field(3, dtype=ti.f32, shape=N)
+        self._b          = ti.Vector.field(3, dtype=ti.f32, shape=N)
+        self._r          = ti.Vector.field(3, dtype=ti.f32, shape=N)
+        self._p          = ti.Vector.field(3, dtype=ti.f32, shape=N)
+        # [r2, p·Ap, r2_new] — kept on GPU so the CG loop has zero Python syncs
+        self._cg_scalars = ti.field(dtype=ti.f32, shape=3)
 
         # Per-tet rest-shape data
         self._tets      = ti.Vector.field(4, dtype=ti.i32,  shape=M)
@@ -207,40 +209,52 @@ class _FEMSimulator:
                             ret[verts[u]][d] += -(dt ** 2) * dH[j, i] * tmp
 
     @ti.kernel
-    def _vec_add(self, ans: ti.template(), a: ti.template(),
-                 k: ti.f32, b: ti.template()):
-        for i in ans:
-            ans[i] = a[i] + k * b[i]
+    def _cg_init_rp(self):
+        """r = b − A·v₀;  p = r;  scalars[0] = r·r  (no Python sync)"""
+        r2 = 0.0
+        for i in self._r:
+            self._r[i] = self._b[i] - self._mul_ans[i]
+            self._p[i]  = self._r[i]
+            r2 += self._r[i].dot(self._r[i])
+        self._cg_scalars[0] = r2
 
     @ti.kernel
-    def _vec_dot(self, a: ti.template(), b: ti.template()) -> ti.f32:
-        ans = 0.0
-        for i in a:
-            ans += a[i].dot(b[i])
-        return ans
+    def _cg_dot_pAp(self):
+        """scalars[1] = p·(A·p)  — stays on GPU"""
+        d = 0.0
+        for i in self._p:
+            d += self._p[i].dot(self._mul_ans[i])
+        self._cg_scalars[1] = d
 
-    def _cg(self, dt: float, cg_iters: int = 50, cg_eps: float = 1e-6):
-        """Conjugate gradient solve for (M - dt²K) v_new = b."""
+    @ti.kernel
+    def _cg_update_xr_r2(self):
+        """α = scalars[0]/scalars[1];  v += α·p;  r −= α·Ap;  scalars[2] = r·r"""
+        alpha = self._cg_scalars[0] / ti.max(self._cg_scalars[1], 1e-30)
+        r2_new = 0.0
+        for i in self.velocities:
+            self.velocities[i] += alpha * self._p[i]
+            self._r[i] -= alpha * self._mul_ans[i]
+            r2_new += self._r[i].dot(self._r[i])
+        self._cg_scalars[2] = r2_new
+
+    @ti.kernel
+    def _cg_update_p(self):
+        """β = scalars[2]/scalars[0];  p = r + β·p;  advance scalars[0]"""
+        beta = self._cg_scalars[2] / ti.max(self._cg_scalars[0], 1e-30)
+        for i in self._p:
+            self._p[i] = self._r[i] + beta * self._p[i]
+        self._cg_scalars[0] = self._cg_scalars[2]
+
+    def _cg(self, dt: float, cg_iters: int = 20):
+        """Zero-sync CG: α, β, r² live in _cg_scalars on GPU throughout."""
         self._get_b(dt)
         self._matmul(self._mul_ans, self.velocities, dt)
-        self._vec_add(self._r, self._b, -1.0, self._mul_ans)
-        self._p.copy_from(self._r)
-        r2 = self._vec_dot(self._r, self._r)
-        r2_init = r2
+        self._cg_init_rp()
         for _ in range(cg_iters):
             self._matmul(self._mul_ans, self._p, dt)
-            denom = self._vec_dot(self._p, self._mul_ans)
-            if abs(denom) < 1e-30:
-                break
-            alpha = r2 / denom
-            self._vec_add(self.velocities, self.velocities,  alpha, self._p)
-            self._vec_add(self._r,         self._r,         -alpha, self._mul_ans)
-            r2_new = self._vec_dot(self._r, self._r)
-            if r2_new <= r2_init * cg_eps ** 2:
-                break
-            beta = r2_new / max(r2, 1e-30)
-            self._vec_add(self._p, self._r, beta, self._p)
-            r2 = r2_new
+            self._cg_dot_pAp()
+            self._cg_update_xr_r2()
+            self._cg_update_p()
 
     # ------------------------------------------------------------------
     # Boundary conditions and position update
@@ -269,12 +283,12 @@ class _FEMSimulator:
     # ------------------------------------------------------------------
 
     def step(self, dt: float, damping: float, v_max: float = 10.0,
-             cg_iters: int = 50, cg_eps: float = 1e-6):
+             cg_iters: int = 20):
         self._clear_forces()
         self._get_force(self._gravity)
         if len(self._sa) > 0:
             self._apply_spring_forces(self._sa, self._sb, self._sr, self._sk)
-        self._cg(dt, cg_iters, cg_eps)
+        self._cg(dt, cg_iters)
         self._apply_fixed()
         self._integrate(dt, damping, v_max)
 

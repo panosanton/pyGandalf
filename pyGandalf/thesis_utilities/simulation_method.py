@@ -482,10 +482,9 @@ class FEMMethod(SimulationMethod):
         self._process_opening_ramp()
         self._simulator.step(
             dt,
-            damping   = float(self._params.get('damping',   1.0)),
-            v_max     = float(self._params.get('v_max',     10.0)),
-            cg_iters  = int(self._params.get('cg_iters',   50)),
-            cg_eps    = float(self._params.get('cg_eps',    1e-6)),
+            damping  = float(self._params.get('damping',  1.0)),
+            v_max    = float(self._params.get('v_max',    10.0)),
+            cg_iters = int(self._params.get('cg_iters',  20)),
         )
 
     def _process_opening_ramp(self) -> None:
