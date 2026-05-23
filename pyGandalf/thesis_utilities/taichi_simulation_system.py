@@ -204,7 +204,8 @@ class TaichiSimulationComponent(Component):
                  blade_travel_dir:   list  = None,
                  blade_speed:        float = 0.5,
                  split_disc_verts:   bool  = True,
-                 opening_ramp_frames: int  = 20):
+                 opening_ramp_frames: int  = 20,
+                 method_instance             = None):
         super().__init__()
         self.tet_mesh      = tet_mesh
         self.time_step     = time_step
@@ -218,6 +219,7 @@ class TaichiSimulationComponent(Component):
         self.v_max         = v_max
         self.spring_damping = spring_damping
         self.opening_ramp_frames = max(1, int(opening_ramp_frames))
+        self._method_instance = method_instance  # optional pre-constructed SimulationMethod
 
         # Populated by TaichiSimulationSystem.on_create_entity
         self.method    = None          # SpringMassMethod — drives physics
@@ -310,7 +312,6 @@ class TaichiSimulationSystem(System):
         comp.poke_mask = (y >= poke_threshold) & (fixed_mask == 0)
         comp.surface_indices = _extract_boundary_faces(tet.tetrahedra, tet.vertices)
 
-        from pyGandalf.thesis_utilities.simulation_method import SpringMassMethod
         _sim_params = {
             'stiffness':           comp.stiffness,
             'damping':             comp.damping,
@@ -324,7 +325,11 @@ class TaichiSimulationSystem(System):
             'blade_speed':         comp.blade_speed,
             'opening_ramp_frames': comp.opening_ramp_frames,
         }
-        comp.method    = SpringMassMethod()
+        if comp._method_instance is not None:
+            comp.method = comp._method_instance
+        else:
+            from pyGandalf.thesis_utilities.simulation_method import SpringMassMethod
+            comp.method = SpringMassMethod()
         comp.method.initialize(comp.tet_mesh, _sim_params)
         comp.simulator = comp.method._simulator
 
@@ -403,8 +408,9 @@ class TaichiSimulationSystem(System):
         if not comp.sim_paused:
             comp.method.step(comp.time_step)
 
-            # Force audit: runs once on the first simulated frame after a cut.
-            if comp._pending_force_audit and comp._n_orig is not None:
+            # Force audit: spring-mass only (uses _spring_forces kernel).
+            if (comp._pending_force_audit and comp._n_orig is not None
+                    and hasattr(comp.simulator, '_spring_forces')):
                 comp._pending_force_audit = False
                 comp.simulator._clear_forces()
                 comp.simulator._spring_forces(
@@ -415,6 +421,8 @@ class TaichiSimulationSystem(System):
                     comp.simulator._forces.to_numpy(),
                     comp._n_orig,
                     comp.simulator.positions.shape[0])
+            elif comp._pending_force_audit:
+                comp._pending_force_audit = False
         t1 = time.perf_counter()
 
         new_positions = comp.simulator.positions.to_numpy()

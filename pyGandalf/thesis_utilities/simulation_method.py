@@ -418,47 +418,215 @@ class SpringMassMethod(SimulationMethod):
 
 
 # ---------------------------------------------------------------------------
-# FEMMethod — planned, not yet implemented
+# FEMMethod
 # ---------------------------------------------------------------------------
 
 class FEMMethod(SimulationMethod):
     """
-    Corotational FEM backend (planned).
+    Taichi GPU corotational FEM backend.
 
-    Key differences from SpringMassMethod:
-    - Forces computed from per-tet deformation gradient and polar decomposition,
-      not from per-edge spring stretch.
-    - Material params: young_modulus (Pa) + poisson_ratio instead of stiffness.
-    - Implicit integration: solves K*dx = f per frame (conjugate gradient).
-      Unconditionally stable — no v_max clamp needed.
-    - Cutting: halves separate by removing shared face coupling in the stiffness
-      matrix rather than zeroing spring stiffness entries.
+    Unconditionally stable — uses an implicit Euler integrator with a
+    matrix-free conjugate gradient solver.  One step per frame; no substeps.
+
+    params keys (all optional, defaults shown)
+    ------------------------------------------
+    young_modulus  : float = 5e4    stiffness in Pa
+    poisson_ratio  : float = 0.4    material compressibility (0 = incompressible limit)
+    density        : float = 1000.0 kg/m³ (distributed by tet volume)
+    damping        : float = 1.0    velocity damping per second
+    gravity        : list  = [0,0,0]
+    v_max          : float = 10.0   velocity cap (m/s)
+    time_step      : float = 0.01   integration timestep (larger than spring-mass is fine)
+    cg_iters       : int   = 50     max CG iterations per step
+    cg_eps         : float = 1e-6   CG convergence tolerance
+    stiffness      : float = 200.0  spring stiffness for cutting springs (N/m)
+    opening_speed  : float = 1.0    velocity (m/s) given to seam vertices on break
+    opening_ramp_frames : int = 1
     """
 
+    def __init__(self):
+        self._simulator          = None
+        self._params             = {}
+        self._n_orig_val         = None
+        self._n_split            = None
+        self._current_tets       = None
+        self._cut_normal         = None
+        self._cut_origin         = None
+        self._blade_dir          = None
+        self._seam_pairs         = []
+        self._opening_ramp_queue = []
+
     def initialize(self, tet_mesh, params: dict) -> None:
-        raise NotImplementedError("FEMMethod not yet implemented.")
+        from pyGandalf.thesis_utilities.fem_simulator import _FEMSimulator
+        self._params = dict(params)
+
+        y          = tet_mesh.vertices[:, 1]
+        threshold  = y.min() + (y.max() - y.min()) * 0.05
+        fixed_mask = (y < threshold).astype(np.int32)
+        self._current_tets = tet_mesh.tetrahedra.copy()
+
+        gravity = np.array(self._params.get('gravity', [0.0, 0.0, 0.0]), dtype=np.float32)
+
+        self._simulator = _FEMSimulator(
+            vertices      = tet_mesh.vertices,
+            tetrahedra    = tet_mesh.tetrahedra,
+            fixed_mask    = fixed_mask,
+            young_modulus = float(self._params.get('young_modulus', 5e4)),
+            poisson_ratio = float(self._params.get('poisson_ratio', 0.4)),
+            density       = float(self._params.get('density', 1000.0)),
+            gravity       = gravity,
+            damping       = float(self._params.get('damping', 1.0)),
+        )
 
     def step(self, dt: float) -> None:
-        raise NotImplementedError
+        self._process_opening_ramp()
+        self._simulator.step(
+            dt,
+            damping   = float(self._params.get('damping',   1.0)),
+            v_max     = float(self._params.get('v_max',     10.0)),
+            cg_iters  = int(self._params.get('cg_iters',   50)),
+            cg_eps    = float(self._params.get('cg_eps',    1e-6)),
+        )
+
+    def _process_opening_ramp(self) -> None:
+        if not self._opening_ramp_queue:
+            return
+        normal = self._cut_normal
+        vels   = self._simulator.velocities.to_numpy()
+        active = []
+        for entry in self._opening_ramp_queue:
+            vels[entry['above']] += entry['step_speed'] * normal
+            vels[entry['below']] -= entry['step_speed'] * normal
+            entry['left'] -= 1
+            if entry['left'] > 0:
+                active.append(entry)
+        self._simulator.velocities.from_numpy(vels.astype(np.float32))
+        self._opening_ramp_queue = active
 
     def get_positions(self) -> np.ndarray:
-        raise NotImplementedError
+        return self._simulator.positions.to_numpy()
 
     def get_velocities(self) -> np.ndarray:
-        raise NotImplementedError
+        return self._simulator.velocities.to_numpy()
 
-    def set_velocities(self, indices, velocities) -> None:
-        raise NotImplementedError
+    def set_velocities(self, indices: np.ndarray, velocities: np.ndarray) -> None:
+        vels = self._simulator.velocities.to_numpy()
+        vels[np.asarray(indices)] = velocities
+        self._simulator.velocities.from_numpy(vels.astype(np.float32))
 
     def setup_cut(self, cut_normal, cut_origin, blade_travel_dir) -> bool:
-        raise NotImplementedError
+        from pyGandalf.thesis_utilities.fem_simulator import _FEMSimulator
+
+        normal    = np.array(cut_normal,       dtype=np.float32)
+        origin    = np.array(cut_origin,       dtype=np.float32)
+        blade_dir = np.array(blade_travel_dir, dtype=np.float32)
+        normal    /= np.linalg.norm(normal)
+        blade_dir /= np.linalg.norm(blade_dir)
+
+        gravity = np.array(self._params.get('gravity', [0.0, 0.0, 0.0]), dtype=np.float32)
+
+        result = _cut_topology_physics(
+            self._current_tets,
+            self._simulator.positions.to_numpy(),
+            self._simulator.velocities.to_numpy(),
+            self._simulator._masses.to_numpy(),
+            self._simulator._fixed.to_numpy(),
+            0.0,          # stiffness unused — FEM doesn't need this for topology
+            gravity, origin, normal,
+        )
+        if result is None:
+            return False
+
+        (_, final_pos, final_vel, _, final_fixed,
+         all_tets, n_orig, n_split, shared_list, remap,
+         _inter_data, _orig_surf_set) = result
+
+        new_fem = _FEMSimulator(
+            vertices      = final_pos,
+            tetrahedra    = all_tets,
+            fixed_mask    = final_fixed,
+            young_modulus = float(self._params.get('young_modulus', 5e4)),
+            poisson_ratio = float(self._params.get('poisson_ratio', 0.4)),
+            density       = float(self._params.get('density', 1000.0)),
+            gravity       = gravity,
+            damping       = float(self._params.get('damping', 1.0)),
+        )
+        new_fem.velocities.from_numpy(final_vel.astype(np.float32))
+
+        self._simulator       = new_fem
+        self._current_tets    = all_tets
+        self._n_orig_val      = n_orig
+        self._n_split         = n_split
+        self._cut_normal      = normal
+        self._cut_origin      = origin
+        self._blade_dir       = blade_dir
+        self._topology_result = result  # cached for ECS surface computation
+
+        # Cutting springs — same virtual-node approach as SpringMassMethod
+        k_cut  = float(self._params.get('stiffness', 200.0)) * 0.5
+        sa_cut = np.array(shared_list, dtype=np.int32)
+        sb_cut = np.array([remap[v] for v in shared_list], dtype=np.int32)
+        sr_cut = np.zeros(len(shared_list), dtype=np.float32)
+        sk_cut = np.full(len(shared_list), k_cut, dtype=np.float32)
+        new_fem.extend_springs(sa_cut, sb_cut, sr_cut, sk_cut)
+
+        seam_pairs = []
+        for i, v_above in enumerate(shared_list):
+            v_below     = int(remap[v_above])
+            spring_idx  = i          # _sa starts empty for a fresh FEM sim
+            pos_seam    = final_pos[v_above]
+            travel_dist = float(np.dot(pos_seam - origin, blade_dir))
+            seam_pairs.append({
+                'v_above':     v_above,
+                'v_below':     v_below,
+                'spring_idx':  spring_idx,
+                'travel_dist': travel_dist,
+                'broken':      False,
+            })
+        seam_pairs.sort(key=lambda p: p['travel_dist'])
+        self._seam_pairs         = seam_pairs
+        self._opening_ramp_queue = []
+        return True
 
     def advance_blade(self, blade_travel: float) -> bool:
-        raise NotImplementedError
+        if not self._seam_pairs:
+            return True
+
+        opening_speed = float(self._params.get('opening_speed', 1.0))
+        ramp_frames   = int(self._params.get('opening_ramp_frames', 1))
+        normal        = self._cut_normal
+
+        newly_broken = [p for p in self._seam_pairs
+                        if not p['broken'] and p['travel_dist'] <= blade_travel]
+
+        if newly_broken:
+            for p in newly_broken:
+                self._simulator._sk[p['spring_idx']] = 0.0
+                p['broken'] = True
+
+            if ramp_frames <= 1:
+                vels = self._simulator.velocities.to_numpy()
+                for p in newly_broken:
+                    vels[p['v_above']] += opening_speed * normal
+                    vels[p['v_below']] -= opening_speed * normal
+                self._simulator.velocities.from_numpy(vels.astype(np.float32))
+            else:
+                self._opening_ramp_queue.append({
+                    'above':      np.array([p['v_above'] for p in newly_broken], dtype=np.int32),
+                    'below':      np.array([p['v_below'] for p in newly_broken], dtype=np.int32),
+                    'step_speed': opening_speed / ramp_frames,
+                    'left':       ramp_frames,
+                })
+
+        return all(p['broken'] for p in self._seam_pairs)
 
     @property
     def vertex_count(self) -> int:
-        raise NotImplementedError
+        return self._simulator.positions.shape[0]
+
+    @property
+    def n_orig(self) -> int | None:
+        return self._n_orig_val
 
 
 # ---------------------------------------------------------------------------
