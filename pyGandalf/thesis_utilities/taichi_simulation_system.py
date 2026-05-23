@@ -220,6 +220,7 @@ class TaichiSimulationComponent(Component):
         self.opening_ramp_frames = max(1, int(opening_ramp_frames))
 
         # Populated by TaichiSimulationSystem.on_create_entity
+        self.method    = None          # SpringMassMethod — drives physics
         self.simulator:           _SpringMassSimulator = None
         self.surface_indices:     np.ndarray           = None
         self.current_tetrahedra:  np.ndarray           = None
@@ -309,14 +310,23 @@ class TaichiSimulationSystem(System):
         comp.poke_mask = (y >= poke_threshold) & (fixed_mask == 0)
         comp.surface_indices = _extract_boundary_faces(tet.tetrahedra, tet.vertices)
 
-        comp.simulator = _SpringMassSimulator(
-            vertices   = tet.vertices,
-            tetrahedra = tet.tetrahedra,
-            fixed_mask = fixed_mask,
-            stiffness  = comp.stiffness,
-            total_mass = comp.total_mass,
-            gravity    = np.array(comp.gravity, dtype=np.float32),
-        )
+        from pyGandalf.thesis_utilities.simulation_method import SpringMassMethod
+        _sim_params = {
+            'stiffness':           comp.stiffness,
+            'damping':             comp.damping,
+            'spring_damping':      comp.spring_damping,
+            'total_mass':          comp.total_mass,
+            'gravity':             comp.gravity,
+            'v_max':               comp.v_max,
+            'time_step':           comp.time_step,
+            'substeps':            comp.substeps,
+            'opening_speed':       comp.opening_speed,
+            'blade_speed':         comp.blade_speed,
+            'opening_ramp_frames': comp.opening_ramp_frames,
+        }
+        comp.method    = SpringMassMethod()
+        comp.method.initialize(comp.tet_mesh, _sim_params)
+        comp.simulator = comp.method._simulator
 
         sub_dt = comp.time_step / comp.substeps
         print("[TaichiSimulationSystem] Initialized:")
@@ -387,27 +397,10 @@ class TaichiSimulationSystem(System):
             _check_disc_parallelism(comp, mesh_comp)
         self._x_prev = x_now
 
-        # --- Opening velocity ramp ---
-        if comp._opening_ramp_queue:
-            vels = comp.simulator.velocities.to_numpy()
-            normal = np.array(comp._cut_normal, dtype=np.float32)
-            still_active = []
-            for entry in comp._opening_ramp_queue:
-                ss = entry['step_speed']
-                vels[entry['above']] += ss * normal
-                vels[entry['below']] -= ss * normal
-                entry['left'] -= 1
-                if entry['left'] > 0:
-                    still_active.append(entry)
-            comp.simulator.velocities.from_numpy(vels.astype(np.float32))
-            comp._opening_ramp_queue = still_active
-
-        # --- Simulation sub-steps ---
+        # --- Simulation sub-steps (via SpringMassMethod — handles ramp internally) ---
         t0 = time.perf_counter()
         if not comp.sim_paused:
-            sub_dt = comp.time_step / comp.substeps
-            for _ in range(comp.substeps):
-                comp.simulator.step(sub_dt, comp.damping, comp.spring_damping, comp.v_max)
+            comp.method.step(comp.time_step)
 
             # Force audit: runs once on the first simulated frame after a cut.
             if comp._pending_force_audit and comp._n_orig is not None:
@@ -740,6 +733,8 @@ def _cut_topology(comp: TaichiSimulationComponent,
     comp.simulator          = new_sim
     comp.current_tetrahedra = all_tets
     comp.fixed_mask         = final_fixed
+    if comp.method is not None:
+        comp.method._simulator = new_sim
 
     return (final_pos, final_vel, final_mass, final_fixed,
             all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set)
@@ -1075,6 +1070,16 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     seam_pairs.sort(key=lambda p: p['travel_dist'])
     comp._seam_pairs = seam_pairs
 
+    if comp.method is not None:
+        comp.method._seam_pairs         = comp._seam_pairs   # shared list — mutations visible to both
+        comp.method._n_orig_val         = n_orig
+        comp.method._n_split            = n_split
+        comp.method._cut_normal         = normal
+        comp.method._cut_origin         = origin
+        comp.method._blade_dir          = blade_dir
+        comp.method._current_tets       = all_tets
+        comp.method._opening_ramp_queue = []
+
     # Blade cursor starts just before the first seam pair.
     if seam_pairs:
         comp.blade_travel = seam_pairs[0]['travel_dist'] - 1e-3
@@ -1178,26 +1183,13 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
     comp.blade_travel += comp.blade_speed * float(dt)
 
     # --- Break springs behind the cursor ---
-    newly_broken = [p for p in comp._seam_pairs
-                    if not p['broken'] and p['travel_dist'] <= comp.blade_travel]
-
-    if newly_broken:
-        first_break = not any(p['broken'] for p in comp._seam_pairs)
-        if first_break:
-            comp._pending_force_audit = True
-        for p in newly_broken:
-            comp.simulator._sk[p['spring_idx']] = 0.0
-            p['broken'] = True
-        # Queue a ramped opening impulse for all pairs broken this frame.
-        step_speed = comp.opening_speed / comp.opening_ramp_frames
-        above = np.array([p['v_above'] for p in newly_broken], dtype=np.int32)
-        below = np.array([p['v_below'] for p in newly_broken], dtype=np.int32)
-        comp._opening_ramp_queue.append({
-            'above': above,
-            'below': below,
-            'step_speed': step_speed,
-            'left': comp.opening_ramp_frames,
-        })
+    # Check first_break before advance_blade() updates the broken flags.
+    newly_to_break = [p for p in comp._seam_pairs
+                      if not p['broken'] and p['travel_dist'] <= comp.blade_travel]
+    if newly_to_break and not any(p['broken'] for p in comp._seam_pairs):
+        comp._pending_force_audit = True
+    comp.method.advance_blade(comp.blade_travel)
+    # comp._seam_pairs is the same list as comp.method._seam_pairs — broken flags updated in-place.
 
     # --- Reveal wound faces behind the cursor ---
     ptr = comp._wound_face_ptr
