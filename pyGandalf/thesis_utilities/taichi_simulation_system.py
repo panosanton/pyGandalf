@@ -203,7 +203,8 @@ class TaichiSimulationComponent(Component):
                  spring_damping:     float = 0.0,
                  blade_travel_dir:   list  = None,
                  blade_speed:        float = 0.5,
-                 split_disc_verts:   bool  = True):
+                 split_disc_verts:   bool  = True,
+                 opening_ramp_frames: int  = 20):
         super().__init__()
         self.tet_mesh      = tet_mesh
         self.time_step     = time_step
@@ -216,8 +217,10 @@ class TaichiSimulationComponent(Component):
         self.poke_speed    = poke_speed
         self.v_max         = v_max
         self.spring_damping = spring_damping
+        self.opening_ramp_frames = max(1, int(opening_ramp_frames))
 
         # Populated by TaichiSimulationSystem.on_create_entity
+        self.method    = None          # SpringMassMethod — drives physics
         self.simulator:           _SpringMassSimulator = None
         self.surface_indices:     np.ndarray           = None
         self.current_tetrahedra:  np.ndarray           = None
@@ -271,6 +274,11 @@ class TaichiSimulationComponent(Component):
         # Set True after a cut; consumed on the next simulated frame to print a force audit.
         self._pending_force_audit: bool = False
 
+        # Opening velocity ramp queue — each entry applies a small velocity increment
+        # per frame for opening_ramp_frames frames instead of one large impulse.
+        # Format: {'above': np.ndarray, 'below': np.ndarray, 'step_speed': float, 'left': int}
+        self._opening_ramp_queue: list = []
+
 
 # ---------------------------------------------------------------------------
 # System
@@ -302,14 +310,23 @@ class TaichiSimulationSystem(System):
         comp.poke_mask = (y >= poke_threshold) & (fixed_mask == 0)
         comp.surface_indices = _extract_boundary_faces(tet.tetrahedra, tet.vertices)
 
-        comp.simulator = _SpringMassSimulator(
-            vertices   = tet.vertices,
-            tetrahedra = tet.tetrahedra,
-            fixed_mask = fixed_mask,
-            stiffness  = comp.stiffness,
-            total_mass = comp.total_mass,
-            gravity    = np.array(comp.gravity, dtype=np.float32),
-        )
+        from pyGandalf.thesis_utilities.simulation_method import SpringMassMethod
+        _sim_params = {
+            'stiffness':           comp.stiffness,
+            'damping':             comp.damping,
+            'spring_damping':      comp.spring_damping,
+            'total_mass':          comp.total_mass,
+            'gravity':             comp.gravity,
+            'v_max':               comp.v_max,
+            'time_step':           comp.time_step,
+            'substeps':            comp.substeps,
+            'opening_speed':       comp.opening_speed,
+            'blade_speed':         comp.blade_speed,
+            'opening_ramp_frames': comp.opening_ramp_frames,
+        }
+        comp.method    = SpringMassMethod()
+        comp.method.initialize(comp.tet_mesh, _sim_params)
+        comp.simulator = comp.method._simulator
 
         sub_dt = comp.time_step / comp.substeps
         print("[TaichiSimulationSystem] Initialized:")
@@ -380,12 +397,10 @@ class TaichiSimulationSystem(System):
             _check_disc_parallelism(comp, mesh_comp)
         self._x_prev = x_now
 
-        # --- Simulation sub-steps ---
+        # --- Simulation sub-steps (via SpringMassMethod — handles ramp internally) ---
         t0 = time.perf_counter()
         if not comp.sim_paused:
-            sub_dt = comp.time_step / comp.substeps
-            for _ in range(comp.substeps):
-                comp.simulator.step(sub_dt, comp.damping, comp.spring_damping, comp.v_max)
+            comp.method.step(comp.time_step)
 
             # Force audit: runs once on the first simulated frame after a cut.
             if comp._pending_force_audit and comp._n_orig is not None:
@@ -557,35 +572,29 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
     return new_pos, above_arr, below_arr, inter_data
 
 
-def _cut_topology(comp: TaichiSimulationComponent,
-                  origin: np.ndarray,
-                  normal: np.ndarray):
+def _cut_topology_physics(
+        current_tets: np.ndarray,
+        positions:    np.ndarray,
+        velocities:   np.ndarray,
+        masses:       np.ndarray,
+        fixed:        np.ndarray,
+        stiffness:    float,
+        gravity:      np.ndarray,
+        origin:       np.ndarray,
+        normal:       np.ndarray):
     """
-    Shared topology-change logic used by both the one-shot cut and the
-    progressive cut setup.
+    Pure topology-change computation — no Component dependency.
 
-    Splits crossed tets, snaps rim vertices, extends vel/mass/fixed arrays,
-    duplicates seam vertices, and rebuilds the simulator.
+    Splits tetrahedra along the cut plane, duplicates seam vertices, and
+    rebuilds the spring-mass simulator.  Used by both the ECS wrapper
+    (_cut_topology) and SpringMassMethod.setup_cut().
 
-    Returns:
-        final_pos      (N_final, 3)
-        final_vel      (N_final, 3)
-        final_mass     (N_final,)
-        final_fixed    (N_final,)
-        all_tets       (T_final, 4)
-        n_orig         int   — number of vertices before split
-        n_split        int   — n_orig + intersection verts (before duplication)
-        shared_list    list  — intersection vertex indices (above-half)
-        remap          (n_split,) int32  — maps above indices to below dup indices
-        inter_data     list of (new_idx, vi, vj, t)
-        orig_surf_set  set of sorted (v0,v1,v2) tuples for original outer faces
+    Returns
+    -------
+    (new_sim, final_pos, final_vel, final_mass, final_fixed,
+     all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set)
+    or None if the cut plane does not divide the mesh.
     """
-    current_tets = comp.current_tetrahedra
-    positions    = comp.simulator.positions.to_numpy()
-    velocities   = comp.simulator.velocities.to_numpy()
-    masses       = comp.simulator._masses.to_numpy()
-    fixed        = comp.simulator._fixed.to_numpy()
-
     signed_dist  = (positions - origin) @ normal
 
     # --- Original outer surface set (to detect interior-exposed faces later) ---
@@ -669,19 +678,16 @@ def _cut_topology(comp: TaichiSimulationComponent,
     new_below_tets = remap[below_tets]
     all_tets       = np.vstack([above_tets, new_below_tets])
 
-    comp.current_tetrahedra = all_tets
-    comp.fixed_mask         = final_fixed
-
     # --- Rebuild simulator ---
-    comp.simulator = _SpringMassSimulator(
+    new_sim = _SpringMassSimulator(
         vertices        = final_pos,
         tetrahedra      = all_tets,
         fixed_mask      = final_fixed,
-        stiffness       = comp.stiffness,
-        gravity         = np.array(comp.gravity, dtype=np.float32),
+        stiffness       = stiffness,
+        gravity         = gravity,
         per_vertex_mass = final_mass,
     )
-    comp.simulator.velocities.from_numpy(final_vel.astype(np.float32))
+    new_sim.velocities.from_numpy(final_vel.astype(np.float32))
 
     # No spring zeroing: orig→new springs are structural tet edges that are
     # needed for mesh connectivity.  Zeroing them disconnects the disc from
@@ -690,16 +696,48 @@ def _cut_topology(comp: TaichiSimulationComponent,
     # behaviour; reduce opening_speed if it looks too violent.
 
     print(f"[Cut] Simulator: {len(final_pos):,} verts, "
-          f"{len(all_tets):,} tets, {len(comp.simulator._sa):,} springs")
+          f"{len(all_tets):,} tets, {len(new_sim._sa):,} springs")
 
-    _print_spring_audit(
-        comp.simulator._sa, comp.simulator._sb,
-        comp.simulator._sr, comp.simulator._sk,
-        n_orig)
+    _print_spring_audit(new_sim._sa, new_sim._sb, new_sim._sr, new_sim._sk, n_orig)
+
+    return (new_sim, final_pos, final_vel, final_mass, final_fixed,
+            all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set)
+
+
+def _cut_topology(comp: TaichiSimulationComponent,
+                  origin: np.ndarray,
+                  normal: np.ndarray):
+    """
+    ECS wrapper for _cut_topology_physics.
+
+    Reads arrays from comp, runs the pure computation, and writes the new
+    simulator / tetrahedra / fixed_mask back to comp.
+    Returns the same 11-tuple callers expect, or None on failure.
+    """
+    result = _cut_topology_physics(
+        comp.current_tetrahedra,
+        comp.simulator.positions.to_numpy(),
+        comp.simulator.velocities.to_numpy(),
+        comp.simulator._masses.to_numpy(),
+        comp.simulator._fixed.to_numpy(),
+        comp.stiffness,
+        np.array(comp.gravity, dtype=np.float32),
+        origin, normal,
+    )
+    if result is None:
+        return None
+
+    (new_sim, final_pos, final_vel, final_mass, final_fixed,
+     all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set) = result
+
+    comp.simulator          = new_sim
+    comp.current_tetrahedra = all_tets
+    comp.fixed_mask         = final_fixed
+    if comp.method is not None:
+        comp.method._simulator = new_sim
 
     return (final_pos, final_vel, final_mass, final_fixed,
-            all_tets, n_orig, n_split, shared_list, remap, inter_data,
-            orig_surf_set)
+            all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set)
 
 
 def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
@@ -899,18 +937,20 @@ def _perform_cut(comp: TaichiSimulationComponent,
     comp._shared_list = shared_list
     comp._cut_normal  = normal
 
-    # --- Opening velocity ---
+    # --- Opening velocity (ramped over opening_ramp_frames frames) ---
     if comp.opening_speed > 0.0:
         inter_indices = np.array([d[0] for d in inter_data], dtype=np.int32)
         dup_indices   = np.array([remap[v] for v in inter_indices
                                   if remap[v] >= n_split], dtype=np.int32)
-        vels = comp.simulator.velocities.to_numpy()
-        if len(inter_indices) > 0:
-            vels[inter_indices] += comp.opening_speed * normal
-        if len(dup_indices) > 0:
-            vels[dup_indices]   -= comp.opening_speed * normal
-        comp.simulator.velocities.from_numpy(vels.astype(np.float32))
-        print(f"[Cut] Opening velocity on {len(inter_indices)} + {len(dup_indices)} verts")
+        step_speed = comp.opening_speed / comp.opening_ramp_frames
+        comp._opening_ramp_queue.append({
+            'above': inter_indices,
+            'below': dup_indices,
+            'step_speed': step_speed,
+            'left': comp.opening_ramp_frames,
+        })
+        print(f"[Cut] Opening ramp queued: {len(inter_indices)} + {len(dup_indices)} verts "
+              f"over {comp.opening_ramp_frames} frames ({step_speed:.4f} m/s/frame)")
     comp._pending_force_audit = True
 
     # --- Surface ---
@@ -1030,6 +1070,16 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     seam_pairs.sort(key=lambda p: p['travel_dist'])
     comp._seam_pairs = seam_pairs
 
+    if comp.method is not None:
+        comp.method._seam_pairs         = comp._seam_pairs   # shared list — mutations visible to both
+        comp.method._n_orig_val         = n_orig
+        comp.method._n_split            = n_split
+        comp.method._cut_normal         = normal
+        comp.method._cut_origin         = origin
+        comp.method._blade_dir          = blade_dir
+        comp.method._current_tets       = all_tets
+        comp.method._opening_ramp_queue = []
+
     # Blade cursor starts just before the first seam pair.
     if seam_pairs:
         comp.blade_travel = seam_pairs[0]['travel_dist'] - 1e-3
@@ -1133,21 +1183,13 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
     comp.blade_travel += comp.blade_speed * float(dt)
 
     # --- Break springs behind the cursor ---
-    newly_broken = [p for p in comp._seam_pairs
-                    if not p['broken'] and p['travel_dist'] <= comp.blade_travel]
-
-    if newly_broken:
-        first_break = not any(p['broken'] for p in comp._seam_pairs)
-        if first_break:
-            comp._pending_force_audit = True
-        # Batch the velocity round-trip.
-        vels = comp.simulator.velocities.to_numpy()
-        for p in newly_broken:
-            comp.simulator._sk[p['spring_idx']] = 0.0
-            vels[p['v_above']] += comp.opening_speed * normal
-            vels[p['v_below']] -= comp.opening_speed * normal
-            p['broken'] = True
-        comp.simulator.velocities.from_numpy(vels.astype(np.float32))
+    # Check first_break before advance_blade() updates the broken flags.
+    newly_to_break = [p for p in comp._seam_pairs
+                      if not p['broken'] and p['travel_dist'] <= comp.blade_travel]
+    if newly_to_break and not any(p['broken'] for p in comp._seam_pairs):
+        comp._pending_force_audit = True
+    comp.method.advance_blade(comp.blade_travel)
+    # comp._seam_pairs is the same list as comp.method._seam_pairs — broken flags updated in-place.
 
     # --- Reveal wound faces behind the cursor ---
     ptr = comp._wound_face_ptr

@@ -149,13 +149,14 @@ def main():
         damping          = 3.5,
         total_mass       = 100.0,
         gravity          = [0.0, 0.0, 0.0],
-        opening_speed    = 4.0,
-        poke_speed       = 2.0,
-        v_max            = 4.0,
-        spring_damping   = 2.0,
-        blade_travel_dir = blade_dir.tolist(),
-        blade_speed      = 0.5,
-        split_disc_verts = True,   # set False to disable rim vertex duplication
+        opening_speed         = 20.0,
+        poke_speed            = 2.0,
+        v_max                 = 20.0,
+        spring_damping        = 2.0,
+        blade_travel_dir      = blade_dir.tolist(),
+        blade_speed           = 0.5,
+        split_disc_verts      = True,   # set False to disable rim vertex duplication
+        opening_ramp_frames   = 20,     # spread opening impulse over N frames
     )
     taichi_comp.cut_plane_origin = origin.tolist()
     taichi_comp.cut_plane_normal = normal.tolist()
