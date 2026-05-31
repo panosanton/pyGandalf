@@ -52,7 +52,7 @@ class _Tee:
 
 def _setup_logging(output_dir: Path) -> object:
     log_path = output_dir / 'generation.log'
-    log_file = open(log_path, 'w', buffering=1)   # line-buffered
+    log_file = open(log_path, 'w', buffering=1, encoding='utf-8')   # line-buffered
     tee = _Tee(sys.__stdout__, log_file)
     sys.stdout = tee
     sys.stderr = _Tee(sys.__stderr__, log_file)
