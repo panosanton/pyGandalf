@@ -61,9 +61,7 @@ def _setup_logging(output_dir: Path) -> object:
 
 from pyGandalf.utilities.mesh_lib import MeshLib
 from pyGandalf.utilities.definitions import MODELS_PATH
-from pyGandalf.thesis_utilities.taichi_simulation_system import (
-    _extract_boundary_faces,
-)
+from pyGandalf.thesis_utilities.simulation_method import SpringMassMethod
 from pyGandalf.thesis_utilities.headless_sim import HeadlessSim
 
 
@@ -131,13 +129,9 @@ def generate_dataset(n_runs: int, output_dir: Path, seed: int | None = None):
     for run_idx in range(n_runs):
         normal, origin, blade_dir = _random_cut_plane(rng)
 
-        sim = HeadlessSim(
-            tet_mesh       = tet_mesh,
-            cut_normal     = normal,
-            cut_origin     = origin,
-            blade_travel_dir = blade_dir,
-            **SIM_PARAMS,
-        )
+        method = SpringMassMethod()
+        method.initialize(tet_mesh, SIM_PARAMS)
+        sim = HeadlessSim(method, normal, origin, blade_dir)
 
         data = sim.run_and_record(settle_steps=SETTLE_STEPS, record_every=RECORD_EVERY)
 

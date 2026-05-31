@@ -214,6 +214,52 @@ class SimulationMethod(ABC):
         """
         return None
 
+    @property
+    def time_step(self) -> float:
+        """Integration timestep in seconds, read from params."""
+        return float(self._params.get('time_step', 0.005))
+
+    @property
+    def blade_speed(self) -> float:
+        """Blade travel speed in m/s, read from params."""
+        return float(self._params.get('blade_speed', 0.5))
+
+    @property
+    def initial_blade_travel(self) -> float:
+        """
+        Recommended starting blade_travel value for HeadlessSim.
+
+        Returns the travel distance of the first seam pair minus a small
+        epsilon so the blade starts just before the first cut point.
+        Returns 0.0 if setup_cut() has not been called yet.
+        """
+        pairs = getattr(self, '_seam_pairs', None)
+        if pairs:
+            return pairs[0]['travel_dist'] - 1e-3
+        return 0.0
+
+    def get_graph_data(self) -> dict:
+        """
+        Return the static graph structure needed for GNN input recording.
+
+        Called once after setup_cut() by HeadlessSim.run_and_record().
+        The returned dict is merged into the trajectory .npz alongside
+        per-frame positions and velocities.
+
+        Concrete methods that support recording must override this.
+        Methods that do not support recording leave this unimplemented;
+        calling it raises NotImplementedError at runtime.
+
+        Returns
+        -------
+        dict with at minimum the keys needed by the GNN trainer.
+        The exact keys are method-defined -- document them in the override.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support graph recording. "
+            "Override get_graph_data() to enable HeadlessSim recording."
+        )
+
 
 # ---------------------------------------------------------------------------
 # SpringMassMethod
@@ -367,6 +413,44 @@ class SpringMassMethod(SimulationMethod):
         self._opening_ramp_queue = []
 
         return True
+
+    def get_graph_data(self) -> dict:
+        """
+        Snapshot the spring graph after setup_cut() for GNN recording.
+
+        Returns
+        -------
+        dict with keys:
+            edges            (E, 2)  int32   -- spring pairs [structural | cutting]
+            rest_lengths     (E,)    float32 -- rest length per spring
+            stiffnesses_max  (E,)    float32 -- initial stiffness per spring
+            spring_break_at  (E,)    float32 -- blade_travel when broken (inf = never)
+            masses           (N,)    float32 -- per-vertex mass
+            fixed            (N,)    int32   -- 1 = fixed, 0 = free
+            n_structural     int     -- number of structural springs
+        """
+        sim  = self._simulator
+        sa   = np.array(sim._sa, dtype=np.int32)
+        sb   = np.array(sim._sb, dtype=np.int32)
+        sr   = np.array(sim._sr, dtype=np.float32)
+        sk   = np.array(sim._sk, dtype=np.float32)
+
+        n_springs    = len(sa)
+        n_structural = n_springs - len(self._seam_pairs)
+
+        spring_break_at = np.full(n_springs, np.inf, dtype=np.float32)
+        for p in self._seam_pairs:
+            spring_break_at[p['spring_idx']] = p['travel_dist']
+
+        return {
+            'edges':           np.stack([sa, sb], axis=1),
+            'rest_lengths':    sr,
+            'stiffnesses_max': sk,
+            'spring_break_at': spring_break_at,
+            'masses':          sim._masses.to_numpy().astype(np.float32),
+            'fixed':           sim._fixed.to_numpy().astype(np.int32),
+            'n_structural':    np.int32(n_structural),
+        }
 
     def advance_blade(self, blade_travel: float) -> bool:
         """
