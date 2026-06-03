@@ -119,6 +119,16 @@ class _SpringMassSimulator:
     # --- Taichi kernels ---
 
     @ti.kernel
+    def _add_vel_scalar(self,
+                        indices: ti.types.ndarray(dtype=ti.i32, ndim=1),
+                        dx: ti.f32, dy: ti.f32, dz: ti.f32):
+        """Add (dx,dy,dz) to velocity[i] for each i in indices — no CPU sync needed."""
+        dv = ti.Vector([dx, dy, dz])
+        for k in range(indices.shape[0]):
+            j = indices[k]
+            self.velocities[j] += dv
+
+    @ti.kernel
     def _clear_forces(self):
         for i in self._forces:
             self._forces[i] = ti.Vector([0.0, 0.0, 0.0])
@@ -381,8 +391,10 @@ class TaichiSimulationSystem(System):
                 print(f"[Blade] {'Resumed' if comp.blade_is_active else 'Paused'}")
         self._b_prev = b_now
 
+        t_blade0 = time.perf_counter()
         if comp.blade_is_active:
             _advance_progressive_blade(comp, mesh_comp, ts)
+        t_blade1 = time.perf_counter()
 
         # --- F key: poke ---
         f_now = InputManager().get_key_down(glfw.KEY_F)
@@ -461,13 +473,15 @@ class TaichiSimulationSystem(System):
             self._fc = 0
         self._fc += 1
         if self._fc % 60 == 0:
+            blade_ms = (t_blade1 - t_blade0) * 1000
             print(
                 f"[Frame {self._fc:4d}] "
+                f"blade {blade_ms:4.2f}ms | "
                 f"sim {(t1-t0)*1000:5.2f}ms | "
                 f"readback {(t2-t1)*1000:4.2f}ms | "
                 f"normals {(t3-t2)*1000:4.2f}ms | "
                 f"upload {(t4-t3)*1000:4.2f}ms | "
-                f"total {(t4-t0)*1000:5.2f}ms"
+                f"total {(t4-t_blade0)*1000:5.2f}ms"
             )
 
 
@@ -755,128 +769,35 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
                            orig_surf_set, mesh_centroid=None,
                            inter_data=None, shared_list=None):
     """
-    Partition raw boundary faces into outer faces and wound faces, applying
-    correct winding to each.
+    Partition raw boundary faces (from _extract_boundary_faces) into outer
+    faces and wound faces.
 
-    Faces with all-original vertices not in orig_surf_set are dropped — they
-    are interior tet faces exposed by the split.
+    Winding is NOT re-applied here. _extract_boundary_faces already uses the
+    robust opposite-vertex test which works for any mesh geometry, including
+    non-convex meshes.  The old centroid and orig_surf_set approaches were
+    sphere-only heuristics that dropped valid faces on complex meshes.
 
-    Collar faces (original + intersection/dup vertices) are classified by
-    mapping each non-original vertex back to its pre-cut parent, recovering the
-    original face key.  If that key is in orig_surf_set, the collar face is the
-    sliced remnant of an outer surface face (the original surface face no longer
-    exists in any tet after the split, so its collar remnant IS the outer surface)
-    → promoted to outer with centroid winding.  If the key is absent → interior,
-    dropped.  Pure disc faces (no original vertices) → wound surface.
-
-    Winding rules:
-      outer (all-orig or collar mapped to orig_surf_set): centroid test.
-      wound (pure disc, no original vertices): cut-normal test.
-        above-half (no vertex >= n_split) → dot(fn, normal) < 0
-        below-half (any vertex >= n_split) → dot(fn, normal) > 0
+    Classification (index-only, no geometry needed):
+      wound face: every vertex is "on the cut plane", meaning:
+        - an intersection vertex (n_orig <= v < n_split), or
+        - a dup seam vertex (v >= n_split), or
+        - an original seam vertex (v < n_orig and v in shared_list).
+      outer face: any face with at least one off-plane original vertex.
     """
-    # inter_data: list of (new_idx, vi_above, vj_below, t)
-    # inter_parent maps intersection vertex index → (vi_above, vj_below)
-    inter_parent: dict = {}
-    if inter_data is not None:
-        for new_id, vi, vj, _t in inter_data:
-            inter_parent[int(new_id)] = (int(vi), int(vj))
+    seam_set = set(int(v) for v in shared_list) if shared_list else set()
 
-    def _orig_face_key(v0, v1, v2):
-        """
-        Map each non-original vertex back to a candidate original vertex and
-        return the pre-cut face key for orig_surf_set lookup.
-
-        A single fixed rule (always above or always below parent) breaks for
-        the 3+1 split: two intersection vertices on the face both come from
-        edges that go to the same single below vertex b, so the naive mapping
-        produces (a1, b, b) — a duplicate key not in orig_surf_set.
-
-        Instead, collect both candidate parents per non-original vertex and
-        try all combinations, returning the first one that forms three distinct
-        vertices whose sorted key is in orig_surf_set.
-        """
-        opts = []
-        for v in (v0, v1, v2):
-            if v < n_orig:
-                opts.append((v,))
-            elif v < n_split:                        # intersection vertex
-                entry = inter_parent.get(v)
-                if entry is None:
-                    return None
-                opts.append((entry[1], entry[0]))    # vj_below first, vi_above fallback
-            else:                                    # dup vertex (below-half)
-                if shared_list is None:
-                    return None
-                seam_idx = v - n_split
-                if seam_idx >= len(shared_list):
-                    return None
-                entry = inter_parent.get(int(shared_list[seam_idx]))
-                if entry is None:
-                    return None
-                opts.append((entry[0], entry[1]))    # vi_above first, vj_below fallback
-        for a in opts[0]:
-            for b in opts[1]:
-                for c in opts[2]:
-                    if a != b and b != c and a != c:
-                        key = tuple(sorted((a, b, c)))
-                        if key in orig_surf_set:
-                            return key
-        return None
+    def on_plane(v):
+        return v >= n_orig or v in seam_set
 
     outer = []
     wound = []
-    dropped_collar = 0
 
     for f in raw_surface:
         v0, v1, v2 = int(f[0]), int(f[1]), int(f[2])
-        all_orig = v0 < n_orig and v1 < n_orig and v2 < n_orig
-        any_orig = v0 < n_orig or v1 < n_orig or v2 < n_orig
-
-        if all_orig:
-            if tuple(sorted((v0, v1, v2))) in orig_surf_set:
-                if mesh_centroid is not None:
-                    p0 = final_pos[v0]; p1 = final_pos[v1]; p2 = final_pos[v2]
-                    fn = np.cross(p1 - p0, p2 - p0)
-                    to_face = (p0 + p1 + p2) / 3.0 - mesh_centroid
-                    if float(np.dot(fn, to_face)) < 0:
-                        f = np.array([v0, v2, v1], dtype=np.uint32)
-                outer.append(f)
-            # else: interior tet face exposed by split — drop
+        if on_plane(v0) and on_plane(v1) and on_plane(v2):
+            wound.append(f)
         else:
-            if any_orig and inter_data is not None:
-                key = _orig_face_key(v0, v1, v2)
-                if key is None or key not in orig_surf_set:
-                    # Interior collar face (or unmappable) — drop.
-                    dropped_collar += 1
-                    continue
-                # Collar face whose pre-cut parent is an outer surface face.
-                # It is the sliced remnant of that face and belongs on the outer
-                # surface with outward winding, not on the wound surface.
-                if mesh_centroid is not None:
-                    p0 = final_pos[v0]; p1 = final_pos[v1]; p2 = final_pos[v2]
-                    fn = np.cross(p1 - p0, p2 - p0)
-                    to_face = (p0 + p1 + p2) / 3.0 - mesh_centroid
-                    if float(np.dot(fn, to_face)) < 0:
-                        f = np.array([v0, v2, v1], dtype=np.uint32)
-                outer.append(f)
-                continue
-
-            # Pure disc face (no original vertices) — genuine wound surface.
-            is_below = v0 >= n_split or v1 >= n_split or v2 >= n_split
-            p0 = final_pos[v0]; p1 = final_pos[v1]; p2 = final_pos[v2]
-            fn  = np.cross(p1 - p0, p2 - p0)
-            dot = float(np.dot(fn, normal))
-            if abs(dot) < 1e-12:
-                continue
-            if is_below:
-                face = f if dot > 0 else np.array([v0, v2, v1], dtype=np.uint32)
-            else:
-                face = f if dot < 0 else np.array([v0, v2, v1], dtype=np.uint32)
-            wound.append(face)
-
-    if dropped_collar > 0:
-        print(f"[Cut] Dropped {dropped_collar} interior collar faces")
+            outer.append(f)
 
     outer_arr = (np.array(outer, dtype=np.uint32)
                  if outer else np.zeros((0, 3), dtype=np.uint32))
@@ -1567,59 +1488,62 @@ def _compute_normals_post_cut(vertices:    np.ndarray,
                                shared_list: list,
                                cut_normal:  np.ndarray) -> np.ndarray:
     """
-    Normal computation for a cut mesh.
-
-    Original vertices use standard angle-weighted accumulation.
-
-    Intersection vertices are split into two groups:
-      - Collar-only (NOT in any disc face): lerped along their parent edge so
-        the collar shading blends smoothly with the rest of the sphere surface.
-      - Disc vertices (appear in a face where all indices >= n_orig): assigned
-        the cut-plane normal directly (±cut_normal).  Disc faces are flat, so
-        every point on them should have the same perpendicular normal.
-
-    inter_data:  [(new_id, vi_above, vj_below, t), ...]
-    shared_list: list of seam vertex indices (above-half copies), where the
-                 dup index is n_split + i for shared_list[i].
-    cut_normal:  normalized cut plane normal (points toward the "above" half).
+    Normal computation for a cut mesh.  Fully vectorized -- no Python loops.
     """
     normals = np.zeros_like(vertices, dtype=np.float32)
     idx_i32 = indices.astype(np.int32)
     _accumulate_normals_kernel(vertices, idx_i32, normals)
     _normalize_normals_kernel(normals)
 
-    # Identify disc vertices: appear in any face where all three indices >= n_orig.
-    disc_mask  = np.all(idx_i32 >= n_orig, axis=1)
-    disc_verts = set(idx_i32[disc_mask].flatten().tolist()) if disc_mask.any() else set()
-
     cut_n = (cut_normal / np.linalg.norm(cut_normal)).astype(np.float32)
 
-    # Lerp override for collar-only intersection vertices.
+    # Disc vertices: appear in any face where all three indices >= n_orig.
+    disc_mask = np.all(idx_i32 >= n_orig, axis=1)
+    if disc_mask.any():
+        disc_arr = np.unique(idx_i32[disc_mask])
+    else:
+        disc_arr = np.empty(0, dtype=np.int32)
+
+    # Lerp normals for collar-only intersection vertices (vectorized).
     if inter_data:
-        for new_id, vi, vj, t in inter_data:
-            if new_id in disc_verts:
-                continue
-            n_vi     = normals[vi]
-            n_vj     = normals[vj]
-            n_interp = n_vi * (1.0 - float(t)) + n_vj * float(t)
-            length   = float(np.linalg.norm(n_interp))
-            normals[new_id] = (n_interp / length) if length > 1e-6 else n_vi
+        inter_np  = np.array([(d[0], d[1], d[2], d[3]) for d in inter_data],
+                              dtype=np.float64)
+        new_ids   = inter_np[:, 0].astype(np.int32)
+        vis       = inter_np[:, 1].astype(np.int32)
+        vjs       = inter_np[:, 2].astype(np.int32)
+        ts        = inter_np[:, 3].astype(np.float32)[:, np.newaxis]
 
-    # Snap disc vertex normals to exactly ±cut_n.  The sign is inferred from
-    # the accumulated normal so this works regardless of which half (above /
-    # below) a disc vertex belongs to, and for rendering-only duplicates whose
-    # indices exceed the physics vertex range.
-    for v in disc_verts:
-        dot = float(np.dot(normals[v], cut_n))
-        if abs(dot) > 1e-6:
-            normals[v] = -cut_n if dot < 0.0 else cut_n
+        is_disc   = np.isin(new_ids, disc_arr)
+        collar    = ~is_disc
+        if collar.any():
+            cids     = new_ids[collar]
+            n_interp = normals[vis[collar]] * (1.0 - ts[collar]) + \
+                       normals[vjs[collar]] * ts[collar]
+            lengths  = np.linalg.norm(n_interp, axis=1, keepdims=True)
+            valid    = (lengths.squeeze(axis=1) > 1e-6)
+            n_interp[valid]  /= lengths[valid]
+            n_interp[~valid]  = normals[vis[collar]][~valid]
+            normals[cids]     = n_interp
 
-    # Non-disc dup vertices share the collar-face normal of their seam partner.
-    if shared_list is not None:
-        for i, seam_v in enumerate(shared_list):
-            dup_v = n_split + i
-            if dup_v < len(normals) and dup_v not in disc_verts:
-                normals[dup_v] = normals[seam_v]
+    # Snap disc vertex normals to ±cut_n (vectorized).
+    if len(disc_arr) > 0:
+        dots = normals[disc_arr] @ cut_n          # (D,)
+        nonzero = np.abs(dots) > 1e-6
+        normals[disc_arr[nonzero]] = np.where(
+            dots[nonzero, np.newaxis] < 0.0, -cut_n, cut_n)
+
+    # Non-disc dup vertices: copy normal from seam partner (vectorized).
+    if shared_list is not None and len(shared_list) > 0:
+        seam_arr = np.asarray(shared_list, dtype=np.int32)
+        dup_arr  = np.arange(n_split, n_split + len(seam_arr), dtype=np.int32)
+        valid    = dup_arr < len(normals)
+        if valid.any() and len(disc_arr) > 0:
+            not_disc = ~np.isin(dup_arr[valid], disc_arr)
+            tgt = dup_arr[valid][not_disc]
+            src = seam_arr[valid][not_disc]
+            normals[tgt] = normals[src]
+        elif valid.any():
+            normals[dup_arr[valid]] = normals[seam_arr[valid]]
 
     return normals
 

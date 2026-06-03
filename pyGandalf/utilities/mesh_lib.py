@@ -375,7 +375,7 @@ class MeshLib(object):
         return submeshes, face_vertex_count
     
     def build_tetrahedral(cls, name: str, surface_mesh_path: Path,
-                          target_faces: int = None):
+                          target_faces: int = None, tet_scale: float = 1.0):
 
         from pyGandalf.thesis_utilities.tet_generator import generate_tetrahedral_mesh
 
@@ -384,7 +384,8 @@ class MeshLib(object):
 
         # 2. Generate tetrahedral mesh (optionally simplified first)
         tet_mesh = generate_tetrahedral_mesh(surface_mesh,
-                                             target_faces=target_faces)
+                                             target_faces=target_faces,
+                                             tet_scale=tet_scale)
 
         # 3. Store and return
         return tet_mesh

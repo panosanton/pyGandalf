@@ -327,15 +327,16 @@ class SpringMassMethod(SimulationMethod):
         if not self._opening_ramp_queue:
             return
         normal = self._cut_normal
-        vels   = self._simulator.velocities.to_numpy()
         active = []
         for entry in self._opening_ramp_queue:
-            vels[entry['above']] += entry['step_speed'] * normal
-            vels[entry['below']] -= entry['step_speed'] * normal
+            dv = (entry['step_speed'] * normal).astype(np.float32)
+            above = np.asarray(entry['above'], dtype=np.int32)
+            below = np.asarray(entry['below'], dtype=np.int32)
+            self._simulator._add_vel_scalar(above,  float(dv[0]),  float(dv[1]),  float(dv[2]))
+            self._simulator._add_vel_scalar(below, -float(dv[0]), -float(dv[1]), -float(dv[2]))
             entry['left'] -= 1
             if entry['left'] > 0:
                 active.append(entry)
-        self._simulator.velocities.from_numpy(vels.astype(np.float32))
         self._opening_ramp_queue = active
 
     def get_positions(self) -> np.ndarray:
@@ -477,11 +478,11 @@ class SpringMassMethod(SimulationMethod):
                 p['broken'] = True
 
             if ramp_frames <= 1:
-                vels = self._simulator.velocities.to_numpy()
-                for p in newly_broken:
-                    vels[p['v_above']] += opening_speed * normal
-                    vels[p['v_below']] -= opening_speed * normal
-                self._simulator.velocities.from_numpy(vels.astype(np.float32))
+                dv = (opening_speed * normal).astype(np.float32)
+                above_np = np.array([p['v_above'] for p in newly_broken], dtype=np.int32)
+                below_np = np.array([p['v_below'] for p in newly_broken], dtype=np.int32)
+                self._simulator._add_vel_scalar(above_np,  float(dv[0]),  float(dv[1]),  float(dv[2]))
+                self._simulator._add_vel_scalar(below_np, -float(dv[0]), -float(dv[1]), -float(dv[2]))
             else:
                 self._opening_ramp_queue.append({
                     'above':      np.array([p['v_above'] for p in newly_broken], dtype=np.int32),
@@ -528,9 +529,10 @@ class FEMMethod(SimulationMethod):
     opening_ramp_frames : int = 1
     """
 
-    def __init__(self):
+    def __init__(self, **overrides):
         self._simulator          = None
         self._params             = {}
+        self._init_overrides     = overrides  # e.g. FEMMethod(cg_iters=50)
         self._n_orig_val         = None
         self._n_split            = None
         self._current_tets       = None
@@ -539,10 +541,16 @@ class FEMMethod(SimulationMethod):
         self._blade_dir          = None
         self._seam_pairs         = []
         self._opening_ramp_queue = []
+        # Debug state
+        self._debug_frames_since_cut = None   # None = pre-cut; int = frames since cut
+        self._debug_fixed_orig_pos   = None   # fixed-vert positions at cut time
+        self._debug_fixed_mask       = None   # fixed mask snapshot at cut time
+        self._debug_pre_cut_force    = None   # max force on fixed verts last frame before cut
 
     def initialize(self, tet_mesh, params: dict) -> None:
         from pyGandalf.thesis_utilities.fem_simulator import _FEMSimulator
         self._params = dict(params)
+        self._params.update(self._init_overrides)  # caller kwargs take priority
 
         y          = tet_mesh.vertices[:, 1]
         threshold  = y.min() + (y.max() - y.min()) * 0.05
@@ -570,20 +578,60 @@ class FEMMethod(SimulationMethod):
             v_max    = float(self._params.get('v_max',    10.0)),
             cg_iters = int(self._params.get('cg_iters',  20)),
         )
+        self._debug_step()
+
+    def _debug_step(self):
+        fixed_mask = self._simulator._fixed.to_numpy()
+        n_fixed    = int(fixed_mask.sum())
+        if n_fixed == 0:
+            return
+
+        forces = self._simulator._forces.to_numpy()
+        max_f  = float(np.linalg.norm(forces[fixed_mask == 1], axis=1).max())
+
+        if self._debug_frames_since_cut is None:
+            # Pre-cut: track last-frame force baseline
+            self._debug_pre_cut_force = max_f
+            return
+
+        if self._debug_frames_since_cut >= 5:
+            return
+
+        f = self._debug_frames_since_cut
+
+        # Check 2: force magnitude on fixed verts after step
+        # Check 3: velocity magnitude on fixed verts after step (should be 0)
+        vels  = self._simulator.velocities.to_numpy()
+        max_v = float(np.linalg.norm(vels[fixed_mask == 1], axis=1).max())
+
+        # Bonus: displacement of fixed verts from their cut-time positions (should stay 0)
+        pos          = self._simulator.positions.to_numpy()
+        fixed_pos    = pos[fixed_mask == 1]
+        displacements = np.linalg.norm(fixed_pos - self._debug_fixed_orig_pos, axis=1)
+        max_d        = float(displacements.max())
+        worst_local  = int(np.argmax(displacements))
+        worst_global = int(np.where(fixed_mask == 1)[0][worst_local])
+
+        print(f"[DEBUG frame+{f}] fixed verts ({n_fixed}):  "
+              f"max_force={max_f:.4f}  max_vel={max_v:.8f}  "
+              f"max_disp={max_d:.6f} (vert {worst_global})", flush=True)
+
+        self._debug_frames_since_cut += 1
 
     def _process_opening_ramp(self) -> None:
         if not self._opening_ramp_queue:
             return
         normal = self._cut_normal
-        vels   = self._simulator.velocities.to_numpy()
         active = []
         for entry in self._opening_ramp_queue:
-            vels[entry['above']] += entry['step_speed'] * normal
-            vels[entry['below']] -= entry['step_speed'] * normal
+            dv = (entry['step_speed'] * normal).astype(np.float32)
+            above = np.asarray(entry['above'], dtype=np.int32)
+            below = np.asarray(entry['below'], dtype=np.int32)
+            self._simulator._add_vel_scalar(above,  float(dv[0]),  float(dv[1]),  float(dv[2]))
+            self._simulator._add_vel_scalar(below, -float(dv[0]), -float(dv[1]), -float(dv[2]))
             entry['left'] -= 1
             if entry['left'] > 0:
                 active.append(entry)
-        self._simulator.velocities.from_numpy(vels.astype(np.float32))
         self._opening_ramp_queue = active
 
     def get_positions(self) -> np.ndarray:
@@ -608,6 +656,11 @@ class FEMMethod(SimulationMethod):
 
         gravity = np.array(self._params.get('gravity', [0.0, 0.0, 0.0]), dtype=np.float32)
 
+        # Check 4a: fixed count before cut
+        n_fixed_before = int(self._simulator._fixed.to_numpy().sum())
+        _pre_force_str = f"{self._debug_pre_cut_force:.4f}" if self._debug_pre_cut_force is not None else "N/A"
+        print(f"[DEBUG 4] Fixed verts before cut: {n_fixed_before}  (pre-cut max force on fixed: {_pre_force_str})", flush=True)
+
         result = _cut_topology_physics(
             self._current_tets,
             self._simulator.positions.to_numpy(),
@@ -623,6 +676,11 @@ class FEMMethod(SimulationMethod):
         (_, final_pos, final_vel, _, final_fixed,
          all_tets, n_orig, n_split, shared_list, remap,
          _inter_data, _orig_surf_set) = result
+
+        # Check 4b: fixed count after topology rebuild
+        n_fixed_after = int(final_fixed.sum())
+        print(f"[DEBUG 4] Fixed verts after  cut: {n_fixed_after}  "
+              f"(delta: {n_fixed_after - n_fixed_before:+d})", flush=True)
 
         new_fem = _FEMSimulator(
             vertices      = final_pos,
@@ -652,6 +710,20 @@ class FEMMethod(SimulationMethod):
         sr_cut = np.zeros(len(shared_list), dtype=np.float32)
         sk_cut = np.full(len(shared_list), k_cut, dtype=np.float32)
         new_fem.extend_springs(sa_cut, sb_cut, sr_cut, sk_cut)
+
+        # Check 1: cutting spring endpoints vs fixed vertices
+        fixed_set = set(np.where(final_fixed == 1)[0])
+        springs_on_fixed = [(int(a), int(b)) for a, b in zip(sa_cut, sb_cut)
+                            if a in fixed_set or b in fixed_set]
+        print(f"[DEBUG 1] Cutting springs: {len(sa_cut)} total, "
+              f"{len(springs_on_fixed)} touch fixed verts", flush=True)
+        if springs_on_fixed:
+            print(f"  Affected pairs (first 10): {springs_on_fixed[:10]}", flush=True)
+
+        # Reset debug state for post-cut step() tracking
+        self._debug_fixed_orig_pos   = final_pos[final_fixed == 1].copy()
+        self._debug_fixed_mask       = final_fixed.copy()
+        self._debug_frames_since_cut = 0
 
         seam_pairs = []
         for i, v_above in enumerate(shared_list):
@@ -688,11 +760,11 @@ class FEMMethod(SimulationMethod):
                 p['broken'] = True
 
             if ramp_frames <= 1:
-                vels = self._simulator.velocities.to_numpy()
-                for p in newly_broken:
-                    vels[p['v_above']] += opening_speed * normal
-                    vels[p['v_below']] -= opening_speed * normal
-                self._simulator.velocities.from_numpy(vels.astype(np.float32))
+                dv = (opening_speed * normal).astype(np.float32)
+                above_np = np.array([p['v_above'] for p in newly_broken], dtype=np.int32)
+                below_np = np.array([p['v_below'] for p in newly_broken], dtype=np.int32)
+                self._simulator._add_vel_scalar(above_np,  float(dv[0]),  float(dv[1]),  float(dv[2]))
+                self._simulator._add_vel_scalar(below_np, -float(dv[0]), -float(dv[1]), -float(dv[2]))
             else:
                 self._opening_ramp_queue.append({
                     'above':      np.array([p['v_above'] for p in newly_broken], dtype=np.int32),
