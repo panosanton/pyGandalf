@@ -85,7 +85,8 @@ pip install PyGLM
 - **B** — first press: initialise and start progressive blade cut; subsequent presses: pause/resume blade
 - **C** — one-shot cut at the configured plane (disabled once B has been used)
 - **P** — pause / resume physics simulation (blade still advances when paused)
-- **X** — disc parallelism check (see below)
+- **X** — disc parallelism check: yellow overlay on disc faces not parallel to the cut plane
+- **O** — orphan overlay (FEM only): purple overlay on faces touching orphaned verts after the cut
 
 **Debug coloring + per-face unindexed rendering (active in test_random_cut.py):**
 - Requires `lit_blinn_phong_debug.vs/.fs` shaders and a 4th attribute (per-face color, location 3)

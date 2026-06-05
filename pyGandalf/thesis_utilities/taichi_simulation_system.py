@@ -409,11 +409,17 @@ class TaichiSimulationSystem(System):
             print(f"[Sim] Physics {'paused' if comp.sim_paused else 'resumed'}")
         self._p_prev = p_now
 
-        # --- X key: disc parallelism check ---
+        # --- X key: disc parallelism check (yellow non-parallel disc faces) ---
         x_now = InputManager().get_key_down(glfw.KEY_X)
         if x_now and not getattr(self, '_x_prev', False):
             _check_disc_parallelism(comp, mesh_comp)
         self._x_prev = x_now
+
+        # --- O key: orphan vert overlay (purple faces touching orphaned verts, FEM only) ---
+        o_now = InputManager().get_key_down(glfw.KEY_O)
+        if o_now and not getattr(self, '_o_prev', False):
+            _overlay_orphan_colors(comp, mesh_comp)
+        self._o_prev = o_now
 
         # --- Simulation sub-steps (via SpringMassMethod — handles ramp internally) ---
         t0 = time.perf_counter()
@@ -1348,6 +1354,42 @@ def _compute_debug_face_colors(faces: np.ndarray, n_orig: int) -> np.ndarray:
     print(f"[Cut] Debug colors: {n_blue} collar faces (blue), {n_red} disc faces (red), "
           f"{n - n_blue - n_red} outer faces (green)")
     return colors
+
+
+def _overlay_orphan_colors(comp: TaichiSimulationComponent,
+                            mesh_comp: StaticMeshComponent) -> None:
+    """
+    O key: color purple every surface face that touches an orphaned vert.
+    Orphan verts are new-cut verts whose tets were all filtered out (FEM only).
+    Use this to confirm whether the visual artifact region matches the orphan region.
+    """
+    if not hasattr(comp.method, '_debug_orphan_verts') or not comp.method._debug_orphan_verts:
+        print("[Orphan] No orphan verts recorded (not an FEM cut, or no cut yet).")
+        return
+
+    all_render_faces = comp._all_render_faces
+    if all_render_faces is None or comp._debug_colors is None:
+        print("[Orphan] No face data yet — cut has not run.")
+        return
+
+    ov_arr      = np.array(sorted(comp.method._debug_orphan_verts), dtype=np.int32)
+    face_colors = comp._debug_colors.copy()
+    PURPLE      = np.array([0.6, 0.0, 0.8], dtype=np.float32)
+    hits        = np.isin(all_render_faces, ov_arr).any(axis=1)
+    face_colors[hits] = PURPLE
+    comp._debug_colors = face_colors.copy()
+
+    n_purple = int(hits.sum())
+    print(f"[Orphan] Purple overlay: {n_purple} faces touch an orphan vert "
+          f"({len(comp.method._debug_orphan_verts)} orphans total).", flush=True)
+
+    if len(mesh_comp.buffers) > 3:
+        exp_colors = np.repeat(face_colors, 3, axis=0).astype(np.float32)
+        flat_col   = exp_colors.flatten()
+        gl.glBindVertexArray(mesh_comp.render_pipeline)
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, mesh_comp.buffers[3])
+        gl.glBufferData(gl.GL_ARRAY_BUFFER, flat_col.nbytes, flat_col, gl.GL_DYNAMIC_DRAW)
+        gl.glBindVertexArray(0)
 
 
 def _realloc_gpu_buffers(mesh_comp: StaticMeshComponent,
