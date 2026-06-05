@@ -19,6 +19,7 @@ Controls:
     Close window to exit
 """
 
+import argparse
 import numpy as np
 import glm
 
@@ -67,10 +68,43 @@ def _random_cut_plane(rng: np.random.Generator, depth_range: float = 0.7):
     return normal, origin, blade_dir
 
 
+# Verified target_faces per mesh (None = use mesh as-is)
+MESH_CONFIG = {
+    'sphere':                   None,
+    'Armadillo_verysimplified': None,
+    'dragon_clean':             1500,
+    'liver-smooth':             3500,
+    'Armadillo_simplified':     None,
+    '_bunny_jacobson':          15000,
+    '_bunny_jacobson_full':     None,   # no simplification -- stress test
+}
+
+# Map mesh names to OBJ filenames (defaults to same name if not listed)
+MESH_FILE = {
+    '_bunny_jacobson_full': '_bunny_jacobson',
+}
+
+
 def main():
+    parser = argparse.ArgumentParser(description='FEM cut simulation')
+    parser.add_argument('--mesh', default='sphere',
+                        choices=list(MESH_CONFIG.keys()),
+                        help='Mesh to simulate (default: sphere)')
+    parser.add_argument('--seed', type=int, default=5,
+                        help='RNG seed for cut plane (default: 5)')
+    parser.add_argument('--cg_iters', type=int, default=20,
+                        help='CG solver iterations (default: 20; increase for larger/stiffer meshes)')
+    parser.add_argument('--tet_scale', type=float, default=1.0,
+                        help='Interior tet size relative to surface (default: 1.0; try 5-20 for fewer tets)')
+    args = parser.parse_args()
+
+    mesh_name    = args.mesh
+    target_faces = MESH_CONFIG[mesh_name]
+    mesh_file    = MESH_FILE.get(mesh_name, mesh_name)
+
     logger.setLevel(logger.INFO)
 
-    rng = np.random.default_rng(5)
+    rng = np.random.default_rng(args.seed)
     normal, origin, blade_dir = _random_cut_plane(rng)
 
     print("=" * 50)
@@ -80,7 +114,7 @@ def main():
     print(f"  blade_dir = [{blade_dir[0]:.3f}, {blade_dir[1]:.3f}, {blade_dir[2]:.3f}]")
     print("=" * 50)
 
-    Application().create(OpenGLWindow('Taichi FEM — Random Cut', 1280, 720, True), OpenGLRenderer)
+    Application().create(OpenGLWindow(f'Taichi FEM -- {mesh_name}', 1280, 720, True), OpenGLRenderer)
 
     scene = Scene('FEM Cut Simulation')
 
@@ -99,8 +133,13 @@ def main():
     OpenGLMaterialLib().build('M_Sphere', MaterialData(
         'debug_mesh', ['white_texture'], glm.vec4(0.3, 0.5, 0.8, 1.0), 1.0))
 
-    print("Generating tetrahedral mesh...")
-    tet_mesh = MeshLib().build_tetrahedral('sphere_tet', MODELS_PATH / 'sphere.obj')
+    print(f"Generating tetrahedral mesh: {mesh_file}.obj ...")
+    tet_mesh = MeshLib().build_tetrahedral(
+        f'{mesh_name}_tet',
+        MODELS_PATH / f'{mesh_file}.obj',
+        target_faces=target_faces,
+        tet_scale=args.tet_scale,
+    )
     print(f"  Vertices:   {len(tet_mesh.vertices):,}")
     print(f"  Tetrahedra: {len(tet_mesh.tetrahedra):,}")
 
@@ -145,7 +184,7 @@ def main():
         blade_speed           = 0.5,
         split_disc_verts      = True,
         opening_ramp_frames   = 20,
-        method_instance       = FEMMethod(),
+        method_instance       = FEMMethod(cg_iters=args.cg_iters, sliver_vol_threshold=1e-5),
     )
     # FEM material params — passed through to FEMMethod.initialize() via _sim_params
     taichi_comp.stiffness = 200.0   # reused as cutting spring k

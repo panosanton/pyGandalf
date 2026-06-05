@@ -26,6 +26,7 @@ Design rules
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from collections import defaultdict
 
 import numpy as np
 
@@ -327,15 +328,16 @@ class SpringMassMethod(SimulationMethod):
         if not self._opening_ramp_queue:
             return
         normal = self._cut_normal
-        vels   = self._simulator.velocities.to_numpy()
         active = []
         for entry in self._opening_ramp_queue:
-            vels[entry['above']] += entry['step_speed'] * normal
-            vels[entry['below']] -= entry['step_speed'] * normal
+            dv = (entry['step_speed'] * normal).astype(np.float32)
+            above = np.asarray(entry['above'], dtype=np.int32)
+            below = np.asarray(entry['below'], dtype=np.int32)
+            self._simulator._add_vel_scalar(above,  float(dv[0]),  float(dv[1]),  float(dv[2]))
+            self._simulator._add_vel_scalar(below, -float(dv[0]), -float(dv[1]), -float(dv[2]))
             entry['left'] -= 1
             if entry['left'] > 0:
                 active.append(entry)
-        self._simulator.velocities.from_numpy(vels.astype(np.float32))
         self._opening_ramp_queue = active
 
     def get_positions(self) -> np.ndarray:
@@ -477,11 +479,11 @@ class SpringMassMethod(SimulationMethod):
                 p['broken'] = True
 
             if ramp_frames <= 1:
-                vels = self._simulator.velocities.to_numpy()
-                for p in newly_broken:
-                    vels[p['v_above']] += opening_speed * normal
-                    vels[p['v_below']] -= opening_speed * normal
-                self._simulator.velocities.from_numpy(vels.astype(np.float32))
+                dv = (opening_speed * normal).astype(np.float32)
+                above_np = np.array([p['v_above'] for p in newly_broken], dtype=np.int32)
+                below_np = np.array([p['v_below'] for p in newly_broken], dtype=np.int32)
+                self._simulator._add_vel_scalar(above_np,  float(dv[0]),  float(dv[1]),  float(dv[2]))
+                self._simulator._add_vel_scalar(below_np, -float(dv[0]), -float(dv[1]), -float(dv[2]))
             else:
                 self._opening_ramp_queue.append({
                     'above':      np.array([p['v_above'] for p in newly_broken], dtype=np.int32),
@@ -523,26 +525,41 @@ class FEMMethod(SimulationMethod):
     time_step      : float = 0.01   integration timestep (larger than spring-mass is fine)
     cg_iters       : int   = 50     max CG iterations per step
     cg_eps         : float = 1e-6   CG convergence tolerance
-    stiffness      : float = 200.0  spring stiffness for cutting springs (N/m)
-    opening_speed  : float = 1.0    velocity (m/s) given to seam vertices on break
-    opening_ramp_frames : int = 1
+    stiffness             : float = 200.0  spring stiffness for cutting springs (N/m)
+    opening_speed         : float = 1.0    velocity (m/s) given to seam vertices on break
+    opening_ramp_frames   : int   = 1
+    sliver_vol_threshold  : float = 0.0    volume below which cut-adjacent tets are removed
+                                           from the FEM (0 = keep all tets). Set to 1e-5
+                                           to suppress force explosions from near-degenerate
+                                           tets created when the plane nearly grazes a vertex.
     """
 
-    def __init__(self):
+    def __init__(self, **overrides):
         self._simulator          = None
         self._params             = {}
+        self._init_overrides     = overrides  # e.g. FEMMethod(cg_iters=50)
         self._n_orig_val         = None
         self._n_split            = None
         self._current_tets       = None
         self._cut_normal         = None
         self._cut_origin         = None
         self._blade_dir          = None
-        self._seam_pairs         = []
-        self._opening_ramp_queue = []
+        self._seam_pairs          = []
+        self._opening_ramp_queue  = []
+        self._orphan_constraints  = {}   # zero-mass vert -> master vert (post-cut)
+        self._debug_orphan_verts  = set()  # indices of all orphaned verts after cut (for purple overlay)
+        # Debug state
+        self._debug_frames_since_cut = None   # None = pre-cut; int = frames since cut
+        self._debug_fixed_orig_pos   = None   # fixed-vert positions at cut time
+        self._debug_fixed_mask       = None   # fixed mask snapshot at cut time
+        self._debug_pre_cut_force    = None   # max force on fixed verts last frame before cut
+        self._debug_n_orig           = None   # n_orig at cut time (new-cut verts: >= n_orig)
+        self._debug_cut_pos          = None   # positions of all verts at cut time
 
     def initialize(self, tet_mesh, params: dict) -> None:
         from pyGandalf.thesis_utilities.fem_simulator import _FEMSimulator
         self._params = dict(params)
+        self._params.update(self._init_overrides)  # caller kwargs take priority
 
         y          = tet_mesh.vertices[:, 1]
         threshold  = y.min() + (y.max() - y.min()) * 0.05
@@ -570,20 +587,108 @@ class FEMMethod(SimulationMethod):
             v_max    = float(self._params.get('v_max',    10.0)),
             cg_iters = int(self._params.get('cg_iters',  20)),
         )
+        self._apply_orphan_constraints()
+        self._debug_step()
+
+    def _apply_orphan_constraints(self) -> None:
+        if not self._orphan_constraints:
+            return
+        pos = self._simulator.positions.to_numpy()
+        vel = self._simulator.velocities.to_numpy()
+        for orphan, master in self._orphan_constraints.items():
+            pos[orphan] = pos[master]
+            vel[orphan] = vel[master]
+        self._simulator.positions.from_numpy(pos.astype(np.float32))
+        self._simulator.velocities.from_numpy(vel.astype(np.float32))
+
+    def _debug_step(self):
+        fixed_mask = self._simulator._fixed.to_numpy()
+        n_fixed    = int(fixed_mask.sum())
+
+        if self._debug_frames_since_cut is None:
+            # Pre-cut baseline: track last force on fixed verts
+            if n_fixed > 0:
+                forces = self._simulator._forces.to_numpy()
+                self._debug_pre_cut_force = float(
+                    np.linalg.norm(forces[fixed_mask == 1], axis=1).max()
+                )
+            return
+
+        if self._debug_frames_since_cut >= 30:
+            return
+
+        f   = self._debug_frames_since_cut
+        pos = self._simulator.positions.to_numpy()
+        vel = self._simulator.velocities.to_numpy()
+
+        # --- fixed vert check (constraint) ---
+        if n_fixed > 0:
+            fixed_disp = np.linalg.norm(pos[fixed_mask == 1] - self._debug_fixed_orig_pos, axis=1)
+            max_fixed_d = float(fixed_disp.max())
+        else:
+            max_fixed_d = 0.0
+
+        # --- new-cut vert check (n_orig .. N-1) ---
+        n_orig = self._debug_n_orig
+        N      = pos.shape[0]
+        if n_orig is not None and n_orig < N:
+            new_idx      = np.arange(n_orig, N)
+            new_pos      = pos[new_idx]
+            new_pos_ref  = self._debug_cut_pos[new_idx]
+            disp         = np.linalg.norm(new_pos - new_pos_ref, axis=1)
+            max_disp     = float(disp.max())
+            min_disp     = float(disp.min())
+            mean_disp    = float(disp.mean())
+            n_stuck      = int((disp < 1e-6).sum())
+            n_expanding  = int((disp > 0.5).sum())
+
+            new_vel_mag  = np.linalg.norm(vel[new_idx], axis=1)
+            max_vel      = float(new_vel_mag.max())
+            mean_vel     = float(new_vel_mag.mean())
+
+            # NaN / inf check
+            n_nan = int(np.isnan(new_pos).any(axis=1).sum())
+            n_inf = int(np.isinf(new_pos).any(axis=1).sum())
+
+            # Top-3 most displaced
+            top3 = np.argsort(disp)[-3:][::-1]
+            top3_global = new_idx[top3]
+            top3_info   = [(int(top3_global[i]), float(disp[top3[i]]),
+                            new_pos[top3[i]].tolist()) for i in range(len(top3))]
+
+            print(
+                f"[DBG f+{f:02d}] new-cut({N - n_orig}): "
+                f"disp max={max_disp:.4f} min={min_disp:.6f} mean={mean_disp:.4f} "
+                f"stuck={n_stuck} expand>{0.5}={n_expanding} "
+                f"vel max={max_vel:.4f} mean={mean_vel:.6f} "
+                f"nan={n_nan} inf={n_inf} | "
+                f"fixed max_disp={max_fixed_d:.6f}",
+                flush=True
+            )
+            if f <= 2 or (f % 5 == 0):
+                for vi, di, pi in top3_info:
+                    print(f"  top vert {vi}: disp={di:.4f}  pos={[round(x,4) for x in pi]}",
+                          flush=True)
+        else:
+            print(f"[DBG f+{f:02d}] (no new-cut verts)  fixed max_disp={max_fixed_d:.6f}",
+                  flush=True)
+
+        self._debug_frames_since_cut += 1
 
     def _process_opening_ramp(self) -> None:
         if not self._opening_ramp_queue:
             return
         normal = self._cut_normal
-        vels   = self._simulator.velocities.to_numpy()
         active = []
         for entry in self._opening_ramp_queue:
-            vels[entry['above']] += entry['step_speed'] * normal
-            vels[entry['below']] -= entry['step_speed'] * normal
+            dv = (entry['step_speed'] * normal).astype(np.float32)
+            above = np.asarray(entry['above'], dtype=np.int32)
+            below = np.asarray(entry['below'], dtype=np.int32)
+            self._simulator._add_vel_scalar(above,  float(dv[0]),  float(dv[1]),  float(dv[2]))
+            self._simulator._add_vel_scalar(below, -float(dv[0]), -float(dv[1]), -float(dv[2]))
             entry['left'] -= 1
             if entry['left'] > 0:
                 active.append(entry)
-        self._simulator.velocities.from_numpy(vels.astype(np.float32))
         self._opening_ramp_queue = active
 
     def get_positions(self) -> np.ndarray:
@@ -608,6 +713,11 @@ class FEMMethod(SimulationMethod):
 
         gravity = np.array(self._params.get('gravity', [0.0, 0.0, 0.0]), dtype=np.float32)
 
+        # Check 4a: fixed count before cut
+        n_fixed_before = int(self._simulator._fixed.to_numpy().sum())
+        _pre_force_str = f"{self._debug_pre_cut_force:.4f}" if self._debug_pre_cut_force is not None else "N/A"
+        print(f"[DEBUG 4] Fixed verts before cut: {n_fixed_before}  (pre-cut max force on fixed: {_pre_force_str})", flush=True)
+
         result = _cut_topology_physics(
             self._current_tets,
             self._simulator.positions.to_numpy(),
@@ -624,9 +734,38 @@ class FEMMethod(SimulationMethod):
          all_tets, n_orig, n_split, shared_list, remap,
          _inter_data, _orig_surf_set) = result
 
+        # Check 4b: fixed count after topology rebuild
+        n_fixed_after = int(final_fixed.sum())
+        print(f"[DEBUG 4] Fixed verts after  cut: {n_fixed_after}  "
+              f"(delta: {n_fixed_after - n_fixed_before:+d})", flush=True)
+
+        # Sliver filtering: cut-adjacent tets with near-zero volume have a near-singular
+        # rest-shape matrix Dm, so B = Dm^-1 is huge and causes force explosions.
+        # Controlled by sliver_vol_threshold param (default 0 = no filtering).
+        # Only tets with at least one new vert (>= n_orig) can be cut-created slivers;
+        # pure-original tets are never filtered.
+        _vol_thresh   = float(self._params.get('sliver_vol_threshold', 0.0))
+        _e1 = final_pos[all_tets[:, 1]] - final_pos[all_tets[:, 0]]
+        _e2 = final_pos[all_tets[:, 2]] - final_pos[all_tets[:, 0]]
+        _e3 = final_pos[all_tets[:, 3]] - final_pos[all_tets[:, 0]]
+        _vols         = np.abs(np.einsum('ij,ij->i', _e1, np.cross(_e2, _e3))) / 6.0
+        _has_new_vert = (all_tets >= n_orig).any(axis=1)
+        if _vol_thresh > 0:
+            _valid    = (~_has_new_vert) | (_vols > _vol_thresh)
+            fem_tets  = all_tets[_valid]
+        else:
+            _valid    = np.ones(len(all_tets), dtype=bool)
+            fem_tets  = all_tets
+        _n_removed    = int((~_valid).sum())
+        _n_cut_adj    = int(_has_new_vert.sum())
+        _min_cut_vol  = float(_vols[_has_new_vert].min()) if _n_cut_adj > 0 else float('nan')
+        print(f"[FILTER] n_orig={n_orig} total_tets={len(all_tets)} "
+              f"cut_adj={_n_cut_adj} min_cut_vol={_min_cut_vol:.2e} "
+              f"vol_thresh={_vol_thresh:.0e} removed={_n_removed}", flush=True)
+
         new_fem = _FEMSimulator(
             vertices      = final_pos,
-            tetrahedra    = all_tets,
+            tetrahedra    = fem_tets,
             fixed_mask    = final_fixed,
             young_modulus = float(self._params.get('young_modulus', 5e4)),
             poisson_ratio = float(self._params.get('poisson_ratio', 0.4)),
@@ -635,6 +774,112 @@ class FEMMethod(SimulationMethod):
             damping       = float(self._params.get('damping', 1.0)),
         )
         new_fem.velocities.from_numpy(final_vel.astype(np.float32))
+
+        # Detect any verts orphaned by the filter (zero mass) and build kinematic constraints.
+        # With the cut-adjacent-only filter, orig-mesh verts should retain at least one tet.
+        # Only new-cut verts (>= n_orig) near a very shallow cut could become orphans here.
+        _masses_np  = new_fem._masses.to_numpy()
+        _zero_mask  = _masses_np == 0.0
+        _vert_remap  = {}
+        _n_fallback  = 0
+        if _zero_mask.any():
+            _zero_idx    = np.where(_zero_mask)[0]
+            _nonzero_idx = np.where(~_zero_mask)[0]
+            _nz_pos      = final_pos[_nonzero_idx]
+
+            # Intersection verts (n_orig..n_split-1) sit exactly on the cut plane and
+            # have no cutting spring, so they never separate with either half.
+            # Exclude them as masters so orphan verts don't get anchored to the plane.
+            _not_inter = (_nonzero_idx < n_orig) | (_nonzero_idx >= n_split)
+
+            # Per-vert centroid dot for CANDIDATE filtering only.
+            # Needed because seam-dup candidates (>= n_split) are co-located with their
+            # above-half counterparts at cut time, so position is ambiguous for them.
+            _tet_cdots_fem = (final_pos[fem_tets].mean(axis=1) - origin) @ normal
+            _sum_f  = np.zeros(len(final_pos), dtype=np.float64)
+            _cnt_f  = np.zeros(len(final_pos), dtype=np.int32)
+            np.add.at(_sum_f, fem_tets.ravel(), np.repeat(_tet_cdots_fem, 4))
+            np.add.at(_cnt_f, fem_tets.ravel(), 1)
+            _vert_cdots = _sum_f / np.where(_cnt_f > 0, _cnt_f, 1)
+            _nz_cdots   = _vert_cdots[_nonzero_idx]
+
+            for _v in _zero_idx:
+                _vi = int(_v)
+                # Orphan half from the topology split structure -- no centroid needed:
+                # - v >= n_split:        seam-dup; remap puts them only in new_below_tets
+                # - n_orig <= v < n_split: shared_list; kept as-is in above_tets after remap
+                # - v < n_orig:          original vert; position dot is reliable
+                if _vi >= n_split:
+                    _cdot = -1.0
+                elif _vi >= n_orig:
+                    _cdot =  1.0
+                else:
+                    _cdot = float(np.dot(final_pos[_vi] - origin, normal))
+
+                if _cdot > 0:
+                    _cand_mask = _not_inter & (_nz_cdots > 0)
+                elif _cdot < 0:
+                    _cand_mask = _not_inter & (_nz_cdots < 0)
+                else:
+                    _cand_mask = _not_inter
+
+                if not _cand_mask.any():
+                    _n_fallback += 1
+                    _cand_mask = _not_inter  # relax side constraint
+                if not _cand_mask.any():
+                    _cand_mask = np.ones(len(_nonzero_idx), dtype=bool)
+
+                _cand_pos = _nz_pos[_cand_mask]
+                _cand_idx = _nonzero_idx[_cand_mask]
+                _dists    = np.linalg.norm(_cand_pos - final_pos[_v], axis=1)
+                _vert_remap[int(_v)] = int(_cand_idx[np.argmin(_dists)])
+
+            _masses_np2  = new_fem._masses.to_numpy()
+            _min_m       = float(_masses_np2[~_zero_mask].min()) * 1e-4
+            _masses_np2[_zero_mask] = _min_m
+            new_fem._masses.from_numpy(_masses_np2.astype(np.float32))
+            _n_orig_orphans  = int((_zero_idx < n_orig).sum())
+            _n_fixed_masters = int(sum(final_fixed[m] for m in _vert_remap.values()))
+            print(f"[FEM] {len(_zero_idx)} orphans: {_n_orig_orphans} orig-mesh  "
+                  f"{len(_zero_idx) - _n_orig_orphans} new-cut  "
+                  f"fixed_masters={_n_fixed_masters}  fallback={_n_fallback}", flush=True)
+
+            # Verify masters using tet centroids in fem_tets (the filtered set).
+            # This checks whether each assigned master is truly on the expected half.
+            _m2t_fem: dict = defaultdict(list)
+            for _ti, _tet in enumerate(fem_tets):
+                for _vi in _tet:
+                    _m2t_fem[int(_vi)].append(_ti)
+            _nc, _nw, _nu = 0, 0, 0
+            for _v, _m in _vert_remap.items():
+                _vi = int(_v)
+                if _vi >= n_split:
+                    _expected_below = True
+                elif _vi >= n_orig:
+                    _expected_below = False
+                else:
+                    _expected_below = float(np.dot(final_pos[_vi] - origin, normal)) < 0
+                _m_tets = _m2t_fem.get(int(_m), [])
+                if not _m_tets:
+                    _nu += 1
+                    continue
+                _m_cdot = float(np.dot(
+                    final_pos[fem_tets[_m_tets]].mean(axis=1).mean(axis=0) - origin, normal
+                ))
+                _master_below = _m_cdot < -0.01
+                _master_above = _m_cdot >  0.01
+                if (_expected_below and _master_above) or (not _expected_below and _master_below):
+                    _nw += 1
+                else:
+                    _nc += 1
+            print(f"[MASTER] side check (via fem_tets centroid): "
+                  f"correct={_nc}  wrong={_nw}  unknown={_nu}", flush=True)
+
+        self._orphan_constraints = dict(_vert_remap)
+        self._debug_orphan_verts = set(_vert_remap.keys())
+
+        def _r(v: int) -> int:
+            return _vert_remap.get(int(v), int(v))
 
         self._simulator       = new_fem
         self._current_tets    = all_tets
@@ -645,23 +890,39 @@ class FEMMethod(SimulationMethod):
         self._blade_dir       = blade_dir
         self._topology_result = result  # cached for ECS surface computation
 
-        # Cutting springs — same virtual-node approach as SpringMassMethod
+        # Cutting springs — endpoints remapped away from any zero-mass orphan verts.
         k_cut  = float(self._params.get('stiffness', 200.0)) * 0.5
-        sa_cut = np.array(shared_list, dtype=np.int32)
-        sb_cut = np.array([remap[v] for v in shared_list], dtype=np.int32)
+        sa_cut = np.array([_r(v)        for v in shared_list], dtype=np.int32)
+        sb_cut = np.array([_r(remap[v]) for v in shared_list], dtype=np.int32)
         sr_cut = np.zeros(len(shared_list), dtype=np.float32)
         sk_cut = np.full(len(shared_list), k_cut, dtype=np.float32)
         new_fem.extend_springs(sa_cut, sb_cut, sr_cut, sk_cut)
 
+        # Check 1: cutting spring endpoints vs fixed vertices
+        fixed_set = set(np.where(final_fixed == 1)[0])
+        springs_on_fixed = [(int(a), int(b)) for a, b in zip(sa_cut, sb_cut)
+                            if a in fixed_set or b in fixed_set]
+        print(f"[DEBUG 1] Cutting springs: {len(sa_cut)} total, "
+              f"{len(springs_on_fixed)} touch fixed verts", flush=True)
+        if springs_on_fixed:
+            print(f"  Affected pairs (first 10): {springs_on_fixed[:10]}", flush=True)
+
+        # Reset debug state for post-cut step() tracking
+        self._debug_fixed_orig_pos   = final_pos[final_fixed == 1].copy()
+        self._debug_fixed_mask       = final_fixed.copy()
+        self._debug_frames_since_cut = 0
+        self._debug_n_orig           = n_orig
+        self._debug_cut_pos          = final_pos.copy()
+
         seam_pairs = []
         for i, v_above in enumerate(shared_list):
             v_below     = int(remap[v_above])
-            spring_idx  = i          # _sa starts empty for a fresh FEM sim
-            pos_seam    = final_pos[v_above]
+            spring_idx  = i
+            pos_seam    = final_pos[_r(v_above)]
             travel_dist = float(np.dot(pos_seam - origin, blade_dir))
             seam_pairs.append({
-                'v_above':     v_above,
-                'v_below':     v_below,
+                'v_above':     _r(v_above),
+                'v_below':     _r(v_below),
                 'spring_idx':  spring_idx,
                 'travel_dist': travel_dist,
                 'broken':      False,
@@ -688,11 +949,11 @@ class FEMMethod(SimulationMethod):
                 p['broken'] = True
 
             if ramp_frames <= 1:
-                vels = self._simulator.velocities.to_numpy()
-                for p in newly_broken:
-                    vels[p['v_above']] += opening_speed * normal
-                    vels[p['v_below']] -= opening_speed * normal
-                self._simulator.velocities.from_numpy(vels.astype(np.float32))
+                dv = (opening_speed * normal).astype(np.float32)
+                above_np = np.array([p['v_above'] for p in newly_broken], dtype=np.int32)
+                below_np = np.array([p['v_below'] for p in newly_broken], dtype=np.int32)
+                self._simulator._add_vel_scalar(above_np,  float(dv[0]),  float(dv[1]),  float(dv[2]))
+                self._simulator._add_vel_scalar(below_np, -float(dv[0]), -float(dv[1]), -float(dv[2]))
             else:
                 self._opening_ramp_queue.append({
                     'above':      np.array([p['v_above'] for p in newly_broken], dtype=np.int32),

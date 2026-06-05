@@ -18,18 +18,26 @@ ti.init(arch=ti.gpu)  # Change to ti.cpu if you don't have a GPU
 
 
 def generate_tetrahedral_mesh(surface_mesh: 'MeshInstance',
-                               target_faces: int = None) -> 'TetrahedralMeshInstance':
+                               target_faces: int = None,
+                               tet_scale: float = 1.0) -> 'TetrahedralMeshInstance':
     """
     Convert a surface mesh into a tetrahedral mesh using TetGen library.
 
     Args:
         surface_mesh: Input surface mesh (triangular faces)
         target_faces: If set, simplify the surface mesh to approximately this
-                      many faces before tetrahedralization.  Fewer faces →
-                      fewer tetrahedra → faster simulation.
+                      many faces before tetrahedralization.  Fewer faces ->
+                      fewer tetrahedra -> faster simulation.
                       Falls back to progressively less aggressive simplification
                       if the result is not watertight, and ultimately to the
                       original mesh if no watertight result can be achieved.
+        tet_scale: Controls interior tet density relative to the surface.
+                   1.0 (default) = standard quality mesh (pq2.0).
+                   >1.0 = interior tets allowed up to tet_scale * natural surface
+                   tet volume.  The surface mesh is preserved exactly (TetGen Y
+                   flag); only interior density decreases.  Values of 5-20 give
+                   a coarser interior while keeping a dense surface.  Very large
+                   values (50+) can create slivers that hurt CG convergence.
 
     Returns:
         TetrahedralMeshInstance: Generated tetrahedral mesh
@@ -45,11 +53,60 @@ def generate_tetrahedral_mesh(surface_mesh: 'MeshInstance',
 
     if target_faces is not None:
         vertices, faces = _simplify_and_repair(vertices, faces, target_faces)
+    else:
+        import trimesh as _trimesh
+        vertices, faces = _repair_and_extract(
+            _trimesh.Trimesh(vertices=vertices, faces=faces, process=False))
+
+    # Normalize to [-4, 4] on the longest axis so blade_speed and other
+    # world-unit parameters work consistently across all meshes.
+    centroid = (vertices.max(axis=0) + vertices.min(axis=0)) * 0.5
+    vertices  = vertices - centroid
+    scale     = float(np.abs(vertices).max())
+    if scale > 0:
+        vertices = (vertices / scale * 4.0).astype(np.float32)
+    print(f"  Normalized: centroid offset={centroid.round(2)}, scale={scale:.4f}")
 
     tg = tetgen.TetGen(vertices, faces)
 
-    print("  Running TetGen...")
-    tg.tetrahedralize(switches='pq2.0')
+    if tet_scale <= 1.0:
+        switches = 'pq2.0'
+    else:
+        # Estimate natural tet volume from average surface triangle size.
+        # For an equilateral triangle with area A:
+        #   edge L = sqrt(4*A / sqrt(3))
+        #   regular tet volume = L^3 * sqrt(2) / 12
+        v = vertices[faces]                                      # (F, 3, 3)
+        cross = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0]) # (F, 3)
+        avg_area  = float(np.mean(0.5 * np.linalg.norm(cross, axis=1)))
+        avg_edge  = float(np.sqrt(4.0 * avg_area / np.sqrt(3.0)))
+        nat_vol   = avg_edge ** 3 * np.sqrt(2.0) / 12.0
+        max_vol   = nat_vol * tet_scale
+        # pY  — preserve surface exactly (no Steiner points on boundary)
+        # a{} — cap max tet volume so interior stays graded (fine near surface,
+        #        coarse deeper inside) without runaway quality refinement
+        switches = f'pYa{max_vol:.6e}'
+        print(f"  tet_scale={tet_scale:.1f}: natural_vol={nat_vol:.3e}, "
+              f"max_tet_vol={max_vol:.3e}")
+        if tet_scale > 20.0:
+            print("  WARNING: tet_scale > 20 may produce interior slivers "
+                  "that hurt CG convergence.")
+
+    # Try progressively more tolerant TetGen switches if the mesh is difficult.
+    # 'pq2.0' — quality mesh (preferred)
+    # 'p'     — no quality refinement, more robust boundary recovery
+    # 'pC'    — coplanar-face detection enabled (handles near-degenerate faces)
+    fallback_switches = [switches, 'p', 'pC']
+    for sw in fallback_switches:
+        try:
+            print(f"  Running TetGen (switches='{sw}')...")
+            tg.tetrahedralize(switches=sw)
+            break
+        except RuntimeError as e:
+            if sw == fallback_switches[-1]:
+                raise
+            print(f"  TetGen failed ({e}), retrying...")
+            tg = tetgen.TetGen(vertices, faces)
 
     print(f"  Generated vertices:   {len(tg.node):,}")
     print(f"  Generated tetrahedra: {len(tg.elem):,}")
@@ -88,7 +145,7 @@ def _simplify_and_repair(vertices: np.ndarray, faces: np.ndarray,
     original_count = len(faces)
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
-    print(f"  Simplification requested: {original_count:,} → {target_faces:,} faces")
+    print(f"  Simplification requested: {original_count:,} -> {target_faces:,} faces")
     print(f"  Original watertight: {mesh.is_watertight}")
 
     if target_faces >= original_count:
@@ -121,21 +178,86 @@ def _simplify_and_repair(vertices: np.ndarray, faces: np.ndarray,
 def _repair_and_extract(mesh):
     """
     Run trimesh repair operations on a mesh and return (vertices, faces).
-    Does not guarantee watertightness — call mesh.is_watertight after to check.
+    Does not guarantee watertightness -- call mesh.is_watertight after to check.
     """
     import trimesh
+
+    # Keep the pre-repair mesh as a fallback in case all repair attempts corrupt it.
+    fallback = trimesh.Trimesh(vertices=mesh.vertices.copy(),
+                               faces=mesh.faces.copy(), process=False)
 
     trimesh.repair.fix_winding(mesh)
     trimesh.repair.fix_normals(mesh)
     mesh.fill_holes()
 
-    # Re-constructing with process=True removes duplicate/degenerate faces
-    # in a version-safe way (avoid calling methods that may not exist).
+    # merge_vertices removes coincident points that cause self-intersection reports
+    mesh.merge_vertices()
+
+    # fix_intersections is available in newer trimesh versions
+    if hasattr(trimesh.repair, 'fix_intersections'):
+        try:
+            trimesh.repair.fix_intersections(mesh)
+        except Exception:
+            pass
+
+    # pymeshfix: dedicated self-intersection repair for TetGen input (two passes)
+    try:
+        import pymeshfix
+        for _pass in range(2):
+            mf = pymeshfix.MeshFix(mesh.vertices, mesh.faces)
+            mf.repair()
+            # API varies by version: new versions expose .mesh (pyvista PolyData)
+            if hasattr(mf, 'v') and mf.v is not None:
+                v_out = np.array(mf.v, dtype=np.float64)
+                f_out = np.array(mf.f, dtype=np.int64)
+            else:
+                poly  = mf.mesh
+                v_out = np.array(poly.points, dtype=np.float64)
+                f_out = poly.faces.reshape(-1, 4)[:, 1:].astype(np.int64)
+            if len(v_out) == 0 or len(f_out) == 0:
+                print(f"  pymeshfix pass {_pass + 1}: empty result, keeping prior mesh")
+                break
+            mesh = trimesh.Trimesh(vertices=v_out, faces=f_out, process=False)
+            if mesh.is_watertight:
+                break
+        print(f"  pymeshfix: {len(mesh.vertices):,}v {len(mesh.faces):,}f "
+              f"(watertight: {mesh.is_watertight})")
+    except Exception as e:
+        print(f"  pymeshfix skipped: {e}")
+
+    # Voxel-remesh fallback: guarantees a manifold mesh when all else fails.
+    # Trades slight geometric smoothing for a clean TetGen-compatible surface.
+    if not mesh.is_watertight and len(mesh.vertices) > 0:
+        try:
+            pitch    = mesh.bounding_box.extents.max() / 80.0
+            vox      = trimesh.voxel.creation.voxelize(mesh, pitch)
+            remeshed = vox.marching_cubes
+            if remeshed is not None and len(remeshed.faces) > 0:
+                print(f"  voxel-remesh: {len(remeshed.vertices):,}v "
+                      f"{len(remeshed.faces):,}f")
+                mesh = remeshed
+        except Exception as e:
+            print(f"  voxel-remesh skipped: {e}")
+
+    # Final safety: if repair produced an empty mesh, use the pre-repair original.
+    if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
+        print("  WARNING: all repair attempts produced empty mesh — using original")
+        mesh = fallback
+
     cleaned = trimesh.Trimesh(vertices=mesh.vertices, faces=mesh.faces,
                               process=True)
 
-    return (np.array(cleaned.vertices, dtype=np.float32),
-            np.array(cleaned.faces,    dtype=np.int32))
+    # Explicitly remove duplicate faces (trimesh process=True misses some cases
+    # that cause TetGen's recoversubfaces to crash).
+    faces_out = np.array(cleaned.faces, dtype=np.int32)
+    sorted_f  = np.sort(faces_out, axis=1)
+    _, unique_idx = np.unique(sorted_f, axis=0, return_index=True)
+    faces_out = faces_out[np.sort(unique_idx)]
+    n_removed = len(cleaned.faces) - len(faces_out)
+    if n_removed > 0:
+        print(f"  Removed {n_removed} duplicate face(s) before TetGen")
+
+    return (np.array(cleaned.vertices, dtype=np.float32), faces_out)
 
 
 # ============================================

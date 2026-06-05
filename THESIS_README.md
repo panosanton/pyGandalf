@@ -13,6 +13,9 @@ pip install taichi
 pip install tetgen
 pip install trimesh
 pip install fast-simplification
+pip install networkx
+pip install pymeshfix
+pip install pyvista
 pip install PyGLM
 ```
 
@@ -21,7 +24,9 @@ pip install PyGLM
 - **tetgen** (0.6.7+) - Tetrahedral mesh generation (C++ with Python bindings)
 - **trimesh** - Surface mesh loading, repair, and simplification
 - **fast-simplification** - Backend for trimesh quadric decimation
-- **pyvista** (0.46+) - 3D visualization (installed automatically with tetgen)
+- **networkx** - Required by trimesh's `fill_holes()` for topological hole repair on non-watertight meshes
+- **pymeshfix** - Self-intersection repair (MeshFix wrapper); required for real-world meshes before TetGen
+- **pyvista** (0.46+) - 3D visualization; also required by pymeshfix to read its output (install explicitly)
 - **PyGLM** - Python bindings for GLM (OpenGL Mathematics); imported as `glm`
 - **numpy** (>=2.0) - Already included in pyGandalf
 
@@ -50,7 +55,7 @@ pip install PyGLM
 - `generate_tetrahedral_mesh(surface_mesh, target_faces=None)` - TetGen wrapper
   - Optional `target_faces`: simplifies the input surface mesh before tetrahedralization
   - `_simplify_and_repair()`: tries progressively less aggressive decimation until a watertight mesh is achieved, with fallback to the original mesh
-  - `_repair_and_extract()`: runs trimesh repair (fix_winding, fix_normals, fill_holes, process=True)
+  - `_repair_and_extract()`: runs trimesh repair (fix_winding, fix_normals, fill_holes, merge_vertices), then pymeshfix self-intersection repair, then trimesh process=True rebuild
 - Taichi GPU kernels: `compute_tet_volumes()`, `compute_tet_quality()`
 - `analyze_tetrahedral_mesh()` - prints mesh statistics
 
@@ -80,7 +85,8 @@ pip install PyGLM
 - **B** — first press: initialise and start progressive blade cut; subsequent presses: pause/resume blade
 - **C** — one-shot cut at the configured plane (disabled once B has been used)
 - **P** — pause / resume physics simulation (blade still advances when paused)
-- **X** — disc parallelism check (see below)
+- **X** — disc parallelism check: yellow overlay on disc faces not parallel to the cut plane
+- **O** — orphan overlay (FEM only): purple overlay on faces touching orphaned verts after the cut
 
 **Debug coloring + per-face unindexed rendering (active in test_random_cut.py):**
 - Requires `lit_blinn_phong_debug.vs/.fs` shaders and a 4th attribute (per-face color, location 3)
