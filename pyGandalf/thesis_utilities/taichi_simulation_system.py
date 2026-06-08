@@ -792,18 +792,33 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
     """
     seam_set = set(int(v) for v in shared_list) if shared_list else set()
 
+    # Build original-surface vert set for phantom collar diagnostic.
+    orig_surf_verts = set()
+    if orig_surf_set:
+        for face_key in orig_surf_set:
+            orig_surf_verts.update(face_key)
+
     def on_plane(v):
         return v >= n_orig or v in seam_set
 
     outer = []
     wound = []
+    n_phantom = 0
 
     for f in raw_surface:
         v0, v1, v2 = int(f[0]), int(f[1]), int(f[2])
         if on_plane(v0) and on_plane(v1) and on_plane(v2):
             wound.append(f)
         else:
+            orig_vs = [v for v in (v0, v1, v2) if v < n_orig and v not in seam_set]
+            new_vs  = [v for v in (v0, v1, v2) if on_plane(v)]
+            if new_vs and orig_vs and orig_surf_verts:
+                if any(v not in orig_surf_verts for v in orig_vs):
+                    n_phantom += 1
+                    continue   # discard phantom collar face
             outer.append(f)
+
+    print(f"[PhantomCollar] discarded {n_phantom} phantom collar faces")
 
     outer_arr = (np.array(outer, dtype=np.uint32)
                  if outer else np.zeros((0, 3), dtype=np.uint32))
@@ -1108,7 +1123,9 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
     while ptr < len(wbd) and wbd[ptr][0] <= comp.blade_travel:
         ptr += 1
 
-    faces_added = ptr > comp._wound_face_ptr
+    hide_wound = getattr(comp, 'hide_wound_faces', False)
+
+    faces_added = (not hide_wound) and (ptr > comp._wound_face_ptr)
     if faces_added:
         comp._wound_face_ptr = ptr
         revealed = [f for _, f in wbd[:ptr]]
@@ -1130,8 +1147,8 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
 
     # --- Stop when complete ---
     if all(p['broken'] for p in comp._seam_pairs):
-        # Force-reveal any remaining wound faces (floating-point edge cases).
-        if comp._wound_face_ptr < len(wbd):
+        # Force-reveal any remaining wound faces (unless hidden for debug).
+        if (not hide_wound) and comp._wound_face_ptr < len(wbd):
             comp._wound_face_ptr = len(wbd)
             revealed = [f for _, f in wbd]
             comp.surface_indices = (

@@ -194,8 +194,9 @@ def main():
     # Cleanest: subclass or use a custom params attribute.
     # For now, FEMMethod uses its own defaults (young_modulus=5e4, poisson_ratio=0.4, density=1000).
 
-    taichi_comp.cut_plane_origin = origin.tolist()
-    taichi_comp.cut_plane_normal = normal.tolist()
+    taichi_comp.cut_plane_origin  = origin.tolist()
+    taichi_comp.cut_plane_normal  = normal.tolist()
+    taichi_comp.hide_wound_faces  = False
     scene.add_component(sphere, taichi_comp)
 
     scene.add_component(light, InfoComponent('light'))
