@@ -596,8 +596,9 @@ class FEMMethod(SimulationMethod):
             return
         pos = self._simulator.positions.to_numpy()
         vel = self._simulator.velocities.to_numpy()
-        for orphan, master in self._orphan_constraints.items():
-            pos[orphan] = pos[master]
+
+        for orphan, (master, offset) in self._orphan_constraints.items():
+            pos[orphan] = pos[master] + offset
             vel[orphan] = vel[master]
         self._simulator.positions.from_numpy(pos.astype(np.float32))
         self._simulator.velocities.from_numpy(vel.astype(np.float32))
@@ -876,7 +877,10 @@ class FEMMethod(SimulationMethod):
             print(f"[MASTER] side check (via fem_tets centroid): "
                   f"correct={_nc}  wrong={_nw}  unknown={_nu}", flush=True)
 
-        self._orphan_constraints = dict(_vert_remap)
+        self._orphan_constraints = {
+            orphan: (master, final_pos[orphan] - final_pos[master])
+            for orphan, master in _vert_remap.items()
+        }
         self._debug_orphan_verts = set(_vert_remap.keys())
 
         def _r(v: int) -> int:

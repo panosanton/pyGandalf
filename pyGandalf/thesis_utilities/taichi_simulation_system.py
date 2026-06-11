@@ -443,8 +443,12 @@ class TaichiSimulationSystem(System):
             comp._wireframe = not getattr(comp, '_wireframe', False)
             print(f"[Wire] {'ON' if comp._wireframe else 'OFF'}")
         self._z_prev = z_now
-        gl.glPolygonMode(gl.GL_FRONT_AND_BACK,
-                         gl.GL_LINE if getattr(comp, '_wireframe', False) else gl.GL_FILL)
+        if getattr(comp, '_wireframe', False):
+            gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_LINE)
+            gl.glDisable(gl.GL_CULL_FACE)
+        else:
+            gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
+            gl.glEnable(gl.GL_CULL_FACE)
 
         # --- Simulation sub-steps (via SpringMassMethod — handles ramp internally) ---
         t0 = time.perf_counter()
