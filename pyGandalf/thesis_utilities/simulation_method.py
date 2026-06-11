@@ -377,7 +377,8 @@ class SpringMassMethod(SimulationMethod):
             return False
 
         (new_sim, final_pos, _final_vel, _final_mass, _final_fixed,
-         all_tets, n_orig, n_split, shared_list, remap, _inter_data, _orig_surf_set) = result
+         all_tets, n_orig, n_split, shared_list, remap, _inter_data, _orig_surf_set,
+         _phantom_keys) = result
 
         self._simulator       = new_sim
         self._current_tets    = all_tets
@@ -595,8 +596,9 @@ class FEMMethod(SimulationMethod):
             return
         pos = self._simulator.positions.to_numpy()
         vel = self._simulator.velocities.to_numpy()
-        for orphan, master in self._orphan_constraints.items():
-            pos[orphan] = pos[master]
+
+        for orphan, (master, offset) in self._orphan_constraints.items():
+            pos[orphan] = pos[master] + offset
             vel[orphan] = vel[master]
         self._simulator.positions.from_numpy(pos.astype(np.float32))
         self._simulator.velocities.from_numpy(vel.astype(np.float32))
@@ -656,22 +658,22 @@ class FEMMethod(SimulationMethod):
             top3_info   = [(int(top3_global[i]), float(disp[top3[i]]),
                             new_pos[top3[i]].tolist()) for i in range(len(top3))]
 
-            print(
-                f"[DBG f+{f:02d}] new-cut({N - n_orig}): "
-                f"disp max={max_disp:.4f} min={min_disp:.6f} mean={mean_disp:.4f} "
-                f"stuck={n_stuck} expand>{0.5}={n_expanding} "
-                f"vel max={max_vel:.4f} mean={mean_vel:.6f} "
-                f"nan={n_nan} inf={n_inf} | "
-                f"fixed max_disp={max_fixed_d:.6f}",
-                flush=True
-            )
-            if f <= 2 or (f % 5 == 0):
-                for vi, di, pi in top3_info:
-                    print(f"  top vert {vi}: disp={di:.4f}  pos={[round(x,4) for x in pi]}",
-                          flush=True)
-        else:
-            print(f"[DBG f+{f:02d}] (no new-cut verts)  fixed max_disp={max_fixed_d:.6f}",
-                  flush=True)
+            # print(
+            #     f"[DBG f+{f:02d}] new-cut({N - n_orig}): "
+            #     f"disp max={max_disp:.4f} min={min_disp:.6f} mean={mean_disp:.4f} "
+            #     f"stuck={n_stuck} expand>{0.5}={n_expanding} "
+            #     f"vel max={max_vel:.4f} mean={mean_vel:.6f} "
+            #     f"nan={n_nan} inf={n_inf} | "
+            #     f"fixed max_disp={max_fixed_d:.6f}",
+            #     flush=True
+            # )
+            # if f <= 2 or (f % 5 == 0):
+            #     for vi, di, pi in top3_info:
+            #         print(f"  top vert {vi}: disp={di:.4f}  pos={[round(x,4) for x in pi]}",
+            #               flush=True)
+        # else:
+            # print(f"[DBG f+{f:02d}] (no new-cut verts)  fixed max_disp={max_fixed_d:.6f}",
+            #       flush=True)
 
         self._debug_frames_since_cut += 1
 
@@ -732,7 +734,7 @@ class FEMMethod(SimulationMethod):
 
         (_, final_pos, final_vel, _, final_fixed,
          all_tets, n_orig, n_split, shared_list, remap,
-         _inter_data, _orig_surf_set) = result
+         _inter_data, _orig_surf_set, _phantom_keys) = result
 
         # Check 4b: fixed count after topology rebuild
         n_fixed_after = int(final_fixed.sum())
@@ -875,7 +877,10 @@ class FEMMethod(SimulationMethod):
             print(f"[MASTER] side check (via fem_tets centroid): "
                   f"correct={_nc}  wrong={_nw}  unknown={_nu}", flush=True)
 
-        self._orphan_constraints = dict(_vert_remap)
+        self._orphan_constraints = {
+            orphan: (master, final_pos[orphan] - final_pos[master])
+            for orphan, master in _vert_remap.items()
+        }
         self._debug_orphan_verts = set(_vert_remap.keys())
 
         def _r(v: int) -> int:
