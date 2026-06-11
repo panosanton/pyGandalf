@@ -357,6 +357,9 @@ class TaichiSimulationSystem(System):
         print("  C — one-shot cut (testing only)")
         print("  P — pause / resume physics simulation")
         print("  X — disc parallelism check (colors non-parallel disc faces yellow)")
+        print("  V — cycle face-category colors (requires --debug-colors): "
+              "white=surface, orange=collar, yellow=reclassified, cyan=wound-above, magenta=wound-dup")
+        print("  Z — toggle wireframe mode")
 
     def on_update_entity(self, ts: float, entity, components):
         comp: TaichiSimulationComponent
@@ -409,6 +412,13 @@ class TaichiSimulationSystem(System):
             print(f"[Sim] Physics {'paused' if comp.sim_paused else 'resumed'}")
         self._p_prev = p_now
 
+        # --- N key: step one frame while paused ---
+        n_now = InputManager().get_key_down(glfw.KEY_N)
+        if n_now and not getattr(self, '_n_prev', False):
+            if comp.sim_paused:
+                comp._step_one_frame = True
+        self._n_prev = n_now
+
         # --- X key: disc parallelism check (yellow non-parallel disc faces) ---
         x_now = InputManager().get_key_down(glfw.KEY_X)
         if x_now and not getattr(self, '_x_prev', False):
@@ -421,9 +431,27 @@ class TaichiSimulationSystem(System):
             _overlay_orphan_colors(comp, mesh_comp)
         self._o_prev = o_now
 
+        # --- V key: cycle face-category colors (requires --debug-colors) ---
+        v_now = InputManager().get_key_down(glfw.KEY_V)
+        if v_now and not getattr(self, '_v_prev', False):
+            _apply_color_cycle(comp, mesh_comp)
+        self._v_prev = v_now
+
+        # --- Z key: toggle wireframe (surface edges only) ---
+        z_now = InputManager().get_key_down(glfw.KEY_Z)
+        if z_now and not getattr(self, '_z_prev', False):
+            comp._wireframe = not getattr(comp, '_wireframe', False)
+            print(f"[Wire] {'ON' if comp._wireframe else 'OFF'}")
+        self._z_prev = z_now
+        gl.glPolygonMode(gl.GL_FRONT_AND_BACK,
+                         gl.GL_LINE if getattr(comp, '_wireframe', False) else gl.GL_FILL)
+
         # --- Simulation sub-steps (via SpringMassMethod — handles ramp internally) ---
         t0 = time.perf_counter()
-        if not comp.sim_paused:
+        step_one = getattr(comp, '_step_one_frame', False)
+        if step_one:
+            comp._step_one_frame = False
+        if not comp.sim_paused or step_one:
             comp.method.step(comp.time_step)
 
             # Force audit: spring-mass only (uses _spring_forces kernel).
@@ -480,15 +508,15 @@ class TaichiSimulationSystem(System):
         self._fc += 1
         if self._fc % 60 == 0:
             blade_ms = (t_blade1 - t_blade0) * 1000
-            print(
-                f"[Frame {self._fc:4d}] "
-                f"blade {blade_ms:4.2f}ms | "
-                f"sim {(t1-t0)*1000:5.2f}ms | "
-                f"readback {(t2-t1)*1000:4.2f}ms | "
-                f"normals {(t3-t2)*1000:4.2f}ms | "
-                f"upload {(t4-t3)*1000:4.2f}ms | "
-                f"total {(t4-t_blade0)*1000:5.2f}ms"
-            )
+            # print(
+            #     f"[Frame {self._fc:4d}] "
+            #     f"blade {blade_ms:4.2f}ms | "
+            #     f"sim {(t1-t0)*1000:5.2f}ms | "
+            #     f"readback {(t2-t1)*1000:4.2f}ms | "
+            #     f"normals {(t3-t2)*1000:4.2f}ms | "
+            #     f"upload {(t4-t3)*1000:4.2f}ms | "
+            #     f"total {(t4-t_blade0)*1000:5.2f}ms"
+            # )
 
 
 # ---------------------------------------------------------------------------
@@ -516,7 +544,8 @@ def _apply_poke(comp: TaichiSimulationComponent):
 
 def _split_crossed_tets(tetrahedra: np.ndarray,
                          positions:  np.ndarray,
-                         signed_dist: np.ndarray):
+                         signed_dist: np.ndarray,
+                         surface_tet_indices: set = None):
     """
     Split tetrahedra that straddle the cut plane by inserting new vertices
     exactly at edge-plane intersections.
@@ -526,17 +555,25 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
       3+1 (3 above, 1 below): symmetric
       2+2 (2 above, 2 below): 3 tets on each side using quad diagonal
 
+    surface_tet_indices: set of original tet indices that have at least one
+      face in the original outer surface.  When provided, collar faces from
+      crossing tets NOT in this set are collected in phantom_above_face_keys
+      (sorted 3-tuples) so the caller can mark them for debugging / filtering.
+
     Returns:
-        new_positions (N_new, 3)  — original + intersection vertices
-        above_tets    (M, 4)      — tets on / above the plane
-        below_tets    (K, 4)      — tets on / below the plane
-        inter_data    list of (new_idx, vi, vj, t)
+        new_positions          (N_new, 3)
+        above_tets             (M, 4)
+        below_tets             (K, 4)
+        inter_data             list of (new_idx, vi, vj, t)
+        phantom_above_face_keys  set of sorted int-triple keys for collar faces
+                               originating from non-surface crossing tets
     """
     ext_positions: list = [p for p in positions]
     edge_cache:    dict = {}
     inter_data:    list = []
     above_list:    list = []
     below_list:    list = []
+    phantom_above_face_keys: set = set()
 
     tet_dists  = signed_dist[tetrahedra]
     above_mask = np.all(tet_dists >= 0, axis=1)
@@ -557,6 +594,10 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
             inter_data.append((nid, vi, vj, t))
         return edge_cache[key][0]
 
+    def _add_phantom_keys(faces):
+        for f in faces:
+            phantom_above_face_keys.add(tuple(sorted(f)))
+
     for idx in np.where(~above_mask & ~below_mask)[0]:
         verts = tetrahedra[idx]
         dists = signed_dist[verts]
@@ -564,6 +605,7 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
         av  = [int(verts[i]) for i in range(4) if dists[i] >= 0]
         bv  = [int(verts[i]) for i in range(4) if dists[i] <  0]
         n_a = len(av)
+        is_surface = surface_tet_indices is None or int(idx) in surface_tet_indices
 
         if n_a == 1:
             a, b0, b1, b2 = av[0], bv[0], bv[1], bv[2]
@@ -572,6 +614,10 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
             below_list += [[b0, b1, b2, p0],
                            [b1, b2, p0, p1],
                            [b2, p0, p1, p2]]
+            if not is_surface:
+                # Collar faces of above tet [a,p0,p1,p2] after internal cancellation:
+                # all three faces that include 'a' (no internal cancellation for 1+3)
+                _add_phantom_keys([[a,p0,p1],[a,p0,p2],[a,p1,p2]])
 
         elif n_a == 3:
             a0, a1, a2, b = av[0], av[1], av[2], bv[0]
@@ -580,6 +626,14 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
             above_list += [[a0, a1, a2, p0],
                            [a1, a2, p0, p1],
                            [a2, p0, p1, p2]]
+            if not is_surface:
+                # Collar faces after internal cancellations ({a1,a2,p0} and {a2,p0,p1}
+                # cancel between adjacent above tets):
+                _add_phantom_keys([
+                    [a0,a1,p0],[a0,a2,p0],
+                    [a1,a2,p1],[a1,p0,p1],
+                    [a2,p0,p2],[a2,p1,p2],
+                ])
 
         else:   # 2+2
             a0, a1 = av[0], av[1]
@@ -592,13 +646,21 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
             below_list += [[b1, p00, p01, p11],
                            [b0, p00, p10, p11],
                            [b0, b1,  p00, p11]]
+            if not is_surface:
+                # Collar faces after internal cancellations ({a0,p00,p11} and
+                # {a1,p00,p11} cancel between above tets):
+                _add_phantom_keys([
+                    [a0,p00,p01],[a0,p01,p11],
+                    [a1,p00,p10],[a1,p10,p11],
+                    [a0,a1,p00],[a0,a1,p11],
+                ])
 
     new_pos   = np.array(ext_positions, dtype=np.float32)
     above_arr = (np.array(above_list, dtype=np.int32)
                  if above_list else np.zeros((0, 4), dtype=np.int32))
     below_arr = (np.array(below_list, dtype=np.int32)
                  if below_list else np.zeros((0, 4), dtype=np.int32))
-    return new_pos, above_arr, below_arr, inter_data
+    return new_pos, above_arr, below_arr, inter_data, phantom_above_face_keys
 
 
 def _cut_topology_physics(
@@ -635,12 +697,66 @@ def _cut_topology_physics(
     orig_surf_set = {tuple(row) for row in all_orig_s[(_cnt == 1)[_inv]]}
     n_orig = len(positions)
 
+    # --- Surface tet set: original tets with at least one face in orig_surf_set ---
+    # Used by _split_crossed_tets to identify phantom collar faces from interior tets.
+    surface_tet_set = set()
+    for _ti in range(len(current_tets)):
+        _t = current_tets[_ti]
+        for _fc in [[0,1,2],[0,1,3],[0,2,3],[1,2,3]]:
+            if tuple(sorted([int(_t[_fc[0]]),int(_t[_fc[1]]),int(_t[_fc[2]])])) in orig_surf_set:
+                surface_tet_set.add(_ti)
+                break
+    print(f"[Cut] {len(surface_tet_set)} surface tets, "
+          f"{len(current_tets) - len(surface_tet_set)} interior tets")
+
+    # --- Pre-snap near-plane above verts to below ---
+    # A vert with 0 < dist < snap_eps is effectively on the cut plane.  If left
+    # as above, it becomes the lone above vert in a 1+3 split, producing a
+    # near-degenerate above-half tet [vi, p0, p1, p2] where p0≈p1≈p2≈vi.
+    # Those near-zero-area outer faces accumulate zero normals for vi, causing
+    # the collar lerp in _compute_normals_post_cut to assign zero normals to the
+    # intersection verts (Bug 1 saw-tooth artifact).  Snapping dist to just
+    # below sends the whole tet to the below-half intact, preserving vi's
+    # original surface faces and their normals.
+    mesh_scale = float(np.linalg.norm(positions.max(axis=0) - positions.min(axis=0)))
+    snap_eps   = mesh_scale * 1e-4
+    near_above = (signed_dist > 0) & (signed_dist < snap_eps)
+    if near_above.any():
+        signed_dist_split = signed_dist.copy()
+        signed_dist_split[near_above] = -snap_eps
+        print(f"[Cut] Pre-snap {int(near_above.sum())} near-plane above verts to below "
+              f"(prevents degenerate 1+3 splits, threshold {snap_eps:.2e})")
+    else:
+        signed_dist_split = signed_dist
+
+    # [Dist0Diag] Count exactly-zero-dist verts that land in crossing tets.
+    # Pre-snap uses strict > 0 so these are NOT snapped.  In a crossing tet
+    # such a vert goes into av (dists[i] >= 0) and iv() computes t=0, placing
+    # the intersection vert exactly at the original vert's position.  This
+    # produces degenerate faces whose cross product ≈ 0, making winding
+    # correction in _extract_boundary_faces numerically unstable.
+    _dist0_arr = np.where(signed_dist == 0.0)[0]
+    if len(_dist0_arr) > 0:
+        _td = signed_dist[current_tets]
+        _crossing = current_tets[~np.all(_td >= 0, axis=1) & ~np.all(_td <= 0, axis=1)]
+        _n_in_cross = int(np.isin(_dist0_arr, _crossing.flatten()).sum()) if len(_crossing) else 0
+        print(f"[Dist0Diag] {len(_dist0_arr)} verts at exactly dist=0.0; "
+              f"{_n_in_cross} appear in crossing tets "
+              f"(missed by pre-snap strict > 0; cause degenerate 2+2/3+1 splits)")
+    else:
+        print(f"[Dist0Diag] 0 verts at exactly dist=0.0")
+
     # --- Tet splitting ---
-    split_pos, above_tets, below_tets, inter_data = \
-        _split_crossed_tets(current_tets, positions, signed_dist)
+    split_pos, above_tets, below_tets, inter_data, phantom_above_face_keys = \
+        _split_crossed_tets(current_tets, positions, signed_dist_split,
+                            surface_tet_indices=surface_tet_set)
 
     n_split = len(split_pos)
     n_inter = n_split - n_orig
+
+    _n_degen_inter = sum(1 for _, _vi, _vj, _t in inter_data if _t < 1e-6 or _t > 1.0 - 1e-6)
+    print(f"[Dist0Diag] {_n_degen_inter} / {len(inter_data)} inter_data entries with t<1e-6 "
+          f"or t>1-1e-6 (degenerate intersections at original vert positions)")
 
     print(f"[Cut] {len(above_tets):,} above-tets, {len(below_tets):,} below-tets, "
           f"{n_inter} intersection verts")
@@ -657,8 +773,7 @@ def _cut_topology_physics(
     # distorted triangles (visible as the spike/flap artifact on off-center cuts).
     # Intersection vertices from iv() already land exactly on the plane by
     # construction, so no snapping is needed for them.
-    mesh_scale = float(np.linalg.norm(positions.max(axis=0) - positions.min(axis=0)))
-    snap_eps   = mesh_scale * 1e-4
+    # mesh_scale and snap_eps already computed above.
     rim_set = set()
     for new_id, vi, vj, _ in inter_data:
         if vi < n_orig: rim_set.add(vi)
@@ -730,7 +845,8 @@ def _cut_topology_physics(
     _print_spring_audit(new_sim._sa, new_sim._sb, new_sim._sr, new_sim._sk, n_orig)
 
     return (new_sim, final_pos, final_vel, final_mass, final_fixed,
-            all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set)
+            all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set,
+            phantom_above_face_keys)
 
 
 def _cut_topology(comp: TaichiSimulationComponent,
@@ -757,7 +873,8 @@ def _cut_topology(comp: TaichiSimulationComponent,
         return None
 
     (new_sim, final_pos, final_vel, final_mass, final_fixed,
-     all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set) = result
+     all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set,
+     phantom_above_face_keys) = result
 
     comp.simulator          = new_sim
     comp.current_tetrahedra = all_tets
@@ -768,7 +885,8 @@ def _cut_topology(comp: TaichiSimulationComponent,
         comp.method._simulator = new_sim
 
     return (final_pos, final_vel, final_mass, final_fixed,
-            all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set)
+            all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set,
+            phantom_above_face_keys)
 
 
 def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
@@ -805,6 +923,8 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
     wound = []
     n_phantom = 0
 
+    cut_n_unit = (normal / np.linalg.norm(normal)).astype(np.float32)
+
     for f in raw_surface:
         v0, v1, v2 = int(f[0]), int(f[1]), int(f[2])
         if on_plane(v0) and on_plane(v1) and on_plane(v2):
@@ -820,9 +940,59 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
 
     print(f"[PhantomCollar] discarded {n_phantom} phantom collar faces")
 
+    # Diagnostic: wound faces whose normals deviate from +-cut_n.
+    # True disc faces are co-planar with the cut, so |dot(fn, cut_n)| ~ 1.
+    # Phantom wound faces are surface-facing: |dot| ~ 0.
+    if wound and final_pos is not None:
+        cut_n_unit = (normal / np.linalg.norm(normal)).astype(np.float32)
+        n_phantom_wound = 0
+        for f in wound:
+            v0, v1, v2 = int(f[0]), int(f[1]), int(f[2])
+            p0r, p1r, p2r = final_pos[v0], final_pos[v1], final_pos[v2]
+            fn = np.cross(p1r - p0r, p2r - p0r)
+            fn_len = float(np.linalg.norm(fn))
+            if fn_len > 1e-10:
+                fn /= fn_len
+                if abs(float(np.dot(fn, cut_n_unit))) < 0.5:
+                    n_phantom_wound += 1
+        print(f"[WoundDiag] {n_phantom_wound} / {len(wound)} wound faces have normals "
+              f"not aligned with cut_n (phantom wound from degenerate splits; should be 0)")
+
+    if inter_data and wound:
+        near_plane_verts = {nid for nid, vi, vj, t in inter_data if t < 0.01 or t > 0.99}
+        near_wound = [f for f in wound if any(int(v) in near_plane_verts for v in f)]
+        if near_wound:
+            wound = [f for f in wound if not any(int(v) in near_plane_verts for v in f)]
+            outer.extend(near_wound)
+            print(f"[NearPlane] reclassified {len(near_wound)} near-plane wound->collar faces")
+
+    # [InteriorTetDiag] Collar faces from interior tets with a surface-vert corner
+    # slip through PhantomCollar (the original vert IS in orig_surf_verts).
+    # Detect them via inter_data: for each intersection vert, vj is the below endpoint.
+    # If ALL below endpoints of a collar face's intersection verts are interior
+    # (not in orig_surf_verts), every edge in that face goes from a surface vert to
+    # an interior vert -- the tet was interior, not a surface tet.
+    suspect_indices = set()
+    if inter_data and orig_surf_verts and outer:
+        inter_vert_to_below = {int(nid): int(vj) for nid, vi, vj, t in inter_data}
+        for i, f in enumerate(outer):
+            v0, v1, v2 = int(f[0]), int(f[1]), int(f[2])
+            inter_vs = [v for v in (v0, v1, v2) if v >= n_orig and v in inter_vert_to_below]
+            if not inter_vs:
+                continue
+            below_eps = [inter_vert_to_below[v] for v in inter_vs]
+            if all(v not in orig_surf_verts for v in below_eps):
+                suspect_indices.add(i)
+        print(f"[InteriorTetDiag] {len(suspect_indices)} collar faces whose intersection "
+              f"verts all come from non-surface edges (interior tet, surface-vert corner; "
+              f"slips through PhantomCollar filter)")
+
     outer_arr = (np.array(outer, dtype=np.uint32)
                  if outer else np.zeros((0, 3), dtype=np.uint32))
-    return outer_arr, wound
+    suspect_mask = np.zeros(len(outer_arr), dtype=bool)
+    for i in suspect_indices:
+        suspect_mask[i] = True
+    return outer_arr, wound, suspect_mask
 
 
 def _split_disc_verts_for_rendering(outer_faces, wound_faces, n_phys, n_orig):
@@ -883,7 +1053,7 @@ def _perform_cut(comp: TaichiSimulationComponent,
 
     (final_pos, final_vel, final_mass, final_fixed,
      all_tets, n_orig, n_split, shared_list, remap, inter_data,
-     orig_surf_set) = result
+     orig_surf_set, phantom_above_face_keys) = result
     comp._n_orig      = n_orig
     comp._n_split     = n_split
     comp._inter_data  = inter_data
@@ -909,7 +1079,7 @@ def _perform_cut(comp: TaichiSimulationComponent,
     # --- Surface ---
     raw_surface = _extract_boundary_faces(all_tets, final_pos)
     mesh_centroid = final_pos[:n_orig].mean(axis=0)
-    outer_faces, wound_faces = _filter_surface_faces(
+    outer_faces, wound_faces, suspect_mask = _filter_surface_faces(
         raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set, mesh_centroid,
         inter_data=inter_data, shared_list=shared_list)
 
@@ -994,7 +1164,7 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     # Extract topology data from the cached result tuple for surface computation.
     (_new_sim, final_pos, _final_vel, _final_mass, _final_fixed,
      all_tets, n_orig, n_split, shared_list, remap, inter_data,
-     orig_surf_set) = comp.method._topology_result
+     orig_surf_set, phantom_above_face_keys) = comp.method._topology_result
 
     comp._n_orig      = n_orig
     comp._n_split     = n_split
@@ -1015,7 +1185,7 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     # --- Build progressive wound surface ---
     raw_surface = _extract_boundary_faces(all_tets, final_pos)
     mesh_centroid = final_pos[:n_orig].mean(axis=0)
-    outer_faces, wound_faces = _filter_surface_faces(
+    outer_faces, wound_faces, suspect_mask = _filter_surface_faces(
         raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set, mesh_centroid,
         inter_data=inter_data, shared_list=shared_list)
 
@@ -1063,8 +1233,31 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     face_colors        = _compute_debug_face_colors(all_render_faces, n_orig)
     comp._debug_colors = face_colors.copy()
 
+    # Face categories for V-key color cycling (requires --debug-colors shader).
+    comp._face_categories  = _compute_face_categories(
+        all_render_faces, len(outer_faces), n_orig, n_split,
+        inter_data=inter_data, orig_surf_set=orig_surf_set,
+        phantom_keys=phantom_above_face_keys)
+    comp._color_cycle_mode = -1
+
     new_normals = _compute_normals_post_cut(render_pos, comp.surface_indices,
                                             n_orig, n_split, inter_data, shared_list, normal)
+
+    # --- Diagnostics: confirm Bug 1 (zero collar normals) and Bug 2 (zero dup normals) ---
+    _n_phys = comp.method.vertex_count
+    outer_flat     = comp.surface_indices.flatten().astype(np.int32)
+    outer_norm_len = np.linalg.norm(new_normals[outer_flat], axis=1)
+    n_zero_collar  = int((outer_norm_len < 1e-6).sum())
+    print(f"[NormDiag] Bug1: {n_zero_collar} / {len(outer_flat)} outer-face vert slots "
+          f"have zero normals (saw-tooth source if > 0)")
+    if len(render_pos) > _n_phys:
+        dup_norm_len = np.linalg.norm(new_normals[_n_phys:], axis=1)
+        n_zero_dup   = int((dup_norm_len < 1e-6).sum())
+        print(f"[NormDiag] Bug2: {n_zero_dup} / {len(render_pos) - _n_phys} "
+              f"rendering-dup verts have zero normals (wound faces appear black if > 0)")
+    else:
+        print("[NormDiag] Bug2: no rendering-dup verts (split_disc_verts=False or no dups)")
+    # --- End diagnostics ---
 
     # Build expanded (unindexed) arrays for the full face set.
     flat_all   = all_render_faces.flatten()
@@ -1357,19 +1550,19 @@ def _compute_debug_face_colors(faces: np.ndarray, n_orig: int) -> np.ndarray:
     Returns (N_faces, 3) float32.
     """
     n = len(faces)
-    colors = np.tile([0.3, 0.7, 0.4], (n, 1)).astype(np.float32)
+    colors = np.tile([0.3, 0.5, 0.8], (n, 1)).astype(np.float32)   # blue — original surface
 
     v = faces  # (N, 3)
     all_new = np.all(v >= n_orig, axis=1)
     any_new = np.any(v >= n_orig, axis=1)
 
-    colors[any_new & ~all_new] = [0.15, 0.35, 0.9]   # blue — collar
-    colors[all_new]             = [0.85, 0.1,  0.1]   # red  — disc
+    colors[any_new & ~all_new] = [0.3, 0.7, 0.4]    # green — collar
+    colors[all_new]             = [0.85, 0.1, 0.1]   # red   — disc
 
-    n_blue = int((any_new & ~all_new).sum())
-    n_red  = int(all_new.sum())
-    print(f"[Cut] Debug colors: {n_blue} collar faces (blue), {n_red} disc faces (red), "
-          f"{n - n_blue - n_red} outer faces (green)")
+    n_green = int((any_new & ~all_new).sum())
+    n_red   = int(all_new.sum())
+    print(f"[Cut] Debug colors: {n_green} collar faces (green), {n_red} disc faces (red), "
+          f"{n - n_green - n_red} outer faces (blue)")
     return colors
 
 
@@ -1498,6 +1691,21 @@ def _extract_boundary_faces(tetrahedra: np.ndarray,
         inward       = np.einsum('ij,ij->i', face_normals, to_fourth) > 0
         boundary_faces[inward] = boundary_faces[inward][:, [0, 2, 1]]
 
+        # [WindingDiag] Re-check after correction: any face still pointing toward
+        # its fourth vertex has genuinely wrong winding (not centroid-test noise).
+        v0c     = vertices[boundary_faces[:, 0]]
+        v1c     = vertices[boundary_faces[:, 1]]
+        v2c     = vertices[boundary_faces[:, 2]]
+        fn_post = np.cross(v1c - v0c, v2c - v0c)
+        still_inward = np.einsum('ij,ij->i', fn_post, to_fourth) > 0
+        n_still = int(still_inward.sum())
+        if n_still:
+            print(f"[WindingDiag] {n_still} / {len(boundary_faces)} boundary faces still "
+                  f"pointing toward their fourth vertex after winding correction")
+        else:
+            print(f"[WindingDiag] 0 / {len(boundary_faces)} boundary faces have residual "
+                  f"winding errors after correction")
+
     return boundary_faces.astype(np.uint32)
 
 
@@ -1560,6 +1768,15 @@ def _compute_normals_post_cut(vertices:    np.ndarray,
     disc_mask = np.all(idx_i32 >= n_orig, axis=1)
     if disc_mask.any():
         disc_arr = np.unique(idx_i32[disc_mask])
+        # Near-plane intersection verts (t≈0 or t≈1) were reclassified from
+        # wound to collar.  They appear in all-intersection-vert collar faces,
+        # which triggers disc_mask=True.  Exclude them so they go through the
+        # collar lerp path and get surface normals instead of ±cut_n.
+        if inter_data:
+            near_ids = np.array([d[0] for d in inter_data
+                                 if d[3] < 0.01 or d[3] > 0.99], dtype=np.int32)
+            if len(near_ids) > 0:
+                disc_arr = disc_arr[~np.isin(disc_arr, near_ids)]
     else:
         disc_arr = np.empty(0, dtype=np.int32)
 
@@ -1615,3 +1832,128 @@ def _update_vbo(vao: int, vbo: int, data: np.ndarray):
     gl.glBufferSubData(gl.GL_ARRAY_BUFFER, 0, flat.nbytes, flat)
     gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
     gl.glBindVertexArray(0)
+
+
+# ---------------------------------------------------------------------------
+# Face category color cycling  (V key, requires --debug-colors shader)
+# ---------------------------------------------------------------------------
+
+_CAT_COLORS = np.array([
+    [1.0, 1.0, 1.0],    # 0 white  — pure surface (all original verts)
+    [1.0, 0.55, 0.0],   # 1 orange — valid collar (mixed orig+inter, outward-facing)
+    [1.0, 1.0, 0.0],    # 2 yellow — all-intersection outer (reclassified near-plane)
+    [1.0, 0.0, 0.5],    # 3 pink   — Cat3 reconstruction phantom (over-filters 1+3 collar)
+    [0.0, 1.0, 0.5],    # 4 cyan   — tet-provenance phantom (parent crossing tet is interior)
+], dtype=np.float32)
+
+_CAT_NAMES = [
+    "pure-surface outer (white)  — all-original verts",
+    "valid collar outer (orange) — reconstructed original face is in orig_surf_set",
+    "all-inter outer    (yellow) — all intersection verts",
+    "phantom collar     (pink)   — reconstructed original face not in orig_surf_set (over-filters)",
+    "tet-provenance phantom (cyan) — parent crossing tet has no face in orig_surf_set",
+]
+
+
+def _compute_face_categories(all_render_faces: np.ndarray, n_outer: int,
+                              n_orig: int, n_split: int,
+                              inter_data=None, orig_surf_set=None,
+                              phantom_keys=None) -> np.ndarray:
+    """
+    Classify each outer face into one of 4 categories.
+    Wound faces (beyond n_outer) are left as 0 -- they are hidden.
+
+    Cat 3 (phantom): a collar face whose reconstructed original tet face is not
+    in orig_surf_set.  Reconstruction: union of (face orig verts) + (both
+    endpoints of every intersection edge in the face), keeping only orig verts
+    (< n_orig).  If the result is not exactly 3 orig verts or those 3 are not
+    in orig_surf_set, the face came from an interior tet face, not a surface
+    one -- it is a phantom exposed by a non-conforming split.
+    """
+    cats = np.zeros(len(all_render_faces), dtype=np.int32)
+    arr  = all_render_faces.astype(np.int64)    # (N, 3)
+    vmax = arr.max(axis=1)
+    vmin = arr.min(axis=1)
+
+    outer_mask = np.zeros(len(all_render_faces), dtype=bool)
+    outer_mask[:n_outer] = True
+
+    cats[outer_mask & (vmax < n_orig)] = 0
+    cats[outer_mask & (vmax >= n_orig) & (vmin < n_orig)] = 1
+    cats[outer_mask & (vmin >= n_orig)] = 2
+
+    # Cat 3: phantom collar -- cat 1 face whose reconstructed original tet face
+    # is not in orig_surf_set.
+    if inter_data is not None and orig_surf_set is not None:
+        inter_edge = {int(d[0]): (int(d[1]), int(d[2])) for d in inter_data}
+        cat1_idx   = np.where(cats == 1)[0]
+        for idx in cat1_idx:
+            f        = all_render_faces[idx]
+            all_orig = set()
+            for v in f:
+                v = int(v)
+                if v < n_orig:
+                    all_orig.add(v)
+                elif v < n_split:
+                    va, vb = inter_edge.get(v, (None, None))
+                    if va is not None:
+                        all_orig.add(va)
+                        all_orig.add(vb)
+            # Only keep original verts (below verts from inter edges are orig too)
+            all_orig = {v for v in all_orig if v < n_orig}
+            if len(all_orig) != 3 or tuple(sorted(all_orig)) not in orig_surf_set:
+                cats[idx] = 3
+        print(f"[FaceCat] cat1={int((cats==1).sum())} valid-collar, "
+              f"cat3={int((cats==3).sum())} phantom (interior orig face)")
+
+    # Cat 4: tet-provenance phantom — parent crossing tet is an interior tet.
+    if phantom_keys is not None:
+        for idx in range(n_outer):
+            f   = all_render_faces[idx]
+            key = tuple(sorted([int(f[0]), int(f[1]), int(f[2])]))
+            if key in phantom_keys:
+                cats[idx] = 4
+        print(f"[FaceCat] cat4={int((cats==4).sum())} tet-provenance phantoms "
+              f"(parent crossing tet has no face in orig_surf_set)")
+
+    return cats
+
+
+def _apply_color_cycle(comp, mesh_comp: 'StaticMeshComponent'):
+    """
+    Cycle to the next face-category highlight.
+
+    Mode 0 resets to the original debug colors.
+    Modes 1-N each highlight ONE category with a bright color while all other
+    faces keep their original debug colors (not dimmed).
+    """
+    if not comp._face_expanded or comp._face_categories is None:
+        print("[ColorCycle] No face categories yet — press B first.")
+        return
+    if len(mesh_comp.buffers) < 4:
+        print("[ColorCycle] No color buffer — run with --debug-colors.")
+        return
+
+    n_modes = len(_CAT_COLORS) + 1          # 0=reset, 1..N=spotlight one cat
+    mode    = (getattr(comp, '_color_cycle_mode', -1) + 1) % n_modes
+    comp._color_cycle_mode = mode
+
+    cats     = comp._face_categories         # (N_faces,) int32
+    baseline = comp._debug_colors.copy()     # original per-face colors, (N_faces, 3)
+
+    if mode == 0:
+        colors = baseline
+        label  = "reset to original"
+    else:
+        c      = mode - 1
+        colors = baseline.copy()
+        colors[cats == c] = _CAT_COLORS[c]  # override only this category
+        label  = _CAT_NAMES[c]
+
+    counts = [int((cats == c).sum()) for c in range(len(_CAT_COLORS))]
+    print(f"[ColorCycle] mode {mode} — {label}")
+    print(f"  face counts: " +
+          ", ".join(f"cat{c}={counts[c]}" for c in range(len(_CAT_COLORS))))
+
+    exp = np.repeat(colors, 3, axis=0).astype(np.float32)
+    _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[3], exp)

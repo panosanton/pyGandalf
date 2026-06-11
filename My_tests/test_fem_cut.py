@@ -96,6 +96,8 @@ def main():
                         help='CG solver iterations (default: 20; increase for larger/stiffer meshes)')
     parser.add_argument('--tet_scale', type=float, default=1.0,
                         help='Interior tet size relative to surface (default: 1.0; try 5-20 for fewer tets)')
+    parser.add_argument('--debug-colors', action='store_true', default=False,
+                        help='Enable per-face debug colors (green/blue/red) after cut')
     args = parser.parse_args()
 
     mesh_name    = args.mesh
@@ -126,12 +128,17 @@ def main():
     OpenGLTextureLib().build('white_texture', TextureData(
         image_bytes=0xffffffff.to_bytes(4, byteorder='big'), width=1, height=1))
 
-    OpenGLShaderLib().build('debug_mesh',
-        SHADERS_PATH / 'opengl' / 'lit_blinn_phong_debug.vs',
-        SHADERS_PATH / 'opengl' / 'lit_blinn_phong_debug.fs')
+    if args.debug_colors:
+        OpenGLShaderLib().build('mesh_shader',
+            SHADERS_PATH / 'opengl' / 'lit_blinn_phong_debug.vs',
+            SHADERS_PATH / 'opengl' / 'lit_blinn_phong_debug.fs')
+    else:
+        OpenGLShaderLib().build('mesh_shader',
+            SHADERS_PATH / 'opengl' / 'lit_blinn_phong.vs',
+            SHADERS_PATH / 'opengl' / 'lit_blinn_phong.fs')
 
     OpenGLMaterialLib().build('M_Sphere', MaterialData(
-        'debug_mesh', ['white_texture'], glm.vec4(0.3, 0.5, 0.8, 1.0), 1.0))
+        'mesh_shader', ['white_texture'], glm.vec4(0.3, 0.5, 0.8, 1.0), 1.0))
 
     print(f"Generating tetrahedral mesh: {mesh_file}.obj ...")
     tet_mesh = MeshLib().build_tetrahedral(
@@ -160,7 +167,9 @@ def main():
     scene.add_component(sphere, LinkComponent(root))
     scene.add_component(sphere, StaticMeshComponent(
         'sphere_surface',
-        attributes=[tet_mesh.vertices.copy(), initial_normals, texcoords, initial_colors],
+        attributes=([tet_mesh.vertices.copy(), initial_normals, texcoords, initial_colors]
+                    if args.debug_colors else
+                    [tet_mesh.vertices.copy(), initial_normals, texcoords]),
         indices=surface_indices,
     ))
     scene.add_component(sphere, MaterialComponent('M_Sphere'))
@@ -196,7 +205,7 @@ def main():
 
     taichi_comp.cut_plane_origin  = origin.tolist()
     taichi_comp.cut_plane_normal  = normal.tolist()
-    taichi_comp.hide_wound_faces  = False
+    taichi_comp.hide_wound_faces  = True
     scene.add_component(sphere, taichi_comp)
 
     scene.add_component(light, InfoComponent('light'))

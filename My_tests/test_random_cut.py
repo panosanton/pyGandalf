@@ -168,6 +168,7 @@ def main():
     )
     taichi_comp.cut_plane_origin = origin.tolist()
     taichi_comp.cut_plane_normal = normal.tolist()
+    taichi_comp.hide_wound_faces = True
     scene.add_component(mesh_e, taichi_comp)
 
     scene.add_component(light, InfoComponent('light'))

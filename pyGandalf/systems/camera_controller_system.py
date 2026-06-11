@@ -65,6 +65,10 @@ class CameraControllerSystem(System):
                 transform.translation -= camera_controller.up * velocity
             if InputManager().get_key_down(glfw.KEY_E):
                 transform.translation += camera_controller.up * velocity
+            if InputManager().get_key_down(glfw.KEY_SPACE):
+                transform.translation += camera_controller.up * velocity
+            if InputManager().get_key_down(glfw.KEY_LEFT_SHIFT):
+                transform.translation -= camera_controller.up * velocity
 
         def on_mouse_move(x, y, width, height) -> None:
             if InputManager().get_key_down(glfw.MOUSE_BUTTON_2) and camera.primary:
