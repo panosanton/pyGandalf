@@ -258,11 +258,17 @@ class TaichiSimulationComponent(Component):
         self._wound_faces_by_dist = []   # [(travel_dist:float, face:np.ndarray(3,))]
         self._wound_face_ptr      = 0    # pointer into _wound_faces_by_dist
 
+        # Collar tet debug visualization (C key)
+        self._collar_tet_face_offset = 0   # start index in _all_render_faces
+        self._n_collar_tet_faces     = 0   # number of collar tet faces appended
+        self._show_collar_tets       = False
+
         # Physics pause (P key) — cut and blade still advance when paused
         self.sim_paused = False
 
-        # Rendering option
+        # Rendering options
         self.split_disc_verts = split_disc_verts  # duplicate rim verts for correct disc/collar normals
+        self.use_culling      = False              # GL backface culling; off by default for cut debugging
 
         # Set after a cut — used for correct normal computation on the cut mesh.
         self._n_orig:            int        = None  # vertex count before splitting
@@ -437,18 +443,63 @@ class TaichiSimulationSystem(System):
             _apply_color_cycle(comp, mesh_comp)
         self._v_prev = v_now
 
+        # --- T key: toggle collar tet face overlay ---
+        t_now = InputManager().get_key_down(glfw.KEY_T)
+        if t_now and not getattr(self, '_t_prev', False):
+            if comp._n_collar_tet_faces > 0:
+                comp._show_collar_tets = not comp._show_collar_tets
+                hide_wound = getattr(comp, 'hide_wound_faces', False)
+                wound_vis  = 0 if hide_wound else comp._wound_face_ptr
+
+                # Recolor outer faces that belong to collar tets.
+                YELLOW = np.array([1.0, 0.85, 0.0], dtype=np.float32)
+                face_colors = comp._debug_colors.copy()
+                if comp._show_collar_tets and comp._collar_outer_mask is not None:
+                    face_colors[:comp._n_outer_faces][comp._collar_outer_mask] = YELLOW
+                # (off: _debug_colors already has original colors, no change needed)
+
+                if len(mesh_comp.buffers) > 3:
+                    exp_colors = np.repeat(face_colors, 3, axis=0).astype(np.float32)
+                    gl.glBindVertexArray(mesh_comp.render_pipeline)
+                    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, mesh_comp.buffers[3])
+                    gl.glBufferData(gl.GL_ARRAY_BUFFER, exp_colors.nbytes, exp_colors,
+                                    gl.GL_DYNAMIC_DRAW)
+                    gl.glBindVertexArray(0)
+
+                # Update index buffer: outer + collar tet appended faces (skip wound).
+                if comp._show_collar_tets:
+                    outer_idx  = np.arange(comp._n_outer_faces * 3, dtype=np.uint32)
+                    c_start    = comp._collar_tet_face_offset * 3
+                    collar_idx = np.arange(c_start, c_start + comp._n_collar_tet_faces * 3,
+                                           dtype=np.uint32)
+                    flat_idx   = np.concatenate([outer_idx, collar_idx])
+                else:
+                    flat_idx = np.arange((comp._n_outer_faces + wound_vis) * 3,
+                                         dtype=np.uint32)
+                gl.glBindVertexArray(mesh_comp.render_pipeline)
+                gl.glBindBuffer(gl.GL_ELEMENT_ARRAY_BUFFER, mesh_comp.index_buffer)
+                gl.glBufferData(gl.GL_ELEMENT_ARRAY_BUFFER, flat_idx.nbytes, flat_idx,
+                                gl.GL_DYNAMIC_DRAW)
+                gl.glBindVertexArray(0)
+                n_yellow = int(comp._collar_outer_mask.sum()) if comp._collar_outer_mask is not None else 0
+                print(f"[CollarTets] {'ON' if comp._show_collar_tets else 'OFF'} — "
+                      f"{n_yellow} outer faces + {comp._n_collar_tet_faces} tet faces yellow")
+            else:
+                print("[CollarTets] No collar tet faces — cut not done yet?")
+        self._t_prev = t_now
+
         # --- Z key: toggle wireframe (surface edges only) ---
         z_now = InputManager().get_key_down(glfw.KEY_Z)
         if z_now and not getattr(self, '_z_prev', False):
             comp._wireframe = not getattr(comp, '_wireframe', False)
             print(f"[Wire] {'ON' if comp._wireframe else 'OFF'}")
         self._z_prev = z_now
-        if getattr(comp, '_wireframe', False):
-            gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_LINE)
-            gl.glDisable(gl.GL_CULL_FACE)
-        else:
-            gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
+        gl.glPolygonMode(gl.GL_FRONT_AND_BACK,
+                         gl.GL_LINE if getattr(comp, '_wireframe', False) else gl.GL_FILL)
+        if comp.use_culling:
             gl.glEnable(gl.GL_CULL_FACE)
+        else:
+            gl.glDisable(gl.GL_CULL_FACE)
 
         # --- Simulation sub-steps (via SpringMassMethod — handles ramp internally) ---
         t0 = time.perf_counter()
@@ -1228,14 +1279,62 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     all_render_faces = (np.vstack([outer_faces, wound_arr])
                         if len(wound_arr) > 0 else outer_faces.copy())
 
+    # --- Collar tet faces for debug visualization (T key) ---
+    # Collect all 4 faces of every tet that touches the cut plane in any way:
+    #   - intersection verts (n_orig <= v < n_split): created at edge-plane crossings
+    #   - seam verts in above tets (v in shared_list, < n_orig): original verts with dist=0
+    #   - seam dup verts in below tets (v >= n_split): remapped copies of shared_list
+    seam_arr = np.array(shared_list, dtype=np.int32) if len(shared_list) > 0 else np.array([], dtype=np.int32)
+    is_inter = (all_tets >= n_orig) & (all_tets < n_split)
+    is_seam  = np.isin(all_tets, seam_arr) if len(seam_arr) > 0 else np.zeros_like(is_inter)
+    is_dup   = all_tets >= n_split
+    # True collar tets: touch the cut plane AND have at least one original SURFACE vert.
+    # Interior split tets also have original verts (< n_orig) but they are interior verts,
+    # not surface verts. Only tets bridging the surface to the cut plane are true collar tets.
+    orig_surf_verts_arr = np.array(sorted({v for tri in orig_surf_set
+                                           for v in tri}), dtype=np.int32)
+    has_cut_plane    = np.any(is_inter | is_seam | is_dup, axis=1)
+    has_surf_orig    = np.any(np.isin(all_tets, orig_surf_verts_arr), axis=1)
+    collar_tet_mask  = has_cut_plane & has_surf_orig
+    collar_tets     = all_tets[collar_tet_mask]
+    TET_FACE_TRIPLES = [(0,1,2), (0,1,3), (0,2,3), (1,2,3)]
+    if len(collar_tets) > 0:
+        collar_tet_faces = np.array(
+            [[collar_tets[t, i], collar_tets[t, j], collar_tets[t, k]]
+             for t in range(len(collar_tets)) for i, j, k in TET_FACE_TRIPLES],
+            dtype=np.uint32)
+    else:
+        collar_tet_faces = np.zeros((0, 3), dtype=np.uint32)
+
+    # Build a set of collar tet face keys (sorted triples) for fast outer-face lookup.
+    collar_face_key_set = {tuple(sorted(f.tolist())) for f in collar_tet_faces}
+
+    # Mark which outer faces belong to collar tets -- these get recolored yellow on T-key.
+    collar_outer_mask = np.array(
+        [tuple(sorted(f.tolist())) in collar_face_key_set for f in outer_faces],
+        dtype=bool)
+
+    collar_tet_face_offset = len(all_render_faces)
+    if len(collar_tet_faces) > 0:
+        all_render_faces = np.vstack([all_render_faces, collar_tet_faces])
+
+    comp._collar_tet_face_offset = collar_tet_face_offset
+    comp._n_collar_tet_faces     = len(collar_tet_faces)
+    comp._collar_outer_mask      = collar_outer_mask   # (n_outer,) bool
+    comp._show_collar_tets       = False
+
     comp.surface_indices    = outer_faces.copy()   # original indices for normal computation
     comp._all_render_faces  = all_render_faces      # full set for per-frame expansion
     comp._n_outer_faces     = len(outer_faces)
     comp._face_expanded     = True
 
-    # Per-face debug colors for the full set (wound faces pre-colored even while hidden).
+    # Per-face debug colors: outer/wound as usual, collar tet faces in yellow.
     face_colors        = _compute_debug_face_colors(all_render_faces, n_orig)
+    if len(collar_tet_faces) > 0:
+        face_colors[collar_tet_face_offset:] = [1.0, 0.85, 0.0]
     comp._debug_colors = face_colors.copy()
+    print(f"[CollarTets] {len(collar_tets):,} collar tets, "
+          f"{int(collar_outer_mask.sum()):,} outer faces touch collar (T to show)")
 
     # Face categories for V-key color cycling (requires --debug-colors shader).
     comp._face_categories  = _compute_face_categories(

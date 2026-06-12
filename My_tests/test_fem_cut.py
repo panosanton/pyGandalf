@@ -98,6 +98,8 @@ def main():
                         help='Interior tet size relative to surface (default: 1.0; try 5-20 for fewer tets)')
     parser.add_argument('--debug-colors', action='store_true', default=False,
                         help='Enable per-face debug colors (green/blue/red) after cut')
+    parser.add_argument('--culling', action='store_true', default=False,
+                        help='Enable GL backface culling (default: off)')
     args = parser.parse_args()
 
     mesh_name    = args.mesh
@@ -206,6 +208,8 @@ def main():
     taichi_comp.cut_plane_origin  = origin.tolist()
     taichi_comp.cut_plane_normal  = normal.tolist()
     taichi_comp.hide_wound_faces  = False
+    taichi_comp.use_culling       = args.culling
+    # taichi_comp.use_culling       = False
     scene.add_component(sphere, taichi_comp)
 
     scene.add_component(light, InfoComponent('light'))
