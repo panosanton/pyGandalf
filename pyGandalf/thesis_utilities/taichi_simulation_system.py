@@ -277,7 +277,34 @@ class TaichiSimulationSystem(System):
         b_now = InputManager().get_key_down(glfw.KEY_B)
         if b_now and not getattr(self, '_b_prev', False):
             if not comp.blade_initialized:
-                _setup_progressive_cut(comp, mesh_comp)
+                # ----- profiling wrapper around the full B-press handler -----
+                import cProfile, pstats, io
+                import taichi as ti
+                _prof = cProfile.Profile()
+                _t0 = time.perf_counter()
+                _prof.enable()
+                try:
+                    _setup_progressive_cut(comp, mesh_comp)
+                finally:
+                    _prof.disable()
+                    _dt = time.perf_counter() - _t0
+                    _s = io.StringIO()
+                    pstats.Stats(_prof, stream=_s).sort_stats('cumulative').print_stats(30)
+                    print("=" * 70, flush=True)
+                    print(f"[PROFILE] _setup_progressive_cut wall time: {_dt:.3f}s", flush=True)
+                    print("[PROFILE] top 30 by cumulative time:", flush=True)
+                    print("=" * 70, flush=True)
+                    print(_s.getvalue(), flush=True)
+                    try:
+                        ti.sync()
+                        print("=" * 70, flush=True)
+                        print("[PROFILE] Taichi kernel profile (cumulative since startup):", flush=True)
+                        print("=" * 70, flush=True)
+                        ti.profiler.print_kernel_profiler_info()
+                        ti.profiler.clear_kernel_profiler_info()
+                    except Exception as _e:
+                        print(f"[TaichiProfile] unavailable: {_e}", flush=True)
+                # -------------------------------------------------------------
             else:
                 comp.blade_is_active = not comp.blade_is_active
                 print(f"[Blade] {'Resumed' if comp.blade_is_active else 'Paused'}")
@@ -390,7 +417,18 @@ class TaichiSimulationSystem(System):
         if step_one:
             comp._step_one_frame = False
         if not comp.sim_paused or step_one:
-            comp.method.step(comp.time_step)
+            # Time the first few step() calls after a cut to see first-touch JIT cost.
+            _n = getattr(comp, '_step_timing_left', 0)
+            if _n > 0:
+                import taichi as ti
+                _t = time.perf_counter()
+                comp.method.step(comp.time_step)
+                ti.sync()
+                _dt = time.perf_counter() - _t
+                print(f"[STEP] post-cut step #{6 - _n}: {_dt*1000:.1f} ms", flush=True)
+                comp._step_timing_left = _n - 1
+            else:
+                comp.method.step(comp.time_step)
 
             # Force audit: spring-mass only (uses _spring_forces kernel).
             if (comp._pending_force_audit and comp._n_orig is not None
@@ -409,7 +447,11 @@ class TaichiSimulationSystem(System):
                 comp._pending_force_audit = False
         t1 = time.perf_counter()
 
-        new_positions = comp.simulator.positions.to_numpy()
+        # Route through the method API: FEM allocates Taichi fields at capacity,
+        # so the raw `simulator.positions.to_numpy()` returns the full capacity
+        # with zero-padded slots in [n_verts, capacity). get_positions() slices
+        # to active size for both backends.
+        new_positions = comp.method.get_positions()
         t2 = time.perf_counter()
 
         if comp._disc_split_phys_idx is not None and len(comp._disc_split_phys_idx) > 0:
@@ -465,13 +507,17 @@ def _apply_poke(comp: TaichiSimulationComponent):
     """Apply a downward impulse to the top 5% of vertices."""
     if comp.simulator is None:
         return
-    pos = comp.simulator.positions.to_numpy()
+    # Active-size positions for thresholding (FEM fields are capacity-allocated).
+    pos = comp.method.get_positions()
+    n_active = pos.shape[0]
     y = pos[:, 1]
     poke_threshold = y.max() - (y.max() - y.min()) * 0.05
-    fixed = comp.simulator._fixed.to_numpy()
+    fixed = comp.simulator._fixed.to_numpy()[:n_active]
     poke_mask = (y >= poke_threshold) & (fixed == 0)
+    # Read full-capacity velocities, modify only the active slice via a view,
+    # then write the full array back.
     vels = comp.simulator.velocities.to_numpy()
-    vels[poke_mask, 1] -= comp.poke_speed
+    vels[:n_active][poke_mask, 1] -= comp.poke_speed
     comp.simulator.velocities.from_numpy(vels.astype(np.float32))
     print(f"[Poke] Applied {comp.poke_speed} m/s downward to {int(poke_mask.sum())} verts")
 
@@ -490,12 +536,15 @@ def _cut_topology(comp: TaichiSimulationComponent,
     simulator / tetrahedra / fixed_mask back to comp.
     Returns the same 11-tuple callers expect, or None on failure.
     """
+    # Active-size views: FEM allocates Taichi fields at capacity, so we must
+    # strip the zero-padded tail before handing arrays to topology code.
+    n_active = getattr(comp.simulator, 'n_verts', comp.simulator.positions.shape[0])
     result = _cut_topology_physics(
         comp.current_tetrahedra,
-        comp.simulator.positions.to_numpy(),
-        comp.simulator.velocities.to_numpy(),
-        comp.simulator._masses.to_numpy(),
-        comp.simulator._fixed.to_numpy(),
+        comp.simulator.positions.to_numpy()[:n_active],
+        comp.simulator.velocities.to_numpy()[:n_active],
+        comp.simulator._masses.to_numpy()[:n_active],
+        comp.simulator._fixed.to_numpy()[:n_active],
         comp.stiffness,
         np.array(comp.gravity, dtype=np.float32),
         origin, normal,
@@ -795,8 +844,19 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     _realloc_gpu_buffers(mesh_comp, exp_pos, exp_norm, exp_tex, trivial_outer,
                          colors=exp_colors)
 
-    comp.blade_initialized = True
-    comp.blade_is_active   = True
+    comp.blade_initialized  = True
+    comp.blade_is_active    = True
+    comp._step_timing_left  = 5  # time the first 5 step() calls to expose first-touch JIT
+
+    # Warm-up step: trigger first-touch JIT of the FEM per-frame kernels while
+    # the user is still inside the setup hitch. Without this the camera freezes
+    # for ~1-5s on the first interactive frame after setup_cut returns.
+    import taichi as ti
+    _t = time.perf_counter()
+    comp.method.step(comp.time_step)
+    ti.sync()
+    print(f"[Blade] JIT warm-up step: {(time.perf_counter() - _t)*1000:.1f} ms", flush=True)
+
     print(f"[Blade] Setup complete — {len(seam_pairs):,} seam pairs, "
           f"blade starts at travel={comp.blade_travel:.4f}")
     print("[Blade] Press B to pause / resume.")
@@ -906,8 +966,9 @@ def _check_disc_parallelism(comp: TaichiSimulationComponent,
     n_orig   = comp._n_orig
     cut_n    = comp._cut_normal
 
-    # Current render positions (physics + rendering disc duplicates)
-    sim_pos = comp.simulator.positions.to_numpy()
+    # Current render positions (physics + rendering disc duplicates).
+    # Use method API so FEM capacity padding is stripped.
+    sim_pos = comp.method.get_positions()
     if comp._disc_split_phys_idx is not None and len(comp._disc_split_phys_idx) > 0:
         render_pos = np.vstack([sim_pos, sim_pos[comp._disc_split_phys_idx]])
     else:

@@ -620,8 +620,10 @@ class FEMMethod(SimulationMethod):
             return
 
         f   = self._debug_frames_since_cut
-        pos = self._simulator.positions.to_numpy()
-        vel = self._simulator.velocities.to_numpy()
+        n_v = self._simulator.n_verts
+        pos = self._simulator.positions.to_numpy()[:n_v]
+        vel = self._simulator.velocities.to_numpy()[:n_v]
+        fixed_mask = fixed_mask[:n_v]
 
         # --- fixed vert check (constraint) ---
         if n_fixed > 0:
@@ -694,10 +696,12 @@ class FEMMethod(SimulationMethod):
         self._opening_ramp_queue = active
 
     def get_positions(self) -> np.ndarray:
-        return self._simulator.positions.to_numpy()
+        n = self._simulator.n_verts
+        return self._simulator.positions.to_numpy()[:n]
 
     def get_velocities(self) -> np.ndarray:
-        return self._simulator.velocities.to_numpy()
+        n = self._simulator.n_verts
+        return self._simulator.velocities.to_numpy()[:n]
 
     def set_velocities(self, indices: np.ndarray, velocities: np.ndarray) -> None:
         vels = self._simulator.velocities.to_numpy()
@@ -705,8 +709,6 @@ class FEMMethod(SimulationMethod):
         self._simulator.velocities.from_numpy(vels.astype(np.float32))
 
     def setup_cut(self, cut_normal, cut_origin, blade_travel_dir) -> bool:
-        from pyGandalf.thesis_utilities.fem_simulator import _FEMSimulator
-
         normal    = np.array(cut_normal,       dtype=np.float32)
         origin    = np.array(cut_origin,       dtype=np.float32)
         blade_dir = np.array(blade_travel_dir, dtype=np.float32)
@@ -715,17 +717,23 @@ class FEMMethod(SimulationMethod):
 
         gravity = np.array(self._params.get('gravity', [0.0, 0.0, 0.0]), dtype=np.float32)
 
+        # Active-size views of the current simulator state. Fields are
+        # capacity-allocated, so slicing strips zeroed padding before handing
+        # arrays to topology code that assumes shape == vertex_count.
+        n_active = self._simulator.n_verts
+        cur_pos    = self._simulator.positions.to_numpy()[:n_active]
+        cur_vel    = self._simulator.velocities.to_numpy()[:n_active]
+        cur_masses = self._simulator._masses.to_numpy()[:n_active]
+        cur_fixed  = self._simulator._fixed.to_numpy()[:n_active]
+
         # Check 4a: fixed count before cut
-        n_fixed_before = int(self._simulator._fixed.to_numpy().sum())
+        n_fixed_before = int(cur_fixed.sum())
         _pre_force_str = f"{self._debug_pre_cut_force:.4f}" if self._debug_pre_cut_force is not None else "N/A"
         print(f"[DEBUG 4] Fixed verts before cut: {n_fixed_before}  (pre-cut max force on fixed: {_pre_force_str})", flush=True)
 
         result = _cut_topology_physics(
             self._current_tets,
-            self._simulator.positions.to_numpy(),
-            self._simulator.velocities.to_numpy(),
-            self._simulator._masses.to_numpy(),
-            self._simulator._fixed.to_numpy(),
+            cur_pos, cur_vel, cur_masses, cur_fixed,
             0.0,          # stiffness unused — FEM doesn't need this for topology
             gravity, origin, normal,
             build_simulator=False,  # FEM discards new_sim; skip the build cost
@@ -766,22 +774,23 @@ class FEMMethod(SimulationMethod):
               f"cut_adj={_n_cut_adj} min_cut_vol={_min_cut_vol:.2e} "
               f"vol_thresh={_vol_thresh:.0e} removed={_n_removed}", flush=True)
 
-        new_fem = _FEMSimulator(
-            vertices      = final_pos,
-            tetrahedra    = fem_tets,
-            fixed_mask    = final_fixed,
-            young_modulus = float(self._params.get('young_modulus', 5e4)),
-            poisson_ratio = float(self._params.get('poisson_ratio', 0.4)),
-            density       = float(self._params.get('density', 1000.0)),
-            gravity       = gravity,
-            damping       = float(self._params.get('damping', 1.0)),
+        # Reuse the same _FEMSimulator across cuts: re-upload mesh state into
+        # the existing Taichi fields so kernel SNode IDs stay stable. This is
+        # the main speedup -- a fresh _FEMSimulator forces ~4s of JIT recompile
+        # on the first step() after the cut.
+        self._simulator.rebuild_topology(
+            vertices   = final_pos,
+            tetrahedra = fem_tets,
+            fixed_mask = final_fixed,
+            velocities = final_vel,
         )
-        new_fem.velocities.from_numpy(final_vel.astype(np.float32))
+        new_fem = self._simulator
 
         # Detect any verts orphaned by the filter (zero mass) and build kinematic constraints.
         # With the cut-adjacent-only filter, orig-mesh verts should retain at least one tet.
         # Only new-cut verts (>= n_orig) near a very shallow cut could become orphans here.
-        _masses_np  = new_fem._masses.to_numpy()
+        n_active = new_fem.n_verts
+        _masses_np  = new_fem._masses.to_numpy()[:n_active]
         _zero_mask  = _masses_np == 0.0
         _vert_remap  = {}
         _n_fallback  = 0
@@ -848,10 +857,13 @@ class FEMMethod(SimulationMethod):
             _resolve(_zero_side == -1, _below_pos,    _below_idx_arr)
             _resolve(_zero_side ==  0, _notinter_pos, _notinter_idx_arr)
 
-            _masses_np2  = new_fem._masses.to_numpy()
-            _min_m       = float(_masses_np2[~_zero_mask].min()) * 1e-4
-            _masses_np2[_zero_mask] = _min_m
-            new_fem._masses.from_numpy(_masses_np2.astype(np.float32))
+            # _masses is capacity-sized; modify the active slice in place via a
+            # view, then re-upload the full capacity array.
+            _masses_full = new_fem._masses.to_numpy()
+            _active_view = _masses_full[:n_active]
+            _min_m       = float(_active_view[~_zero_mask].min()) * 1e-4
+            _active_view[_zero_mask] = _min_m
+            new_fem._masses.from_numpy(_masses_full.astype(np.float32))
             _n_orig_orphans  = int((_zero_idx < n_orig).sum())
             _n_fixed_masters = int(sum(final_fixed[m] for m in _vert_remap.values()))
             print(f"[FEM] {len(_zero_idx)} orphans: {_n_orig_orphans} orig-mesh  "
@@ -952,7 +964,7 @@ class FEMMethod(SimulationMethod):
 
     @property
     def vertex_count(self) -> int:
-        return self._simulator.positions.shape[0]
+        return self._simulator.n_verts
 
     @property
     def n_orig(self) -> int | None:
