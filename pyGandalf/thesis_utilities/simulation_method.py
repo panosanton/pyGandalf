@@ -728,6 +728,7 @@ class FEMMethod(SimulationMethod):
             self._simulator._fixed.to_numpy(),
             0.0,          # stiffness unused — FEM doesn't need this for topology
             gravity, origin, normal,
+            build_simulator=False,  # FEM discards new_sim; skip the build cost
         )
         if result is None:
             return False
@@ -805,36 +806,47 @@ class FEMMethod(SimulationMethod):
             _vert_cdots = _sum_f / np.where(_cnt_f > 0, _cnt_f, 1)
             _nz_cdots   = _vert_cdots[_nonzero_idx]
 
-            for _v in _zero_idx:
-                _vi = int(_v)
-                # Orphan half from the topology split structure -- no centroid needed:
-                # - v >= n_split:        seam-dup; remap puts them only in new_below_tets
-                # - n_orig <= v < n_split: shared_list; kept as-is in above_tets after remap
-                # - v < n_orig:          original vert; position dot is reliable
-                if _vi >= n_split:
-                    _cdot = -1.0
-                elif _vi >= n_orig:
-                    _cdot =  1.0
+            # Side label per orphan: 1 = above, -1 = below, 0 = on-plane (use _not_inter only).
+            # Same rules as the per-vert branch above, but vectorized across all orphans.
+            from scipy.spatial import cKDTree
+            _zero_side = np.zeros(len(_zero_idx), dtype=np.int8)
+            _zero_side[_zero_idx >= n_split] = -1
+            _zero_side[(_zero_idx >= n_orig) & (_zero_idx < n_split)] = 1
+            _orig_pick = _zero_idx < n_orig
+            if _orig_pick.any():
+                _dot = (final_pos[_zero_idx[_orig_pick]] - origin) @ normal
+                _zero_side[_orig_pick] = np.where(_dot > 0, 1,
+                                          np.where(_dot < 0, -1, 0)).astype(np.int8)
+
+            _above_mask       = _not_inter & (_nz_cdots > 0)
+            _below_mask       = _not_inter & (_nz_cdots < 0)
+            _above_pos        = _nz_pos[_above_mask];    _above_idx_arr    = _nonzero_idx[_above_mask]
+            _below_pos        = _nz_pos[_below_mask];    _below_idx_arr    = _nonzero_idx[_below_mask]
+            _notinter_pos     = _nz_pos[_not_inter];     _notinter_idx_arr = _nonzero_idx[_not_inter]
+
+            def _resolve(group_mask, primary_pos, primary_idx_arr):
+                nonlocal _n_fallback
+                if not group_mask.any():
+                    return
+                orphan_v   = _zero_idx[group_mask]
+                orphan_pos = final_pos[orphan_v]
+                if len(primary_pos) > 0:
+                    _, j  = cKDTree(primary_pos).query(orphan_pos)
+                    masters = primary_idx_arr[j]
                 else:
-                    _cdot = float(np.dot(final_pos[_vi] - origin, normal))
+                    _n_fallback += int(group_mask.sum())
+                    if len(_notinter_pos) > 0:
+                        _, j  = cKDTree(_notinter_pos).query(orphan_pos)
+                        masters = _notinter_idx_arr[j]
+                    else:
+                        _, j  = cKDTree(_nz_pos).query(orphan_pos)
+                        masters = _nonzero_idx[j]
+                for _v, _m in zip(orphan_v, masters):
+                    _vert_remap[int(_v)] = int(_m)
 
-                if _cdot > 0:
-                    _cand_mask = _not_inter & (_nz_cdots > 0)
-                elif _cdot < 0:
-                    _cand_mask = _not_inter & (_nz_cdots < 0)
-                else:
-                    _cand_mask = _not_inter
-
-                if not _cand_mask.any():
-                    _n_fallback += 1
-                    _cand_mask = _not_inter  # relax side constraint
-                if not _cand_mask.any():
-                    _cand_mask = np.ones(len(_nonzero_idx), dtype=bool)
-
-                _cand_pos = _nz_pos[_cand_mask]
-                _cand_idx = _nonzero_idx[_cand_mask]
-                _dists    = np.linalg.norm(_cand_pos - final_pos[_v], axis=1)
-                _vert_remap[int(_v)] = int(_cand_idx[np.argmin(_dists)])
+            _resolve(_zero_side ==  1, _above_pos,    _above_idx_arr)
+            _resolve(_zero_side == -1, _below_pos,    _below_idx_arr)
+            _resolve(_zero_side ==  0, _notinter_pos, _notinter_idx_arr)
 
             _masses_np2  = new_fem._masses.to_numpy()
             _min_m       = float(_masses_np2[~_zero_mask].min()) * 1e-4
@@ -845,37 +857,6 @@ class FEMMethod(SimulationMethod):
             print(f"[FEM] {len(_zero_idx)} orphans: {_n_orig_orphans} orig-mesh  "
                   f"{len(_zero_idx) - _n_orig_orphans} new-cut  "
                   f"fixed_masters={_n_fixed_masters}  fallback={_n_fallback}", flush=True)
-
-            # Verify masters using tet centroids in fem_tets (the filtered set).
-            # This checks whether each assigned master is truly on the expected half.
-            _m2t_fem: dict = defaultdict(list)
-            for _ti, _tet in enumerate(fem_tets):
-                for _vi in _tet:
-                    _m2t_fem[int(_vi)].append(_ti)
-            _nc, _nw, _nu = 0, 0, 0
-            for _v, _m in _vert_remap.items():
-                _vi = int(_v)
-                if _vi >= n_split:
-                    _expected_below = True
-                elif _vi >= n_orig:
-                    _expected_below = False
-                else:
-                    _expected_below = float(np.dot(final_pos[_vi] - origin, normal)) < 0
-                _m_tets = _m2t_fem.get(int(_m), [])
-                if not _m_tets:
-                    _nu += 1
-                    continue
-                _m_cdot = float(np.dot(
-                    final_pos[fem_tets[_m_tets]].mean(axis=1).mean(axis=0) - origin, normal
-                ))
-                _master_below = _m_cdot < -0.01
-                _master_above = _m_cdot >  0.01
-                if (_expected_below and _master_above) or (not _expected_below and _master_below):
-                    _nw += 1
-                else:
-                    _nc += 1
-            print(f"[MASTER] side check (via fem_tets centroid): "
-                  f"correct={_nc}  wrong={_nw}  unknown={_nu}", flush=True)
 
         self._orphan_constraints = {
             orphan: (master, final_pos[orphan] - final_pos[master])

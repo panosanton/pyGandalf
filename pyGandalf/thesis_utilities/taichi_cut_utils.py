@@ -37,7 +37,7 @@ import numpy as np
 
 import OpenGL.GL as gl
 
-ti.init(arch=ti.gpu, log_level=ti.WARN)
+ti.init(arch=ti.gpu, log_level=ti.WARN, kernel_profiler=True, offline_cache=True)
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +206,7 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
     ext_positions: list = [p for p in positions]
     edge_cache:    dict = {}
     inter_data:    list = []
-    above_list:    list = []
+    above_list:    list = []   # only crossing-tet sub-tets; non-crossing stitched in below
     below_list:    list = []
     phantom_above_face_keys: set = set()
 
@@ -214,8 +214,11 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
     above_mask = np.all(tet_dists >= 0, axis=1)
     below_mask = np.all(tet_dists <= 0, axis=1)
 
-    above_list.extend(tetrahedra[above_mask].tolist())
-    below_list.extend(tetrahedra[below_mask].tolist())
+    # Keep non-crossing tets as numpy arrays. The crossing-tet split loop below
+    # appends to above_list/below_list; we concatenate at the end. Skipping the
+    # tolist() round trip on these (often 100k+ rows) avoids ~100ms.
+    above_nocross = tetrahedra[above_mask]
+    below_nocross = tetrahedra[below_mask]
 
     def iv(vi: int, vj: int) -> int:
         key = (min(vi, vj), max(vi, vj))
@@ -284,24 +287,27 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
                     [a0,a1,p00],[a0,a1,p11],
                 ])
 
-    new_pos   = np.array(ext_positions, dtype=np.float32)
-    above_arr = (np.array(above_list, dtype=np.int32)
-                 if above_list else np.zeros((0, 4), dtype=np.int32))
-    below_arr = (np.array(below_list, dtype=np.int32)
-                 if below_list else np.zeros((0, 4), dtype=np.int32))
+    new_pos       = np.array(ext_positions, dtype=np.float32)
+    above_cross   = (np.array(above_list, dtype=np.int32)
+                     if above_list else np.zeros((0, 4), dtype=np.int32))
+    below_cross   = (np.array(below_list, dtype=np.int32)
+                     if below_list else np.zeros((0, 4), dtype=np.int32))
+    above_arr     = np.vstack([above_nocross.astype(np.int32), above_cross])
+    below_arr     = np.vstack([below_nocross.astype(np.int32), below_cross])
     return new_pos, above_arr, below_arr, inter_data, phantom_above_face_keys
 
 
 def _cut_topology_physics(
-        current_tets: np.ndarray,
-        positions:    np.ndarray,
-        velocities:   np.ndarray,
-        masses:       np.ndarray,
-        fixed:        np.ndarray,
-        stiffness:    float,
-        gravity:      np.ndarray,
-        origin:       np.ndarray,
-        normal:       np.ndarray):
+        current_tets:    np.ndarray,
+        positions:       np.ndarray,
+        velocities:      np.ndarray,
+        masses:          np.ndarray,
+        fixed:           np.ndarray,
+        stiffness:       float,
+        gravity:         np.ndarray,
+        origin:          np.ndarray,
+        normal:          np.ndarray,
+        build_simulator: bool = True):
     """
     Pure topology-change computation — no Component dependency.
 
@@ -321,20 +327,22 @@ def _cut_topology_physics(
     face_combos = np.array([[0,1,2],[0,1,3],[0,2,3],[1,2,3]], dtype=np.int32)
     all_orig_f  = current_tets[:, face_combos].reshape(-1, 3)
     all_orig_s  = np.sort(all_orig_f, axis=1)
-    _, _inv, _cnt = np.unique(all_orig_s, axis=0,
-                               return_inverse=True, return_counts=True)
+    # Pack each (a, b, c) into one int64 (21 bits per slot -- safe for any mesh
+    # with <2M verts) so unique runs on a 1D array. axis=0 on 2D is ~10x slower.
+    assert int(all_orig_s.max()) < (1 << 21), "vertex index too large to pack"
+    _keys_o = ((all_orig_s[:, 0].astype(np.int64) << 42)
+             | (all_orig_s[:, 1].astype(np.int64) << 21)
+             |  all_orig_s[:, 2].astype(np.int64))
+    _, _inv, _cnt = np.unique(_keys_o, return_inverse=True, return_counts=True)
     orig_surf_set = {tuple(row) for row in all_orig_s[(_cnt == 1)[_inv]]}
     n_orig = len(positions)
 
     # --- Surface tet set: original tets with at least one face in orig_surf_set ---
     # Used by _split_crossed_tets to identify phantom collar faces from interior tets.
-    surface_tet_set = set()
-    for _ti in range(len(current_tets)):
-        _t = current_tets[_ti]
-        for _fc in [[0,1,2],[0,1,3],[0,2,3],[1,2,3]]:
-            if tuple(sorted([int(_t[_fc[0]]),int(_t[_fc[1]]),int(_t[_fc[2]])])) in orig_surf_set:
-                surface_tet_set.add(_ti)
-                break
+    # Vectorized: each row of all_orig_s comes from tet (i // 4), so the
+    # boundary-face mask directly gives the set of tets with a surface face.
+    _bnd_mask        = (_cnt == 1)[_inv]
+    surface_tet_set  = set(int(t) for t in np.unique(np.where(_bnd_mask)[0] // 4))
     print(f"[Cut] {len(surface_tet_set)} surface tets, "
           f"{len(current_tets) - len(surface_tet_set)} interior tets")
 
@@ -408,12 +416,13 @@ def _cut_topology_physics(
         split_fixed[new_id] = 0
 
     # --- Vertex duplication (seam) ---
-    above_vert_set = set(above_tets.flatten().tolist())
-    below_vert_set = set(below_tets.flatten().tolist())
-    # Only duplicate intersection vertices (idx >= n_orig).  Original vertices
-    # at signed_dist ~ 0 appear in both sets but must NOT be duplicated — they
-    # sit on the cut plane and should stay shared between both halves.
-    shared_list    = sorted(v for v in (above_vert_set & below_vert_set) if v >= n_orig)
+    # Vertices appearing in both halves are seam candidates. np.intersect1d
+    # returns a sorted, deduplicated array faster than building two Python sets
+    # and intersecting. Only duplicate intersection vertices (idx >= n_orig);
+    # originals at signed_dist ~ 0 appear in both halves but must stay shared.
+    _shared_all   = np.intersect1d(above_tets.ravel(), below_tets.ravel(),
+                                   assume_unique=False)
+    shared_list   = [int(v) for v in _shared_all[_shared_all >= n_orig]]
     n_shared       = len(shared_list)
     print(f"[Cut] Duplicating {n_shared} seam vertices")
 
@@ -430,27 +439,32 @@ def _cut_topology_physics(
     new_below_tets = remap[below_tets]
     all_tets       = np.vstack([above_tets, new_below_tets])
 
-    # --- Rebuild simulator ---
-    new_sim = _SpringMassSimulator(
-        vertices        = final_pos,
-        tetrahedra      = all_tets,
-        fixed_mask      = final_fixed,
-        stiffness       = stiffness,
-        gravity         = gravity,
-        per_vertex_mass = final_mass,
-    )
-    new_sim.velocities.from_numpy(final_vel.astype(np.float32))
+    # --- Rebuild simulator (skipped when caller is FEM and only wants topology) ---
+    if build_simulator:
+        new_sim = _SpringMassSimulator(
+            vertices        = final_pos,
+            tetrahedra      = all_tets,
+            fixed_mask      = final_fixed,
+            stiffness       = stiffness,
+            gravity         = gravity,
+            per_vertex_mass = final_mass,
+        )
+        new_sim.velocities.from_numpy(final_vel.astype(np.float32))
 
-    # No spring zeroing: orig->new springs are structural tet edges that are
-    # needed for mesh connectivity.  Zeroing them disconnects the disc from
-    # the hemispheres (Fix 3 mistake — verified by force audit).
-    # Collar deformation from opening velocity is physically correct elastic
-    # behaviour; reduce opening_speed if it looks too violent.
+        # No spring zeroing: orig->new springs are structural tet edges that are
+        # needed for mesh connectivity.  Zeroing them disconnects the disc from
+        # the hemispheres (Fix 3 mistake — verified by force audit).
+        # Collar deformation from opening velocity is physically correct elastic
+        # behaviour; reduce opening_speed if it looks too violent.
 
-    print(f"[Cut] Simulator: {len(final_pos):,} verts, "
-          f"{len(all_tets):,} tets, {len(new_sim._sa):,} springs")
+        print(f"[Cut] Simulator: {len(final_pos):,} verts, "
+              f"{len(all_tets):,} tets, {len(new_sim._sa):,} springs")
 
-    _print_spring_audit(new_sim._sa, new_sim._sb, new_sim._sr, new_sim._sk, n_orig)
+        _print_spring_audit(new_sim._sa, new_sim._sb, new_sim._sr, new_sim._sk, n_orig)
+    else:
+        new_sim = None
+        print(f"[Cut] Topology only: {len(final_pos):,} verts, "
+              f"{len(all_tets):,} tets (no spring-mass simulator built)")
 
     return (new_sim, final_pos, final_vel, final_mass, final_fixed,
             all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set,
@@ -680,8 +694,13 @@ def _extract_boundary_faces(tetrahedra: np.ndarray,
     all_faces        = tetrahedra[:, face_combos].reshape(-1, 3)
     all_faces_sorted = np.sort(all_faces, axis=1)
 
-    _, inverse, counts = np.unique(
-        all_faces_sorted, axis=0, return_inverse=True, return_counts=True)
+    # Pack each (a, b, c) into one int64 (21 bits per slot) so unique runs on a
+    # 1D array. axis=0 on 2D is ~10x slower (its argsort dominates the profile).
+    assert int(all_faces_sorted.max()) < (1 << 21), "vertex index too large to pack"
+    _keys = ((all_faces_sorted[:, 0].astype(np.int64) << 42)
+           | (all_faces_sorted[:, 1].astype(np.int64) << 21)
+           |  all_faces_sorted[:, 2].astype(np.int64))
+    _, inverse, counts = np.unique(_keys, return_inverse=True, return_counts=True)
 
     boundary_mask  = (counts == 1)[inverse]
     boundary_faces = all_faces[boundary_mask].copy()
@@ -960,10 +979,16 @@ def _build_springs(vertices: np.ndarray, tetrahedra: np.ndarray) -> tuple:
     edge_pairs = np.array([[0,1],[0,2],[0,3],[1,2],[1,3],[2,3]])
     all_edges  = tetrahedra[:, edge_pairs].reshape(-1, 2)
     all_edges  = np.sort(all_edges, axis=1)
-    unique_edges = np.unique(all_edges, axis=0)
 
-    sa   = unique_edges[:, 0].astype(np.int32)
-    sb   = unique_edges[:, 1].astype(np.int32)
+    # Pack each (lo, hi) pair into a single int64 so np.unique runs on a 1D
+    # array. axis=0 on 2D is a known slow path; the packed form is 5-10x faster.
+    lo = all_edges[:, 0].astype(np.int64)
+    hi = all_edges[:, 1].astype(np.int64)
+    keys = (lo << 32) | hi
+    unique_keys = np.unique(keys)
+    sa = (unique_keys >> 32).astype(np.int32)
+    sb = (unique_keys & 0xFFFFFFFF).astype(np.int32)
+
     rest = np.linalg.norm(
         vertices[sb] - vertices[sa], axis=1
     ).astype(np.float32)

@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 
 # Initialize Taichi for GPU acceleration
-ti.init(arch=ti.gpu, default_fp=ti.f32)
+ti.init(arch=ti.gpu, default_fp=ti.f32, kernel_profiler=True, offline_cache=True)
 
 class MeshInstance:
     def __init__(self, name, path, vertices, indices, normals, texcoords):
