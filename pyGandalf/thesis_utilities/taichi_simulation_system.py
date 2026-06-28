@@ -739,54 +739,13 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
           f"phantoms={_total_actual_b - _total_expected_b} "
           f"({_n_phantom_tets_b} tets with mismatches)")
 
-    # [CollarFilter] Remove extra collar faces using reconstruction check.
-    # For each collar face (has inter vert), reconstruct the original tet face:
-    # replace each inter vert with the union of its above+below endpoints.
-    # If the 3-vert reconstruction is in orig_surf_set -> genuine collar, keep.
-    # If not -> came from an interior tet face (phantom or non-conforming), remove.
-    # Collar faces come in two flavours:
-    #   above-side: contain inter verts in [n_orig, n_split).
-    #   below-side: contain seam-dup verts in [n_split, n_split + len(shared_list))
-    #               (the remap rewrote shared inter verts to dup indices).
-    # Map dup vert back to its original inter vert so reconstruction works for both.
-    _ivert_above  = {int(nid): int(vi) for nid, vi, vj, t in inter_data}
-    _ivert_below  = {int(nid): int(vj) for nid, vi, vj, t in inter_data}
-    _dup_to_inter = {n_split + i: int(shared_list[i]) for i in range(len(shared_list))}
-    _filtered_outer = []
-    _n_collar_removed_a = 0
-    _n_collar_removed_b = 0
-    for _f in outer_faces:
-        _v0, _v1, _v2 = int(_f[0]), int(_f[1]), int(_f[2])
-        _has_inter = any(n_orig <= _v < n_split for _v in (_v0, _v1, _v2))
-        _has_dup   = any(_v >= n_split          for _v in (_v0, _v1, _v2))
-        if not (_has_inter or _has_dup):
-            _filtered_outer.append(_f)   # no cut-plane vert -> not a collar face, keep
-            continue
-        _recon = set()
-        for _v in (_v0, _v1, _v2):
-            if _v >= n_split:
-                _inter = _dup_to_inter[_v]
-                _recon.add(_ivert_above.get(_inter, _inter))
-                _recon.add(_ivert_below.get(_inter, _inter))
-            elif n_orig <= _v < n_split:
-                _recon.add(_ivert_above.get(_v, _v))
-                _recon.add(_ivert_below.get(_v, _v))
-            else:
-                _recon.add(_v)
-        if len(_recon) != 3 or tuple(sorted(_recon)) in orig_surf_set:
-            _filtered_outer.append(_f)   # genuine collar (or degenerate recon -> keep)
-        else:
-            if _has_dup:
-                _n_collar_removed_b += 1
-            else:
-                _n_collar_removed_a += 1
-    outer_faces = (np.array(_filtered_outer, dtype=np.uint32)
-                   if _filtered_outer else np.zeros((0, 3), dtype=np.uint32))
+    # [CollarFilter] now runs inside _filter_surface_faces (taichi_cut_utils.py) so the
+    # one-shot cut path picks it up automatically. outer_faces is already filtered here.
     comp._outer_faces = outer_faces
-    print(f"[CollarFilter] removed {_n_collar_removed_a} above-collar + "
-          f"{_n_collar_removed_b} below-collar = "
-          f"{_n_collar_removed_a + _n_collar_removed_b} extra faces; "
-          f"{len(outer_faces)} outer faces remaining")
+
+    # Re-derive ivert maps for the diagnostics below (the filter no longer exposes them).
+    _ivert_above = {int(nid): int(vi) for nid, vi, vj, t in inter_data}
+    _ivert_below = {int(nid): int(vj) for nid, vi, vj, t in inter_data}
 
     # [PhantomResidual] For each tet still over-contributing after [CollarFilter],
     # print the extra collar faces and show what their reconstruction maps to.

@@ -625,6 +625,58 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
               f"verts all come from non-surface edges (interior tet, surface-vert corner; "
               f"slips through PhantomCollar filter)")
 
+    # [CollarFilter] Reconstruction-based phantom removal.
+    # The virtual-node split algorithm inherently produces extra interior faces when
+    # adjacent crossing tets land in different split cases and triangulate their shared
+    # face differently. We detect them by reconstructing each collar face's pre-cut
+    # parent and checking against orig_surf_set.
+    # Collar flavours:
+    #   above-side: face contains an inter vert in [n_orig, n_split).
+    #   below-side: face contains a seam-dup vert in [n_split, n_split + len(shared_list))
+    #               (the post-split remap rewrote shared inter verts to dup indices).
+    # Map dup vert back to its original inter vert so reconstruction works for both halves.
+    if inter_data is not None and orig_surf_set:
+        _ivert_above  = {int(nid): int(vi) for nid, vi, vj, t in inter_data}
+        _ivert_below  = {int(nid): int(vj) for nid, vi, vj, t in inter_data}
+        _dup_to_inter = ({n_split + i: int(shared_list[i]) for i in range(len(shared_list))}
+                         if shared_list else {})
+        _filtered_outer = []
+        _filtered_suspect = []
+        _n_removed_a = 0
+        _n_removed_b = 0
+        for i, _f in enumerate(outer):
+            _v0, _v1, _v2 = int(_f[0]), int(_f[1]), int(_f[2])
+            _has_inter = any(n_orig <= _v < n_split for _v in (_v0, _v1, _v2))
+            _has_dup   = any(_v >= n_split          for _v in (_v0, _v1, _v2))
+            if not (_has_inter or _has_dup):
+                _filtered_outer.append(_f)
+                _filtered_suspect.append(i in suspect_indices)
+                continue
+            _recon = set()
+            for _v in (_v0, _v1, _v2):
+                if _v >= n_split:
+                    _inter = _dup_to_inter.get(_v, _v)
+                    _recon.add(_ivert_above.get(_inter, _inter))
+                    _recon.add(_ivert_below.get(_inter, _inter))
+                elif n_orig <= _v < n_split:
+                    _recon.add(_ivert_above.get(_v, _v))
+                    _recon.add(_ivert_below.get(_v, _v))
+                else:
+                    _recon.add(_v)
+            if len(_recon) != 3 or tuple(sorted(_recon)) in orig_surf_set:
+                _filtered_outer.append(_f)
+                _filtered_suspect.append(i in suspect_indices)
+            else:
+                if _has_dup:
+                    _n_removed_b += 1
+                else:
+                    _n_removed_a += 1
+        print(f"[CollarFilter] removed {_n_removed_a} above-collar + "
+              f"{_n_removed_b} below-collar = {_n_removed_a + _n_removed_b} extra faces; "
+              f"{len(_filtered_outer)} outer faces remaining")
+        outer = _filtered_outer
+        suspect_indices = {i for i, s in enumerate(_filtered_suspect) if s}
+
     outer_arr = (np.array(outer, dtype=np.uint32)
                  if outer else np.zeros((0, 3), dtype=np.uint32))
     suspect_mask = np.zeros(len(outer_arr), dtype=bool)
