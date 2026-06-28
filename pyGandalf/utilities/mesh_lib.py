@@ -9,8 +9,14 @@ import taichi as ti
 import os
 from pathlib import Path
 
-# Initialize Taichi for GPU acceleration
-ti.init(arch=ti.gpu, default_fp=ti.f32, kernel_profiler=True, offline_cache=True)
+# Initialize Taichi for GPU acceleration.
+# kernel_profiler adds non-trivial per-launch overhead, so it's gated behind
+# the PYGANDALF_PROFILE_KERNELS env var (default off). Set the env var before
+# launching any test to enable; ti.profiler.print_kernel_profiler_info() then
+# has data.
+_PROFILE_KERNELS = os.environ.get("PYGANDALF_PROFILE_KERNELS", "0") not in ("", "0")
+ti.init(arch=ti.gpu, default_fp=ti.f32,
+        kernel_profiler=_PROFILE_KERNELS, offline_cache=True)
 
 class MeshInstance:
     def __init__(self, name, path, vertices, indices, normals, texcoords):
