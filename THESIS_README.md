@@ -146,17 +146,27 @@ Corotational FEM with implicit Euler integration and CG solver, running on GPU v
   - `_integrate()` -- update positions from velocities; clamp speed to v_max
   - `_apply_orphan_constraints()` -- snap zero-mass verts to masters with fixed offset
 
-### `pyGandalf/thesis_utilities/taichi_simulation_system.py`
+### `pyGandalf/thesis_utilities/taichi_cut_utils.py`
 
-**Core ECS file -- major additions since initial implementation:**
+**Cut-pipeline helpers (extracted from `taichi_simulation_system.py`):**
 - `_cut_topology_physics()` -- shared topology helper used by both SpringMassMethod and FEMMethod
   - Pre-snaps near-plane verts (`0 < dist < snap_eps` snapped to `-snap_eps`) to prevent degenerate 1+3 splits
-  - Returns `phantom_above_face_keys`: set of face keys from interior crossing tets (used by PhantomCollar filter)
-- `_split_crossed_tets()` -- now accepts `surface_tet_indices` parameter; tracks which tets are surface tets for tet-provenance phantom filtering; returns `phantom_above_face_keys` as 5th element
-- `_filter_surface_faces()` -- PhantomCollar filter: discards collar faces where any original vert is not in `orig_surf_verts` (interior vert exposed by non-conforming split)
+  - Returns `phantom_above_face_keys`: set of face keys from interior crossing tets (used by `_compute_face_categories` for V-key debug)
+- `_split_crossed_tets()` -- accepts `surface_tet_indices` parameter; tracks which tets are surface tets for tet-provenance phantom marking
+- `_extract_boundary_faces()` -- robust opposite-vertex winding correction; returns faces appearing in exactly one tet
+- `_filter_surface_faces()` -- two-stage phantom filter:
+  - **PhantomCollar**: drops collar faces with any non-seam original vert outside `orig_surf_verts`
+  - **[CollarFilter] reconstruction filter**: for any collar face (containing an inter vert in `[n_orig, n_split)` OR a seam-dup vert `>= n_split`), maps each new vert back to its endpoints (`dup_to_inter` for dups, `ivert_above`/`ivert_below` for inters), then drops the face if the 3-vert reconstruction is not in `orig_surf_set`. Catches non-conforming-split phantoms on both halves.
+- `_compute_face_categories()` -- assigns each face to a category (cat1=valid collar, cat2=surface, cat3=phantom, cat4=tet-provenance phantom) for V-key color cycling
 - `_compute_normals_post_cut()` -- per-frame normal computation on cut mesh; handles intersection vert lerp and seam dup vert snapping
-- `_setup_progressive_cut()` -- collar tet face buffer appended after wound faces for T-key debug overlay
-- `_compute_face_categories()` -- assigns each face to a category (cat1=valid collar, cat2=surface, cat3=phantom) for V-key color cycling
+- `_build_springs()` -- builds spring network from tet edges for spring-mass backend
+
+### `pyGandalf/thesis_utilities/taichi_simulation_system.py`
+
+**Core ECS file:**
+- `_setup_progressive_cut()` -- one-time setup for progressive blade cut; appends collar tet face buffer after wound faces for T-key debug overlay
+- `_advance_progressive_blade()` -- per-frame: advances blade cursor, breaks cutting springs, reveals wound faces
+- `_perform_cut()` -- one-shot cut (C key); reuses `_filter_surface_faces` so the phantom filter applies
 - `_realloc_gpu_buffers()` -- reallocates all GPU VBOs and EBO after topology change
 
 **Controls (full list):**
