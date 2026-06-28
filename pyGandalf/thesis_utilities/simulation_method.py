@@ -30,7 +30,7 @@ from collections import defaultdict
 
 import numpy as np
 
-from .taichi_simulation_system import _SpringMassSimulator, _cut_topology_physics
+from .taichi_cut_utils import _SpringMassSimulator, _cut_topology_physics
 
 
 class SimulationMethod(ABC):
@@ -378,7 +378,7 @@ class SpringMassMethod(SimulationMethod):
 
         (new_sim, final_pos, _final_vel, _final_mass, _final_fixed,
          all_tets, n_orig, n_split, shared_list, remap, _inter_data, _orig_surf_set,
-         _phantom_keys) = result
+         _phantom_keys, _above_groups, _below_groups) = result
 
         self._simulator       = new_sim
         self._current_tets    = all_tets
@@ -734,7 +734,7 @@ class FEMMethod(SimulationMethod):
 
         (_, final_pos, final_vel, _, final_fixed,
          all_tets, n_orig, n_split, shared_list, remap,
-         _inter_data, _orig_surf_set, _phantom_keys) = result
+         _inter_data, _orig_surf_set, _phantom_keys, _above_groups, _below_groups) = result
 
         # Check 4b: fixed count after topology rebuild
         n_fixed_after = int(final_fixed.sum())
