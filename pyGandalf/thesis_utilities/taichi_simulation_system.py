@@ -505,7 +505,7 @@ def _cut_topology(comp: TaichiSimulationComponent,
 
     (new_sim, final_pos, final_vel, final_mass, final_fixed,
      all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set,
-     phantom_above_face_keys, above_groups, below_groups) = result
+     phantom_above_face_keys) = result
 
     comp.simulator          = new_sim
     comp.current_tetrahedra = all_tets
@@ -517,7 +517,7 @@ def _cut_topology(comp: TaichiSimulationComponent,
 
     return (final_pos, final_vel, final_mass, final_fixed,
             all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set,
-            phantom_above_face_keys, above_groups, below_groups)
+            phantom_above_face_keys)
 
 
 def _perform_cut(comp: TaichiSimulationComponent,
@@ -540,7 +540,7 @@ def _perform_cut(comp: TaichiSimulationComponent,
 
     (final_pos, final_vel, final_mass, final_fixed,
      all_tets, n_orig, n_split, shared_list, remap, inter_data,
-     orig_surf_set, phantom_above_face_keys, above_groups, below_groups) = result
+     orig_surf_set, phantom_above_face_keys) = result
     comp._n_orig      = n_orig
     comp._n_split     = n_split
     comp._inter_data  = inter_data
@@ -566,7 +566,7 @@ def _perform_cut(comp: TaichiSimulationComponent,
     # --- Surface ---
     raw_surface = _extract_boundary_faces(all_tets, final_pos)
     mesh_centroid = final_pos[:n_orig].mean(axis=0)
-    outer_faces, wound_faces, suspect_mask = _filter_surface_faces(
+    outer_faces, wound_faces = _filter_surface_faces(
         raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set, mesh_centroid,
         inter_data=inter_data, shared_list=shared_list)
 
@@ -651,7 +651,7 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     # Extract topology data from the cached result tuple for surface computation.
     (_new_sim, final_pos, _final_vel, _final_mass, _final_fixed,
      all_tets, n_orig, n_split, shared_list, remap, inter_data,
-     orig_surf_set, phantom_above_face_keys, above_groups, below_groups) = comp.method._topology_result
+     orig_surf_set, phantom_above_face_keys) = comp.method._topology_result
 
     comp._n_orig      = n_orig
     comp._n_split     = n_split
@@ -672,236 +672,11 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     # --- Build progressive wound surface ---
     raw_surface = _extract_boundary_faces(all_tets, final_pos)
     mesh_centroid = final_pos[:n_orig].mean(axis=0)
-    outer_faces, wound_faces, suspect_mask = _filter_surface_faces(
+    outer_faces, wound_faces = _filter_surface_faces(
         raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set, mesh_centroid,
         inter_data=inter_data, shared_list=shared_list)
 
-    # [CollarCount] Per-crossing-tet expected vs actual collar face count.
-    # For each crossing tet, above_groups records its above sub-tets and the
-    # expected collar count from its surface faces.  We build the globally
-    # confirmed boundary collar face key set from raw_surface, then attribute
-    # each collar face to its source crossing tet via its local sub-tet faces.
-    # Any tet where actual != expected produced phantom or missing collar faces.
-    _boundary_collar_keys = set(
-        tuple(sorted(int(v) for v in f))
-        for f in outer_faces
-        if any(n_orig <= int(v) < n_split for v in f)
-    )
-    _total_expected = 0
-    _total_actual   = 0
-    _n_phantom_tets = 0
-    for _orig_idx, _local_above, _exp, _case in above_groups:
-        # Local face count from this tet's above sub-tets only.
-        _lfc = {}
-        for _st in _local_above:
-            for _i, _j, _k in ((0,1,2),(0,1,3),(0,2,3),(1,2,3)):
-                _k2 = tuple(sorted([int(_st[_i]), int(_st[_j]), int(_st[_k])]))
-                _lfc[_k2] = _lfc.get(_k2, 0) + 1
-        # Faces with odd local count that are also globally boundary collar faces.
-        _act = sum(1 for _k2, _c in _lfc.items()
-                   if _c % 2 == 1 and _k2 in _boundary_collar_keys)
-        _total_expected += _exp
-        _total_actual   += _act
-        if _act != _exp:
-            _n_phantom_tets += 1
-            print(f"[CollarCount] orig_tet={_orig_idx} ({_case}): "
-                  f"expected={_exp} actual={_act} diff={_act - _exp}")
-    print(f"[CollarCount] total: expected={_total_expected} actual={_total_actual} "
-          f"phantoms={_total_actual - _total_expected} "
-          f"({_n_phantom_tets} tets with mismatches)")
-
-    # [CollarCountBelow] Mirror of [CollarCount] for below sub-tets.
-    # Below sub-tets had their seam inter verts remapped to dup indices (>= n_split).
-    # So below-half collar faces in outer_faces have verts >= n_split, not in [n_orig, n_split).
-    _boundary_collar_keys_below = set(
-        tuple(sorted(int(v) for v in f))
-        for f in outer_faces
-        if any(int(v) >= n_split for v in f)
-    )
-    _total_expected_b = 0
-    _total_actual_b   = 0
-    _n_phantom_tets_b = 0
-    for _orig_idx, _local_below, _exp, _case in below_groups:
-        _lfc = {}
-        for _st in _local_below:
-            for _i, _j, _k in ((0,1,2),(0,1,3),(0,2,3),(1,2,3)):
-                _k2 = tuple(sorted([int(_st[_i]), int(_st[_j]), int(_st[_k])]))
-                _lfc[_k2] = _lfc.get(_k2, 0) + 1
-        _act = sum(1 for _k2, _c in _lfc.items()
-                   if _c % 2 == 1 and _k2 in _boundary_collar_keys_below)
-        _total_expected_b += _exp
-        _total_actual_b   += _act
-        if _act != _exp:
-            _n_phantom_tets_b += 1
-            print(f"[CollarCountBelow] orig_tet={_orig_idx} ({_case}): "
-                  f"expected={_exp} actual={_act} diff={_act - _exp}")
-    print(f"[CollarCountBelow] total: expected={_total_expected_b} actual={_total_actual_b} "
-          f"phantoms={_total_actual_b - _total_expected_b} "
-          f"({_n_phantom_tets_b} tets with mismatches)")
-
-    # [CollarFilter] now runs inside _filter_surface_faces (taichi_cut_utils.py) so the
-    # one-shot cut path picks it up automatically. outer_faces is already filtered here.
     comp._outer_faces = outer_faces
-
-    # Re-derive ivert maps for the diagnostics below (the filter no longer exposes them).
-    _ivert_above = {int(nid): int(vi) for nid, vi, vj, t in inter_data}
-    _ivert_below = {int(nid): int(vj) for nid, vi, vj, t in inter_data}
-
-    # [PhantomResidual] For each tet still over-contributing after [CollarFilter],
-    # print the extra collar faces and show what their reconstruction maps to.
-    # This explains WHY [CollarFilter] kept them (reconstruction in orig_surf_set).
-    _post_collar_key_to_face = {}
-    for _f in outer_faces:
-        _k = tuple(sorted(int(v) for v in _f))
-        if any(n_orig <= int(v) < n_split for v in _f):
-            _post_collar_key_to_face[_k] = _f
-    _post_exp = _post_act = _post_phantom_tets = 0
-    _n_recon_in_surf = _n_recon_not_in_surf = _n_recon_degenerate = 0
-    for _orig_idx, _local_above, _exp, _case in above_groups:
-        _lfc = {}
-        for _st in _local_above:
-            for _i, _j, _k in ((0,1,2),(0,1,3),(0,2,3),(1,2,3)):
-                _k2 = tuple(sorted([int(_st[_i]), int(_st[_j]), int(_st[_k])]))
-                _lfc[_k2] = _lfc.get(_k2, 0) + 1
-        _act_keys = [_k2 for _k2, _c in _lfc.items()
-                     if _c % 2 == 1 and _k2 in _post_collar_key_to_face]
-        _act = len(_act_keys)
-        _post_exp += _exp
-        _post_act += _act
-        if _act > _exp:
-            _post_phantom_tets += 1
-            # Identify the extra faces and show their reconstructions.
-            for _fk in _act_keys[_exp:]:   # faces beyond the expected count are phantom
-                _fverts = _post_collar_key_to_face[_fk]
-                _recon = set()
-                for _v in (int(_fverts[0]), int(_fverts[1]), int(_fverts[2])):
-                    if n_orig <= _v < n_split:
-                        _recon.add(_ivert_above.get(_v, _v))
-                        _recon.add(_ivert_below.get(_v, _v))
-                    else:
-                        _recon.add(_v)
-                _n_inter_in_face = sum(1 for _v in _fk if n_orig <= _v < n_split)
-                _recon_key = tuple(sorted(_recon)) if len(_recon) == 3 else None
-                _in_surf = _recon_key in orig_surf_set if _recon_key else False
-                if _recon_key is None:
-                    _n_recon_degenerate += 1
-                elif _in_surf:
-                    _n_recon_in_surf += 1
-                else:
-                    _n_recon_not_in_surf += 1
-                print(f"[PhantomResidual] tet={_orig_idx} ({_case}) "
-                      f"face={_fk} inter_verts={_n_inter_in_face} "
-                      f"recon={_recon_key} in_surf={_in_surf}")
-    print(f"[PhantomResidual] total: expected={_post_exp} actual={_post_act} "
-          f"residual={_post_act - _post_exp} ({_post_phantom_tets} tets) | "
-          f"recon: in_surf={_n_recon_in_surf} not_in_surf={_n_recon_not_in_surf} "
-          f"degenerate={_n_recon_degenerate}")
-
-    # [PhantomResidualBelow] Mirror of [PhantomResidual] for below sub-tets.
-    # Note: [CollarFilter] above only touches faces with verts in [n_orig, n_split), so
-    # below-half collar faces (with seam-dup verts >= n_split) pass through unchanged.
-    # Reconstruction needs to map dup indices back to their original inter verts first.
-    _dup_to_inter = {n_split + i: int(shared_list[i]) for i in range(len(shared_list))}
-    _post_collar_key_to_face_below = {}
-    for _f in outer_faces:
-        _k = tuple(sorted(int(v) for v in _f))
-        if any(int(v) >= n_split for v in _f):
-            _post_collar_key_to_face_below[_k] = _f
-    _post_exp_b = _post_act_b = _post_phantom_tets_b = 0
-    _n_recon_in_surf_b = _n_recon_not_in_surf_b = _n_recon_degenerate_b = 0
-    _per_face_print_budget_b = 20   # cap per-face prints so totals stay visible
-    for _orig_idx, _local_below, _exp, _case in below_groups:
-        _lfc = {}
-        for _st in _local_below:
-            for _i, _j, _k in ((0,1,2),(0,1,3),(0,2,3),(1,2,3)):
-                _k2 = tuple(sorted([int(_st[_i]), int(_st[_j]), int(_st[_k])]))
-                _lfc[_k2] = _lfc.get(_k2, 0) + 1
-        _act_keys = [_k2 for _k2, _c in _lfc.items()
-                     if _c % 2 == 1 and _k2 in _post_collar_key_to_face_below]
-        _act = len(_act_keys)
-        _post_exp_b += _exp
-        _post_act_b += _act
-        if _act > _exp:
-            _post_phantom_tets_b += 1
-            for _fk in _act_keys[_exp:]:
-                _fverts = _post_collar_key_to_face_below[_fk]
-                _recon = set()
-                for _v in (int(_fverts[0]), int(_fverts[1]), int(_fverts[2])):
-                    if _v >= n_split:
-                        _inter = _dup_to_inter[_v]
-                        _recon.add(_ivert_above.get(_inter, _inter))
-                        _recon.add(_ivert_below.get(_inter, _inter))
-                    elif n_orig <= _v < n_split:
-                        _recon.add(_ivert_above.get(_v, _v))
-                        _recon.add(_ivert_below.get(_v, _v))
-                    else:
-                        _recon.add(_v)
-                _n_dup_in_face = sum(1 for _v in _fk if _v >= n_split)
-                _recon_key = tuple(sorted(_recon)) if len(_recon) == 3 else None
-                _in_surf = _recon_key in orig_surf_set if _recon_key else False
-                if _recon_key is None:
-                    _n_recon_degenerate_b += 1
-                elif _in_surf:
-                    _n_recon_in_surf_b += 1
-                else:
-                    _n_recon_not_in_surf_b += 1
-                if _per_face_print_budget_b > 0:
-                    print(f"[PhantomResidualBelow] tet={_orig_idx} ({_case}) "
-                          f"face={_fk} dup_verts={_n_dup_in_face} "
-                          f"recon={_recon_key} in_surf={_in_surf}")
-                    _per_face_print_budget_b -= 1
-    print(f"[PhantomResidualBelow] total: expected={_post_exp_b} actual={_post_act_b} "
-          f"residual={_post_act_b - _post_exp_b} ({_post_phantom_tets_b} tets) | "
-          f"recon: in_surf={_n_recon_in_surf_b} not_in_surf={_n_recon_not_in_surf_b} "
-          f"degenerate={_n_recon_degenerate_b}")
-
-    # [CollarDiag] Exhaustive winding audit for collar faces after [CollarFilter].
-    # Build face->fourth-vertex map from all_tets to test each collar face.
-    # Tracks: inward count, fourth-vertex category (inter / interior-orig / exterior-surf-orig).
-    _d_orig_surf_verts = {v for tri in orig_surf_set for v in tri}
-    _d_face_fourth = {}
-    for _dt in all_tets:
-        for _dfi, _dfj, _dfk in ((0,1,2),(0,1,3),(0,2,3),(1,2,3)):
-            _dfkey = tuple(sorted([int(_dt[_dfi]), int(_dt[_dfj]), int(_dt[_dfk])]))
-            _dfw = (set(range(4)) - {_dfi, _dfj, _dfk}).pop()
-            _d_face_fourth[_dfkey] = int(_dt[_dfw])
-
-    _d_n_collar = _d_inward = _d_ext_surf = _d_inter_fourth = _d_int_orig = _d_missing = 0
-    _d_inward_ext = 0  # inward AND exterior surf fourth
-    _d_no_fourth = 0
-    for _df in outer_faces:
-        _dv0, _dv1, _dv2 = int(_df[0]), int(_df[1]), int(_df[2])
-        if not any(n_orig <= _dv < n_split for _dv in (_dv0, _dv1, _dv2)):
-            continue  # not a collar face
-        _d_n_collar += 1
-        _dp0, _dp1, _dp2 = final_pos[_dv0], final_pos[_dv1], final_pos[_dv2]
-        _dfn = np.cross(_dp1 - _dp0, _dp2 - _dp0)
-        _dfc = (_dp0 + _dp1 + _dp2) / 3.0
-        _dfkey2 = tuple(sorted([_dv0, _dv1, _dv2]))
-        _dfv = _d_face_fourth.get(_dfkey2)
-        if _dfv is None:
-            _d_no_fourth += 1
-            continue
-        _dtp = final_pos[_dfv]
-        _dto = _dtp - _dfc
-        _is_inward = bool(np.dot(_dfn, _dto) > 0)
-        if _is_inward:
-            _d_inward += 1
-        if _dfv >= n_split:
-            pass  # dup vert fourth -- skip category
-        elif _dfv >= n_orig:
-            _d_inter_fourth += 1   # inter vert as fourth
-        elif _dfv in _d_orig_surf_verts:
-            _d_ext_surf += 1       # exterior surface vert as fourth
-            if _is_inward:
-                _d_inward_ext += 1
-        else:
-            _d_int_orig += 1       # interior original vert as fourth
-    print(f"[CollarDiag] collar faces after filter: {_d_n_collar}")
-    print(f"[CollarDiag] inward-facing (toward 4th vert): {_d_inward}")
-    print(f"[CollarDiag] fourth-vert categories: inter={_d_inter_fourth} "
-          f"ext-surf-orig={_d_ext_surf} int-orig={_d_int_orig} missing={_d_no_fourth}")
-    print(f"[CollarDiag] inward AND ext-surf-orig fourth: {_d_inward_ext}")
 
     if comp.split_disc_verts:
         remapped_wound, split_phys = _split_disc_verts_for_rendering(
@@ -1002,22 +777,6 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
 
     new_normals = _compute_normals_post_cut(render_pos, comp.surface_indices,
                                             n_orig, n_split, inter_data, shared_list, normal)
-
-    # --- Diagnostics: confirm Bug 1 (zero collar normals) and Bug 2 (zero dup normals) ---
-    _n_phys = comp.method.vertex_count
-    outer_flat     = comp.surface_indices.flatten().astype(np.int32)
-    outer_norm_len = np.linalg.norm(new_normals[outer_flat], axis=1)
-    n_zero_collar  = int((outer_norm_len < 1e-6).sum())
-    print(f"[NormDiag] Bug1: {n_zero_collar} / {len(outer_flat)} outer-face vert slots "
-          f"have zero normals (saw-tooth source if > 0)")
-    if len(render_pos) > _n_phys:
-        dup_norm_len = np.linalg.norm(new_normals[_n_phys:], axis=1)
-        n_zero_dup   = int((dup_norm_len < 1e-6).sum())
-        print(f"[NormDiag] Bug2: {n_zero_dup} / {len(render_pos) - _n_phys} "
-              f"rendering-dup verts have zero normals (wound faces appear black if > 0)")
-    else:
-        print("[NormDiag] Bug2: no rendering-dup verts (split_disc_verts=False or no dups)")
-    # --- End diagnostics ---
 
     # Build expanded (unindexed) arrays for the full face set.
     flat_all   = all_render_faces.flatten()
