@@ -81,8 +81,6 @@ def main():
                         help='RNG seed for cut plane (default: 5)')
     parser.add_argument('--tet_scale', type=float, default=1.0,
                         help='Interior tet size relative to surface (default: 1.0; try 5-20 for fewer tets)')
-    parser.add_argument('--profile-kernels', action='store_true', default=False,
-                        help='Enable Taichi kernel_profiler (~halves fps; sniffed at import time)')
     args = parser.parse_args()
 
     mesh_name    = args.mesh

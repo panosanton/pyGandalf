@@ -889,10 +889,16 @@ class FEMMethod(SimulationMethod):
         self._topology_result = result  # cached for ECS surface computation
 
         # Cutting springs — endpoints remapped away from any zero-mass orphan verts.
+        # Rest length = actual setup distance between the (possibly remapped) endpoints.
+        # When neither endpoint is orphaned, this is 0 (the original assumption).
+        # When orphan-remap pulled an endpoint to a non-coincident master, the rest
+        # length records that initial separation so the spring is at equilibrium at
+        # setup instead of immediately producing huge corrective forces.
         k_cut  = float(self._params.get('stiffness', 200.0)) * 0.5
         sa_cut = np.array([_r(v)        for v in shared_list], dtype=np.int32)
         sb_cut = np.array([_r(remap[v]) for v in shared_list], dtype=np.int32)
-        sr_cut = np.zeros(len(shared_list), dtype=np.float32)
+        sr_cut = np.linalg.norm(final_pos[sa_cut] - final_pos[sb_cut],
+                                axis=1).astype(np.float32)
         sk_cut = np.full(len(shared_list), k_cut, dtype=np.float32)
         new_fem.extend_springs(sa_cut, sb_cut, sr_cut, sk_cut)
 

@@ -209,7 +209,7 @@ def main():
 
     taichi_comp.cut_plane_origin  = origin.tolist()
     taichi_comp.cut_plane_normal  = normal.tolist()
-    taichi_comp.hide_wound_faces  = True
+    taichi_comp.hide_wound_faces  = False
     taichi_comp.use_culling       = args.culling
     # taichi_comp.use_culling       = False
     scene.add_component(sphere, taichi_comp)
