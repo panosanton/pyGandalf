@@ -33,15 +33,17 @@ Why explicit Euler:
 """
 
 import os
+import sys
 
 import taichi as ti
 import numpy as np
 
 import OpenGL.GL as gl
 
-# kernel_profiler adds non-trivial per-launch overhead. Gate behind an env var
-# (PYGANDALF_PROFILE_KERNELS=1) so interactive runs aren't slowed down by default.
-_PROFILE_KERNELS = os.environ.get("PYGANDALF_PROFILE_KERNELS", "0") not in ("", "0")
+# kernel_profiler adds non-trivial per-launch overhead. Gate behind the
+# --profile-kernels CLI flag so interactive runs aren't slowed down by default.
+# ti.init runs at import time, before argparse, so we sniff sys.argv here.
+_PROFILE_KERNELS = "--profile-kernels" in sys.argv
 ti.init(arch=ti.gpu, log_level=ti.WARN,
         kernel_profiler=_PROFILE_KERNELS, offline_cache=True)
 

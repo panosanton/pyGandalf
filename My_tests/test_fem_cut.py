@@ -100,6 +100,8 @@ def main():
                         help='Enable per-face debug colors (green/blue/red) after cut')
     parser.add_argument('--culling', action='store_true', default=False,
                         help='Enable GL backface culling (default: off)')
+    parser.add_argument('--profile-kernels', action='store_true', default=False,
+                        help='Enable Taichi kernel_profiler (~halves fps; sniffed at import time)')
     args = parser.parse_args()
 
     mesh_name    = args.mesh
@@ -207,7 +209,7 @@ def main():
 
     taichi_comp.cut_plane_origin  = origin.tolist()
     taichi_comp.cut_plane_normal  = normal.tolist()
-    taichi_comp.hide_wound_faces  = False
+    taichi_comp.hide_wound_faces  = True
     taichi_comp.use_culling       = args.culling
     # taichi_comp.use_culling       = False
     scene.add_component(sphere, taichi_comp)

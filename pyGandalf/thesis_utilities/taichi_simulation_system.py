@@ -5,10 +5,12 @@ GPU-accelerated spring-mass simulator for tetrahedral meshes using explicit
 Euler integration.
 
 Controls:
-  B — start / pause progressive blade cut
-  F — poke the top of the mesh downward
-  C — one-shot cut at the plane defined by cut_plane_origin/normal (kept for testing)
-  P — pause / resume physics simulation (cut still runs)
+  B - start / pause progressive blade cut
+  F - poke the top of the mesh downward
+  C - one-shot cut at the plane defined by cut_plane_origin/normal (kept for testing)
+  P - pause / resume physics simulation (cut still runs)
+  K - clear Taichi kernel_profiler stats (only meaningful with --profile-kernels)
+  L - print Taichi kernel_profiler stats snapshot
 
 Progressive cutting (virtual-node algorithm):
   When B is pressed the mesh topology is split once along the cut plane.
@@ -36,6 +38,7 @@ import numpy as np
 import time
 
 import glfw
+import taichi as ti
 import OpenGL.GL as gl
 from pyGandalf.core.input_manager import InputManager
 from pyGandalf.systems.system import System
@@ -279,7 +282,6 @@ class TaichiSimulationSystem(System):
             if not comp.blade_initialized:
                 # ----- profiling wrapper around the full B-press handler -----
                 import cProfile, pstats, io
-                import taichi as ti
                 _prof = cProfile.Profile()
                 _t0 = time.perf_counter()
                 _prof.enable()
@@ -404,6 +406,20 @@ class TaichiSimulationSystem(System):
             comp._wireframe = not getattr(comp, '_wireframe', False)
             print(f"[Wire] {'ON' if comp._wireframe else 'OFF'}")
         self._z_prev = z_now
+
+        # --- K key: clear Taichi kernel_profiler stats (no-op if profiling off) ---
+        k_now = InputManager().get_key_down(glfw.KEY_K)
+        if k_now and not getattr(self, '_k_prev', False):
+            ti.profiler.clear_kernel_profiler_info()
+            print("[Profiler] kernel stats cleared")
+        self._k_prev = k_now
+
+        # --- L key: print Taichi kernel_profiler stats (no-op if profiling off) ---
+        l_now = InputManager().get_key_down(glfw.KEY_L)
+        if l_now and not getattr(self, '_l_prev', False):
+            print("[Profiler] kernel stats snapshot:")
+            ti.profiler.print_kernel_profiler_info()
+        self._l_prev = l_now
         gl.glPolygonMode(gl.GL_FRONT_AND_BACK,
                          gl.GL_LINE if getattr(comp, '_wireframe', False) else gl.GL_FILL)
         if comp.use_culling:
@@ -420,7 +436,6 @@ class TaichiSimulationSystem(System):
             # Time the first few step() calls after a cut to see first-touch JIT cost.
             _n = getattr(comp, '_step_timing_left', 0)
             if _n > 0:
-                import taichi as ti
                 _t = time.perf_counter()
                 comp.method.step(comp.time_step)
                 ti.sync()
@@ -851,7 +866,6 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     # Warm-up step: trigger first-touch JIT of the FEM per-frame kernels while
     # the user is still inside the setup hitch. Without this the camera freezes
     # for ~1-5s on the first interactive frame after setup_cut returns.
-    import taichi as ti
     _t = time.perf_counter()
     comp.method.step(comp.time_step)
     ti.sync()

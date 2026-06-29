@@ -7,14 +7,14 @@ from pxr import Usd, UsdGeom
 import taichi as ti
 
 import os
+import sys
 from pathlib import Path
 
 # Initialize Taichi for GPU acceleration.
 # kernel_profiler adds non-trivial per-launch overhead, so it's gated behind
-# the PYGANDALF_PROFILE_KERNELS env var (default off). Set the env var before
-# launching any test to enable; ti.profiler.print_kernel_profiler_info() then
-# has data.
-_PROFILE_KERNELS = os.environ.get("PYGANDALF_PROFILE_KERNELS", "0") not in ("", "0")
+# the --profile-kernels CLI flag (default off). ti.init runs at import time,
+# before any test's argparse runs, so we sniff sys.argv directly here.
+_PROFILE_KERNELS = "--profile-kernels" in sys.argv
 ti.init(arch=ti.gpu, default_fp=ti.f32,
         kernel_profiler=_PROFILE_KERNELS, offline_cache=True)
 
