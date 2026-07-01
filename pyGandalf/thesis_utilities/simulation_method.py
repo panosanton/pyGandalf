@@ -900,6 +900,27 @@ class FEMMethod(SimulationMethod):
         sr_cut = np.linalg.norm(final_pos[sa_cut] - final_pos[sb_cut],
                                 axis=1).astype(np.float32)
         sk_cut = np.full(len(shared_list), k_cut, dtype=np.float32)
+
+        # Dedupe: orphan-remap can collapse multiple shared verts onto the same
+        # (master_above, master_below) pair, producing N springs on one anchor
+        # pair and N times the corrective force.  Keep the first occurrence of
+        # each unordered (a, b) and deactivate the rest (k=0, r=0).  Spring
+        # indices are preserved, so the blade-break logic still functions; the
+        # deactivated springs just sit inert.
+        _key_lo = np.minimum(sa_cut, sb_cut).astype(np.int64)
+        _key_hi = np.maximum(sa_cut, sb_cut).astype(np.int64)
+        _key    = (_key_lo << 32) | _key_hi
+        _, _first_idx = np.unique(_key, return_index=True)
+        _keep_mask = np.zeros(len(_key), dtype=bool)
+        _keep_mask[_first_idx] = True
+        _n_dedup = int((~_keep_mask).sum())
+        sk_cut[~_keep_mask] = 0.0
+        sr_cut[~_keep_mask] = 0.0
+        if _n_dedup > 0:
+            print(f"[Cut] Deactivated {_n_dedup} duplicate cutting springs "
+                  f"({len(_keep_mask) - _n_dedup} unique anchor pairs remain)",
+                  flush=True)
+
         new_fem.extend_springs(sa_cut, sb_cut, sr_cut, sk_cut)
 
         # Check 1: cutting spring endpoints vs fixed vertices
