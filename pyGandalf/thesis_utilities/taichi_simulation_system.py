@@ -11,6 +11,9 @@ Controls:
   P - pause / resume physics simulation (cut still runs)
   K - clear Taichi kernel_profiler stats (only meaningful with --profile-kernels)
   L - print Taichi kernel_profiler stats snapshot
+  Ctrl+LMB - pick nearest rendered face, dump face/tet/vert info,
+             highlight face+tet (needs --debug-colors for the color to show)
+  Ctrl+RMB - clear pick highlight
 
 Progressive cutting (virtual-node algorithm):
   When B is pressed the mesh topology is split once along the cut plane.
@@ -42,7 +45,12 @@ import taichi as ti
 import OpenGL.GL as gl
 from pyGandalf.core.input_manager import InputManager
 from pyGandalf.systems.system import System
-from pyGandalf.scene.components import Component, StaticMeshComponent
+from pyGandalf.scene.components import (Component, StaticMeshComponent,
+                                          CameraComponent, TransformComponent)
+from pyGandalf.scene.scene_manager import SceneManager
+from pyGandalf.core.application import Application
+
+from . import pick_inspector
 
 from .taichi_cut_utils import (
     _SpringMassSimulator,
@@ -420,6 +428,20 @@ class TaichiSimulationSystem(System):
             print("[Profiler] kernel stats snapshot:")
             ti.profiler.print_kernel_profiler_info()
         self._l_prev = l_now
+
+        # --- Ctrl + Left click : pick face + parent tet, dump info ---
+        # --- Ctrl + Right click: clear highlight ---
+        ctrl_held  = InputManager().get_key_down(glfw.KEY_LEFT_CONTROL)
+        lmb_now    = InputManager().get_key_down(glfw.MOUSE_BUTTON_1)
+        rmb_now    = InputManager().get_key_down(glfw.MOUSE_BUTTON_2)
+        lmb_press  = ctrl_held and lmb_now and not getattr(self, '_pick_lmb_prev', False)
+        rmb_press  = ctrl_held and rmb_now and not getattr(self, '_pick_rmb_prev', False)
+        if lmb_press:
+            _run_pick(comp, mesh_comp)
+        if rmb_press:
+            pick_inspector.clear_highlight(comp, mesh_comp)
+        self._pick_lmb_prev = lmb_now
+        self._pick_rmb_prev = rmb_now
         gl.glPolygonMode(gl.GL_FRONT_AND_BACK,
                          gl.GL_LINE if getattr(comp, '_wireframe', False) else gl.GL_FILL)
         if comp.use_culling:
@@ -512,6 +534,42 @@ class TaichiSimulationSystem(System):
             #     f"upload {(t4-t3)*1000:4.2f}ms | "
             #     f"total {(t4-t_blade0)*1000:5.2f}ms"
             # )
+
+
+# ---------------------------------------------------------------------------
+# Ctrl+click pick dispatch
+# ---------------------------------------------------------------------------
+
+def _run_pick(comp: TaichiSimulationComponent, mesh_comp: StaticMeshComponent):
+    """Locate the primary camera + window and hand off to pick_inspector."""
+    scene = SceneManager().active_scene
+    if scene is None:
+        print("[Pick] no active scene")
+        return
+
+    camera_comp = None
+    camera_xf   = None
+    arrays = scene.get_components_array()
+    cameras   = arrays.get(CameraComponent,    []) or []
+    transforms = arrays.get(TransformComponent, []) or []
+    # Match camera to its transform via entity ownership.
+    for entity in scene.get_entities():
+        refs = scene.get_entity_component_references(entity)
+        if CameraComponent in refs and TransformComponent in refs:
+            cc = cameras[refs[CameraComponent]]
+            if getattr(cc, 'primary', False):
+                camera_comp = cc
+                camera_xf   = transforms[refs[TransformComponent]]
+                break
+    if camera_comp is None:
+        print("[Pick] no primary camera found")
+        return
+
+    win = Application().get_window()
+    cursor = InputManager().get_mouse_cursor_pos()
+    pick_inspector.pick_and_dump(
+        comp, mesh_comp, camera_comp, camera_xf,
+        cursor.x, cursor.y, int(win.width), int(win.height))
 
 
 # ---------------------------------------------------------------------------
