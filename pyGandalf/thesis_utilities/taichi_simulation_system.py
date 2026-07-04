@@ -522,12 +522,22 @@ class TaichiSimulationSystem(System):
             upload_pos  = render_positions[flat].reshape(-1, 3)
             upload_norm = new_normals[flat].reshape(-1, 3)
             # Per-slot override: wound-face slots snap to +-cut_n regardless of
-            # the per-vertex normal (fixes near-plane INTER shading anomalies).
+            # the per-vertex normal (fixes near-plane INTER shading anomalies
+            # and sliver-tet winding flips via same-half majority vote).
             if comp._cut_normal is not None and comp._n_outer_faces is not None:
                 n_outer = int(comp._n_outer_faces)
-                n_wound = len(comp._all_render_faces) - n_outer
-                _finalize_wound_slot_normals(upload_norm, upload_pos,
-                                              n_wound, n_outer, comp._cut_normal)
+                # [outer | wound | collar_tet], stop at wound.
+                n_wound_end = (int(comp._collar_tet_face_offset)
+                                if comp._n_collar_tet_faces > 0
+                                else len(comp._all_render_faces))
+                n_wound = n_wound_end - n_outer
+                _finalize_wound_slot_normals(
+                    upload_norm, upload_pos, comp._all_render_faces,
+                    n_wound_faces=n_wound, n_outer_faces=n_outer,
+                    n_orig=comp._n_orig, n_split=comp._n_split,
+                    n_phys=new_positions.shape[0],
+                    disc_split_phys_idx=comp._disc_split_phys_idx,
+                    cut_normal=comp._cut_normal)
         else:
             upload_pos  = render_positions
             upload_norm = new_normals
@@ -736,10 +746,13 @@ def _perform_cut(comp: TaichiSimulationComponent,
     flat              = all_faces.flatten()
     exp_pos           = render_pos[flat].reshape(-1, 3)
     exp_norm          = new_normals[flat].reshape(-1, 3)
-    _finalize_wound_slot_normals(exp_norm, exp_pos,
-                                  n_wound_faces=len(all_faces) - len(outer_faces),
-                                  n_outer_faces=len(outer_faces),
-                                  cut_normal=normal)
+    _finalize_wound_slot_normals(
+        exp_norm, exp_pos, all_faces,
+        n_wound_faces=len(all_faces) - len(outer_faces),
+        n_outer_faces=len(outer_faces),
+        n_orig=n_orig, n_split=n_split, n_phys=len(final_pos),
+        disc_split_phys_idx=comp._disc_split_phys_idx,
+        cut_normal=normal)
     exp_tex           = np.zeros((len(all_faces) * 3, 2), dtype=np.float32)
     exp_colors        = np.repeat(face_colors, 3, axis=0)
     trivial_idx       = np.arange(len(all_faces) * 3, dtype=np.uint32).reshape(-1, 3)
@@ -924,10 +937,13 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     flat_all   = all_render_faces.flatten()
     exp_pos    = render_pos[flat_all].reshape(-1, 3)
     exp_norm   = new_normals[flat_all].reshape(-1, 3)   # hidden wound normals = zero initially (OK)
-    _finalize_wound_slot_normals(exp_norm, exp_pos,
-                                  n_wound_faces=len(wound_faces),
-                                  n_outer_faces=len(outer_faces),
-                                  cut_normal=normal)
+    _finalize_wound_slot_normals(
+        exp_norm, exp_pos, all_render_faces,
+        n_wound_faces=len(wound_faces),
+        n_outer_faces=len(outer_faces),
+        n_orig=n_orig, n_split=n_split, n_phys=len(final_pos),
+        disc_split_phys_idx=comp._disc_split_phys_idx,
+        cut_normal=normal)
     exp_tex    = np.zeros((len(all_render_faces) * 3, 2), dtype=np.float32)
     exp_colors = np.repeat(face_colors, 3, axis=0)
 

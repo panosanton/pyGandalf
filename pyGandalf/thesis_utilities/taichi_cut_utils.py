@@ -895,28 +895,48 @@ def _compute_normals_post_cut(vertices:    np.ndarray,
     return normals
 
 
-def _finalize_wound_slot_normals(exp_norm:      np.ndarray,
-                                  exp_pos:       np.ndarray,
-                                  n_wound_faces: int,
-                                  n_outer_faces: int,
-                                  cut_normal:    np.ndarray) -> np.ndarray:
+def _finalize_wound_slot_normals(exp_norm:            np.ndarray,
+                                  exp_pos:             np.ndarray,
+                                  all_render_faces:    np.ndarray,
+                                  n_wound_faces:       int,
+                                  n_outer_faces:       int,
+                                  n_orig:              int,
+                                  n_split:             int,
+                                  n_phys:              int,
+                                  disc_split_phys_idx: np.ndarray,
+                                  cut_normal:          np.ndarray) -> np.ndarray:
     """
-    Override normals for wound-face slots with the face-oriented +-cut_n.
+    Override normals for wound-face slots with the topologically-correct +-cut_n.
 
     The per-vertex normal pipeline (`_compute_normals_post_cut`) cannot give
     correct shading for a vertex that belongs to both a wound face and a
-    collar face -- one per-vertex slot is broadcast to every face-slot it
-    appears in. This finalizer runs in the exploded (per-slot) frame and
+    collar face. This finalizer runs in the exploded (per-slot) frame and
     stamps `sign * cut_n` into every wound-face slot without touching
     collar/surface slots.
 
-    exp_norm       : (F*3, 3) already-broadcast per-slot normal buffer.
-    exp_pos        : (F*3, 3) matching per-slot position buffer.
-    n_wound_faces  : number of wound faces (they sit after n_outer_faces).
-    n_outer_faces  : number of outer faces at the start of the buffer.
-    cut_normal     : (3,) unit-ish cut-plane normal.
+    Sign choice per wound face:
+      1. Classify each vert by resolving RENDER_DUPs (>= n_phys) back to their
+         physics index, then labelling INTER (n_orig <= v < n_split, i.e., the
+         above-half's intersection copies) or DUP (>= n_split, i.e., the
+         below-half's seam copies).
+      2. All 3 verts INTER  -> "above-half" wound face.
+         All 3 verts DUP    -> "below-half" wound face.
+         Mixed              -> fall back to cross-product sign.
+      3. The +-cut_n orientation of each half is not fixed a priori (cut_normal
+         direction is caller-defined). We derive it by majority vote of the
+         cross-product signs of same-class faces. This absorbs sliver-adjacent
+         faces whose extracted winding is flipped -- the majority still gives
+         the correct sign for the class, and the outlier gets overridden.
 
-    Modifies exp_norm in-place and returns it.
+    exp_norm            : (F*3, 3) per-slot normal buffer (modified in place).
+    exp_pos             : (F*3, 3) matching per-slot position buffer.
+    all_render_faces    : (F, 3) face-vertex index array (outer + wound).
+    n_wound_faces       : number of wound faces (sit after n_outer_faces).
+    n_outer_faces       : number of outer faces at the start of the buffer.
+    n_orig, n_split, n_phys : topology-split boundaries.
+    disc_split_phys_idx : (K,) physics indices sourced by RENDER_DUPs at index
+                          n_phys + i, or None if no disc-split duplication.
+    cut_normal          : (3,) unit-ish cut-plane normal.
     """
     if n_wound_faces <= 0:
         return exp_norm
@@ -926,22 +946,50 @@ def _finalize_wound_slot_normals(exp_norm:      np.ndarray,
         return exp_norm
     cut_n = cut_n / cn_norm
 
-    # Wound-face slot IDs: 3 slots per wound face, contiguous after outer.
     start = n_outer_faces * 3
     stop  = start + n_wound_faces * 3
     if stop > len(exp_norm):
-        return exp_norm  # buffer smaller than expected -- bail safely.
+        return exp_norm
 
-    # Face-oriented sign per wound face from geometric cross product.
+    # ---- Cross-product sign per face (used for majority vote + mixed fallback)
     p0 = exp_pos[start    : stop : 3]
     p1 = exp_pos[start + 1: stop : 3]
     p2 = exp_pos[start + 2: stop : 3]
-    face_n = np.cross(p1 - p0, p2 - p0)          # (n_wound, 3)
-    dots   = face_n @ cut_n                       # (n_wound,)
-    signs  = np.where(dots >= 0.0, 1.0, -1.0).astype(np.float32)
-    signed = signs[:, np.newaxis] * cut_n[np.newaxis, :]  # (n_wound, 3)
+    face_n = np.cross(p1 - p0, p2 - p0)
+    dots   = face_n @ cut_n
+    xsigns = np.where(dots >= 0.0, 1.0, -1.0).astype(np.float32)  # (Nw,)
 
-    # Broadcast each face's signed cut_n across its 3 slots.
+    # ---- Topology-based per-vert classification with RENDER_DUP resolution
+    wound_faces = np.asarray(all_render_faces[n_outer_faces:
+                                              n_outer_faces + n_wound_faces],
+                             dtype=np.int64)
+    resolved = wound_faces.copy()
+    if disc_split_phys_idx is not None and len(disc_split_phys_idx) > 0:
+        rmask = resolved >= n_phys
+        if rmask.any():
+            resolved[rmask] = np.asarray(disc_split_phys_idx,
+                                          dtype=np.int64)[resolved[rmask] - n_phys]
+    is_inter = (resolved >= n_orig) & (resolved < n_split)
+    is_dup   = resolved >= n_split
+    all_inter = is_inter.all(axis=1)
+    all_dup   = is_dup.all(axis=1)
+
+    # ---- Majority cross-sign per class defines the class -> +-cut_n mapping
+    def _majority_sign(mask, default):
+        if not mask.any():
+            return float(default)
+        s = float(xsigns[mask].sum())
+        return 1.0 if s > 0 else (-1.0 if s < 0 else float(default))
+    inter_sign = _majority_sign(all_inter, +1.0)
+    dup_sign   = _majority_sign(all_dup,   -1.0)
+
+    # ---- Final sign per face
+    final_signs = xsigns.copy()
+    final_signs[all_inter] = inter_sign
+    final_signs[all_dup]   = dup_sign
+    # mixed faces keep their cross-product sign
+
+    signed = final_signs[:, np.newaxis] * cut_n[np.newaxis, :]
     exp_norm[start:stop] = np.repeat(signed, 3, axis=0)
     return exp_norm
 
