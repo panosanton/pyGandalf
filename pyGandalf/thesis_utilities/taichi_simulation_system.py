@@ -330,7 +330,9 @@ class TaichiSimulationSystem(System):
         self._b_prev = b_now
 
         t_blade0 = time.perf_counter()
-        if comp.blade_is_active:
+        # Blade advances only when physics is running. Pausing (P) freezes both
+        # deformation and the blade cursor so the mesh state can be inspected.
+        if comp.blade_is_active and not comp.sim_paused:
             _advance_progressive_blade(comp, mesh_comp, ts)
         t_blade1 = time.perf_counter()
 
