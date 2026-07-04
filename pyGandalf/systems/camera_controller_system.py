@@ -53,6 +53,9 @@ class CameraControllerSystem(System):
 
         if InputManager().get_key_down(glfw.MOUSE_BUTTON_2) and camera.primary:
             velocity = camera_controller.movement_speed * ts
+            # Hold middle mouse for fine-grained (slower) movement.
+            if InputManager().get_key_down(glfw.MOUSE_BUTTON_3):
+                velocity *= 0.2
             if InputManager().get_key_down(glfw.KEY_W):
                 transform.translation += camera_controller.front * velocity
             if InputManager().get_key_down(glfw.KEY_S):

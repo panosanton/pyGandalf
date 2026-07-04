@@ -131,6 +131,7 @@ Corotational FEM with implicit Euler integration and CG solver, running on GPU v
   - Reads params: `young_modulus`, `poisson_ratio`, `density`, `cg_iters`, `cg_eps`, `damping`, `v_max`, `gravity`
   - `setup_cut()` calls `_cut_topology_physics`, discards spring-mass result, builds `_FEMSimulator` from split topology
   - Orphan constraint: `{orphan: (master, offset)}` dict; each step sets `pos[orphan] = pos[master] + offset`
+  - Master-side classification is position-based (sign of `(pos - origin) . normal`) so that each orphan is anchored to a master on the same half of the cut plane
 - `NeuralMethod` -- placeholder, not yet implemented
 
 ### `pyGandalf/thesis_utilities/fem_simulator.py`
@@ -151,6 +152,7 @@ Corotational FEM with implicit Euler integration and CG solver, running on GPU v
 **Cut-pipeline helpers (extracted from `taichi_simulation_system.py`):**
 - `_cut_topology_physics()` -- shared topology helper used by both SpringMassMethod and FEMMethod
   - Pre-snaps near-plane verts (`0 < dist < snap_eps` snapped to `-snap_eps`) to prevent degenerate 1+3 splits
+  - Extra seam-dup case for plane-hit ORIGs (`|signed_dist| < snap_eps * 10`, present in below-tets only): appended to `shared_list` so a below-half DUP is created for each. Ensures a below-half boundary face touching such a vertex has its on-plane corner anchored to something that moves with the below half.
   - Returns `phantom_above_face_keys`: set of face keys from interior crossing tets (used by `_compute_face_categories` for V-key debug)
 - `_split_crossed_tets()` -- accepts `surface_tet_indices` parameter; tracks which tets are surface tets for tet-provenance phantom marking
 - `_extract_boundary_faces()` -- robust opposite-vertex winding correction; returns faces appearing in exactly one tet
@@ -186,6 +188,9 @@ Corotational FEM with implicit Euler integration and CG solver, running on GPU v
 | WASD | Move camera |
 | Right-click drag | Rotate camera |
 | Q / E or Space / Shift | Camera up/down |
+| Middle mouse (held) + WASD | Fine-grained (0.2x) camera movement |
+| Ctrl + Left-click | Pick tool: dump face/tet/vert info to console |
+| Ctrl + Right-click | Clear pick highlight |
 
 **Debug coloring (active with `--debug-colors` flag):**
 - Requires `lit_blinn_phong_debug.vs/.fs` and 4th vertex attribute (per-face color, location 3)
@@ -302,7 +307,6 @@ Verts with zero mass after sliver filtering. Sliver tets near the cut plane are 
 - **SOFA GPU (SofaCUDA):** `CudaTetrahedronFEMForceField` unavailable in the installed SOFA version. SOFA kept as reference only.
 - **Explicit Euler stability (spring-mass):** `sub_dt` must stay below `dt_crit = 2*sqrt(m_vertex / k_eff)`. Current params give ~14x safety margin.
 - **Trimesh simplification API:** Installed version uses `target_reduction` (0-1 float) not face count. Code handles both via try/except.
-- **Phantom inside faces (Bug B):** 554 inward-facing collar faces still present after PhantomCollar filter. Under active investigation on branch `fix-phantom-inside-faces`.
 
 ---
 

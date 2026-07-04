@@ -216,7 +216,8 @@ def pick_and_dump(comp, mesh_comp, camera_comp, camera_transform,
     # ---- Per-vertex live state ---------------------------------------------
     _dump_vertex_states(comp, list(set(int(v) for v in face_verts)
                                     | {int(v) for ti in parent_tets
-                                       for v in tets_np[ti]}))
+                                       for v in tets_np[ti]}),
+                        n_orig=n_orig, n_split=n_split)
 
     # ---- Highlight if debug-colors are enabled ------------------------------
     _apply_highlight(comp, mesh_comp, face_row, face_verts, parent_tets, tets_np)
@@ -262,10 +263,15 @@ def _classify_face_bucket(comp, face_row):
     return "WOUND", int(face_row - n_outer)
 
 
-def _dump_vertex_states(comp, vert_indices):
+def _dump_vertex_states(comp, vert_indices, n_orig=None, n_split=None):
     sim = comp.simulator
     pos = comp.method.get_positions()
     vel = comp.method.get_velocities()
+    cut_normal = None
+    cut_origin = None
+    if comp._cut_normal is not None:
+        cut_normal = np.asarray(comp._cut_normal, dtype=np.float32)
+        cut_origin = np.asarray(comp.cut_plane_origin, dtype=np.float32)
     try:
         mass = sim._masses.to_numpy()[:sim.n_verts]
     except Exception:
@@ -300,6 +306,40 @@ def _dump_vertex_states(comp, vert_indices):
               f"pos=({p[0]:+.4f}, {p[1]:+.4f}, {p[2]:+.4f}) "
               f"vel=({vv[0]:+.4f}, {vv[1]:+.4f}, {vv[2]:+.4f}) "
               f"mass={m:.4e} fixed={fx}{orphan_str}")
+
+        # Half-consistency diagnostic for orphans
+        if is_orphan and cut_normal is not None and n_orig is not None and n_split is not None:
+            master, _ = orphan_map[v]
+            d_orph = float(np.dot(p - cut_origin, cut_normal))
+            mp = pos[master] if master < sim.n_verts else None
+            if mp is None:
+                print(f"[Pick]     >> master {master} out of range")
+            else:
+                d_mast = float(np.dot(mp - cut_origin, cut_normal))
+                # Setup-time label per matcher's rule (INTER=+1, DUP=-1, ORIG=sign(pos.n))
+                if n_orig <= v < n_split:
+                    orph_label = +1
+                    label_reason = "INTER"
+                elif v >= n_split:
+                    orph_label = -1
+                    label_reason = "DUP"
+                else:
+                    orph_label = int(np.sign(d_orph)) if abs(d_orph) > 1e-6 else 0
+                    label_reason = f"ORIG(sign(pos.n)={d_orph:+.4f})"
+                # Master's current-side (live position)
+                mast_side = int(np.sign(d_mast)) if abs(d_mast) > 1e-6 else 0
+                # Verdict
+                if orph_label == 0:
+                    verdict = "ON-PLANE (fallback)"
+                elif mast_side == 0:
+                    verdict = "MASTER-ON-PLANE"
+                elif orph_label == mast_side:
+                    verdict = "AGREE"
+                else:
+                    verdict = "*** DISAGREE ***"
+                print(f"[Pick]     >> half-check: orph_label={orph_label:+d} "
+                      f"({label_reason})  master_side={mast_side:+d} "
+                      f"(d_mast={d_mast:+.4f})  d_orph={d_orph:+.4f}  {verdict}")
 
         # Cutting springs involving this vert
         if sa is not None and len(sa) > 0:

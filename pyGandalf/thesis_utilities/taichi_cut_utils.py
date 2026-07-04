@@ -424,13 +424,37 @@ def _cut_topology_physics(
         split_fixed[new_id] = 0
 
     # --- Vertex duplication (seam) ---
-    # Vertices appearing in both halves are seam candidates. np.intersect1d
-    # returns a sorted, deduplicated array faster than building two Python sets
-    # and intersecting. Only duplicate intersection vertices (idx >= n_orig);
-    # originals at signed_dist ~ 0 appear in both halves but must stay shared.
+    # Standard case: INTER verts (idx >= n_orig) appearing in both halves.
+    # ORIG verts get classified into exactly one half by pre-snap / signed_dist,
+    # so they never appear in the intersection here -- their below-cap variant
+    # is handled by the "extra case" block below.
     _shared_all   = np.intersect1d(above_tets.ravel(), below_tets.ravel(),
                                    assume_unique=False)
     shared_list   = [int(v) for v in _shared_all[_shared_all >= n_orig]]
+
+    # Extra case: ORIG verts that the cut plane hits dead on (|signed_dist|
+    # within tolerance).  These are the only ORIGs that cause the "spike face"
+    # bug -- the plane passes through them, so a below-half boundary face
+    # touching them has its "on-plane corner" anchored to a near-plane master
+    # that doesn't move with the below half.  Give them an explicit below-half
+    # DUP so the face uses that instead.  Deep-below or deep-above ORIGs are
+    # unaffected: their masters are deep on their own half and move with it.
+    _plane_hit_eps = snap_eps * 10.0
+    _plane_hit     = np.where(np.abs(signed_dist) < _plane_hit_eps)[0]
+    if len(_plane_hit) > 0:
+        _below_verts = np.unique(below_tets.ravel())
+        _above_verts = np.unique(above_tets.ravel())
+        # Only need dup for plane-hit ORIGs that ended up in below_tets but
+        # not above_tets (a below-half DUP is the remap target). Above-only
+        # cases don't get corrupted by remap and don't produce below-cap
+        # spikes.
+        _hit_in_below = _plane_hit[np.isin(_plane_hit, _below_verts)
+                                    & ~np.isin(_plane_hit, _above_verts)]
+        _extra = _hit_in_below[~np.isin(_hit_in_below, _shared_all)]
+        if len(_extra) > 0:
+            shared_list = shared_list + [int(v) for v in _extra]
+            print(f"[Cut] Extra seam dup: {len(_extra)} plane-hit ORIG verts "
+                  f"(|dist| < {_plane_hit_eps:.2e})")
     n_shared       = len(shared_list)
     print(f"[Cut] Duplicating {n_shared} seam vertices")
 
@@ -497,6 +521,11 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
         - a dup seam vertex (v >= n_split), or
         - an original seam vertex (v < n_orig and v in shared_list).
       outer face: any face with at least one off-plane original vertex.
+
+      With the plane-hit ORIG augmentation in _cut_topology_physics,
+      shared_list may include ORIG indices whose position was on the cut
+      plane at cut time. Their DUPs also sit on the plane initially, so
+      treating them as on-plane matches the geometry.
     """
     seam_set = set(int(v) for v in shared_list) if shared_list else set()
 

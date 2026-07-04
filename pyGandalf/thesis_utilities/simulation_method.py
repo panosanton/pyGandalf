@@ -804,19 +804,19 @@ class FEMMethod(SimulationMethod):
             # Exclude them as masters so orphan verts don't get anchored to the plane.
             _not_inter = (_nonzero_idx < n_orig) | (_nonzero_idx >= n_split)
 
-            # Per-vert centroid dot for CANDIDATE filtering only.
-            # Needed because seam-dup candidates (>= n_split) are co-located with their
-            # above-half counterparts at cut time, so position is ambiguous for them.
-            _tet_cdots_fem = (final_pos[fem_tets].mean(axis=1) - origin) @ normal
-            _sum_f  = np.zeros(len(final_pos), dtype=np.float64)
-            _cnt_f  = np.zeros(len(final_pos), dtype=np.int32)
-            np.add.at(_sum_f, fem_tets.ravel(), np.repeat(_tet_cdots_fem, 4))
-            np.add.at(_cnt_f, fem_tets.ravel(), 1)
-            _vert_cdots = _sum_f / np.where(_cnt_f > 0, _cnt_f, 1)
-            _nz_cdots   = _vert_cdots[_nonzero_idx]
+            # Master-side classification (position-based, not tet-centroid).
+            # DUP verts (>= n_split) are below-half by construction.
+            # ORIG verts (< n_orig) use sign(dot(pos - origin, normal)).
+            # INTER verts (n_orig..n_split-1) are excluded via _not_inter.
+            # Tet-centroid averaging (the previous rule) misclassified near-plane
+            # ORIG masters whose incident tets straddled both halves -- caused
+            # below-labeled orphans to be anchored to above-side masters and
+            # produced stretched "spike" faces after separation.
+            _master_dot = (_nz_pos - origin) @ normal
+            _is_dup     = _nonzero_idx >= n_split
+            _is_orig    = _nonzero_idx < n_orig
 
             # Side label per orphan: 1 = above, -1 = below, 0 = on-plane (use _not_inter only).
-            # Same rules as the per-vert branch above, but vectorized across all orphans.
             from scipy.spatial import cKDTree
             _zero_side = np.zeros(len(_zero_idx), dtype=np.int8)
             _zero_side[_zero_idx >= n_split] = -1
@@ -827,8 +827,8 @@ class FEMMethod(SimulationMethod):
                 _zero_side[_orig_pick] = np.where(_dot > 0, 1,
                                           np.where(_dot < 0, -1, 0)).astype(np.int8)
 
-            _above_mask       = _not_inter & (_nz_cdots > 0)
-            _below_mask       = _not_inter & (_nz_cdots < 0)
+            _above_mask       = _is_orig & (_master_dot > 0)
+            _below_mask       = _is_dup | (_is_orig & (_master_dot < 0))
             _above_pos        = _nz_pos[_above_mask];    _above_idx_arr    = _nonzero_idx[_above_mask]
             _below_pos        = _nz_pos[_below_mask];    _below_idx_arr    = _nonzero_idx[_below_mask]
             _notinter_pos     = _nz_pos[_not_inter];     _notinter_idx_arr = _nonzero_idx[_not_inter]

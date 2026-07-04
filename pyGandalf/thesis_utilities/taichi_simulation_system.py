@@ -38,7 +38,12 @@ Why explicit Euler:
 """
 
 import numpy as np
+import sys
 import time
+
+# Gate the B-press cProfile + ti.profiler dump behind the same CLI flag
+# used by mesh_lib.py / taichi_cut_utils.py to enable Taichi's kernel_profiler.
+_PROFILE_KERNELS = "--profile-kernels" in sys.argv
 
 import glfw
 import taichi as ti
@@ -288,33 +293,36 @@ class TaichiSimulationSystem(System):
         b_now = InputManager().get_key_down(glfw.KEY_B)
         if b_now and not getattr(self, '_b_prev', False):
             if not comp.blade_initialized:
-                # ----- profiling wrapper around the full B-press handler -----
-                import cProfile, pstats, io
-                _prof = cProfile.Profile()
-                _t0 = time.perf_counter()
-                _prof.enable()
-                try:
-                    _setup_progressive_cut(comp, mesh_comp)
-                finally:
-                    _prof.disable()
-                    _dt = time.perf_counter() - _t0
-                    _s = io.StringIO()
-                    pstats.Stats(_prof, stream=_s).sort_stats('cumulative').print_stats(30)
-                    print("=" * 70, flush=True)
-                    print(f"[PROFILE] _setup_progressive_cut wall time: {_dt:.3f}s", flush=True)
-                    print("[PROFILE] top 30 by cumulative time:", flush=True)
-                    print("=" * 70, flush=True)
-                    print(_s.getvalue(), flush=True)
+                if _PROFILE_KERNELS:
+                    # Python + Taichi profile of the one-shot setup, gated behind
+                    # --profile-kernels so interactive runs aren't slowed down.
+                    import cProfile, pstats, io
+                    _prof = cProfile.Profile()
+                    _t0 = time.perf_counter()
+                    _prof.enable()
                     try:
-                        ti.sync()
+                        _setup_progressive_cut(comp, mesh_comp)
+                    finally:
+                        _prof.disable()
+                        _dt = time.perf_counter() - _t0
+                        _s = io.StringIO()
+                        pstats.Stats(_prof, stream=_s).sort_stats('cumulative').print_stats(30)
                         print("=" * 70, flush=True)
-                        print("[PROFILE] Taichi kernel profile (cumulative since startup):", flush=True)
+                        print(f"[PROFILE] _setup_progressive_cut wall time: {_dt:.3f}s", flush=True)
+                        print("[PROFILE] top 30 by cumulative time:", flush=True)
                         print("=" * 70, flush=True)
-                        ti.profiler.print_kernel_profiler_info()
-                        ti.profiler.clear_kernel_profiler_info()
-                    except Exception as _e:
-                        print(f"[TaichiProfile] unavailable: {_e}", flush=True)
-                # -------------------------------------------------------------
+                        print(_s.getvalue(), flush=True)
+                        try:
+                            ti.sync()
+                            print("=" * 70, flush=True)
+                            print("[PROFILE] Taichi kernel profile (cumulative since startup):", flush=True)
+                            print("=" * 70, flush=True)
+                            ti.profiler.print_kernel_profiler_info()
+                            ti.profiler.clear_kernel_profiler_info()
+                        except Exception as _e:
+                            print(f"[TaichiProfile] unavailable: {_e}", flush=True)
+                else:
+                    _setup_progressive_cut(comp, mesh_comp)
             else:
                 comp.blade_is_active = not comp.blade_is_active
                 print(f"[Blade] {'Resumed' if comp.blade_is_active else 'Paused'}")
