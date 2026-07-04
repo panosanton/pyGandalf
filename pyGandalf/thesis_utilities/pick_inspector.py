@@ -202,6 +202,9 @@ def pick_and_dump(comp, mesh_comp, camera_comp, camera_transform,
                   f"pos=({p[0]:+.4f}, {p[1]:+.4f}, {p[2]:+.4f})  "
                   f"dist_to_plane={d:+.4f}")
 
+    # Per-face-vertex normals (from the VBO — what the shader actually samples).
+    _dump_picked_face_normals(comp, mesh_comp, face_row, face_verts)
+
     # ---- Parent tets --------------------------------------------------------
     tets_np = comp.simulator._tets.to_numpy()[:comp.simulator.n_tets]
     parent_tets = _find_tets_containing_vectorised(face_verts, tets_np)
@@ -261,6 +264,44 @@ def _classify_face_bucket(comp, face_row):
     if face_row < n_outer:
         return "OUTER", int(face_row)
     return "WOUND", int(face_row - n_outer)
+
+
+def _dump_picked_face_normals(comp, mesh_comp, face_row, face_verts):
+    """Print the 3 face-vertex normals the shader will sample for this face.
+
+    Exploded (unindexed) layout: slots [face_row*3, face_row*3+1, face_row*3+2].
+    Indexed layout: slots [face_verts[0], face_verts[1], face_verts[2]].
+    Reads directly from the normal VBO (mesh_comp.buffers[1]) so we see the same
+    data the shader sees.
+    """
+    if len(mesh_comp.buffers) < 2:
+        print(f"[Pick] no normal VBO (buffers={len(mesh_comp.buffers)})")
+        return
+    exploded = bool(getattr(comp, '_face_expanded', False))
+    if exploded:
+        slots = [face_row * 3 + i for i in range(3)]
+    else:
+        slots = [int(v) for v in face_verts]
+
+    try:
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, mesh_comp.buffers[1])
+        normals = np.empty((3, 3), dtype=np.float32)
+        stride = 3 * 4  # 3 float32
+        for k, s in enumerate(slots):
+            data = gl.glGetBufferSubData(gl.GL_ARRAY_BUFFER, s * stride, stride)
+            normals[k] = np.frombuffer(data, dtype=np.float32).copy()
+        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+    except Exception as e:
+        print(f"[Pick] normal VBO read failed: {e}")
+        return
+
+    label = "exploded" if exploded else "indexed"
+    print(f"[Pick] Face-vertex normals ({label} VBO, buffer[1]):")
+    for k, (s, v) in enumerate(zip(slots, face_verts)):
+        n = normals[k]
+        mag = float(np.linalg.norm(n))
+        print(f"[Pick]   slot {s:>7d}  vert {int(v):>6d}  "
+              f"n=({n[0]:+.4f}, {n[1]:+.4f}, {n[2]:+.4f})  |n|={mag:.4f}")
 
 
 def _dump_vertex_states(comp, vert_indices, n_orig=None, n_split=None):

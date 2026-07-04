@@ -895,6 +895,57 @@ def _compute_normals_post_cut(vertices:    np.ndarray,
     return normals
 
 
+def _finalize_wound_slot_normals(exp_norm:      np.ndarray,
+                                  exp_pos:       np.ndarray,
+                                  n_wound_faces: int,
+                                  n_outer_faces: int,
+                                  cut_normal:    np.ndarray) -> np.ndarray:
+    """
+    Override normals for wound-face slots with the face-oriented +-cut_n.
+
+    The per-vertex normal pipeline (`_compute_normals_post_cut`) cannot give
+    correct shading for a vertex that belongs to both a wound face and a
+    collar face -- one per-vertex slot is broadcast to every face-slot it
+    appears in. This finalizer runs in the exploded (per-slot) frame and
+    stamps `sign * cut_n` into every wound-face slot without touching
+    collar/surface slots.
+
+    exp_norm       : (F*3, 3) already-broadcast per-slot normal buffer.
+    exp_pos        : (F*3, 3) matching per-slot position buffer.
+    n_wound_faces  : number of wound faces (they sit after n_outer_faces).
+    n_outer_faces  : number of outer faces at the start of the buffer.
+    cut_normal     : (3,) unit-ish cut-plane normal.
+
+    Modifies exp_norm in-place and returns it.
+    """
+    if n_wound_faces <= 0:
+        return exp_norm
+    cut_n = np.asarray(cut_normal, dtype=np.float32)
+    cn_norm = float(np.linalg.norm(cut_n))
+    if cn_norm < 1e-12:
+        return exp_norm
+    cut_n = cut_n / cn_norm
+
+    # Wound-face slot IDs: 3 slots per wound face, contiguous after outer.
+    start = n_outer_faces * 3
+    stop  = start + n_wound_faces * 3
+    if stop > len(exp_norm):
+        return exp_norm  # buffer smaller than expected -- bail safely.
+
+    # Face-oriented sign per wound face from geometric cross product.
+    p0 = exp_pos[start    : stop : 3]
+    p1 = exp_pos[start + 1: stop : 3]
+    p2 = exp_pos[start + 2: stop : 3]
+    face_n = np.cross(p1 - p0, p2 - p0)          # (n_wound, 3)
+    dots   = face_n @ cut_n                       # (n_wound,)
+    signs  = np.where(dots >= 0.0, 1.0, -1.0).astype(np.float32)
+    signed = signs[:, np.newaxis] * cut_n[np.newaxis, :]  # (n_wound, 3)
+
+    # Broadcast each face's signed cut_n across its 3 slots.
+    exp_norm[start:stop] = np.repeat(signed, 3, axis=0)
+    return exp_norm
+
+
 def _update_vbo(vao: int, vbo: int, data: np.ndarray):
     """Upload new data into an existing VBO (no reallocation)."""
     flat = data.flatten().astype(np.float32)

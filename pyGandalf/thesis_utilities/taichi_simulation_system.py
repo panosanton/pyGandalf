@@ -69,6 +69,7 @@ from .taichi_cut_utils import (
     _extract_boundary_faces,
     _compute_normals,
     _compute_normals_post_cut,
+    _finalize_wound_slot_normals,
     _update_vbo,
     _compute_debug_face_colors,
     _compute_face_categories,
@@ -520,6 +521,13 @@ class TaichiSimulationSystem(System):
             flat = comp._all_render_faces.flatten()
             upload_pos  = render_positions[flat].reshape(-1, 3)
             upload_norm = new_normals[flat].reshape(-1, 3)
+            # Per-slot override: wound-face slots snap to +-cut_n regardless of
+            # the per-vertex normal (fixes near-plane INTER shading anomalies).
+            if comp._cut_normal is not None and comp._n_outer_faces is not None:
+                n_outer = int(comp._n_outer_faces)
+                n_wound = len(comp._all_render_faces) - n_outer
+                _finalize_wound_slot_normals(upload_norm, upload_pos,
+                                              n_wound, n_outer, comp._cut_normal)
         else:
             upload_pos  = render_positions
             upload_norm = new_normals
@@ -728,6 +736,10 @@ def _perform_cut(comp: TaichiSimulationComponent,
     flat              = all_faces.flatten()
     exp_pos           = render_pos[flat].reshape(-1, 3)
     exp_norm          = new_normals[flat].reshape(-1, 3)
+    _finalize_wound_slot_normals(exp_norm, exp_pos,
+                                  n_wound_faces=len(all_faces) - len(outer_faces),
+                                  n_outer_faces=len(outer_faces),
+                                  cut_normal=normal)
     exp_tex           = np.zeros((len(all_faces) * 3, 2), dtype=np.float32)
     exp_colors        = np.repeat(face_colors, 3, axis=0)
     trivial_idx       = np.arange(len(all_faces) * 3, dtype=np.uint32).reshape(-1, 3)
@@ -912,6 +924,10 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     flat_all   = all_render_faces.flatten()
     exp_pos    = render_pos[flat_all].reshape(-1, 3)
     exp_norm   = new_normals[flat_all].reshape(-1, 3)   # hidden wound normals = zero initially (OK)
+    _finalize_wound_slot_normals(exp_norm, exp_pos,
+                                  n_wound_faces=len(wound_faces),
+                                  n_outer_faces=len(outer_faces),
+                                  cut_normal=normal)
     exp_tex    = np.zeros((len(all_render_faces) * 3, 2), dtype=np.float32)
     exp_colors = np.repeat(face_colors, 3, axis=0)
 
