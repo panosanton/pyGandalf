@@ -366,13 +366,19 @@ def _cut_topology_physics(
     # Ref: Edelsbrunner-Mucke, Simulation of Simplicity, 1990.
     mesh_scale = float(np.linalg.norm(positions.max(axis=0) - positions.min(axis=0)))
     snap_eps   = mesh_scale * 1e-4
-    sos_eps    = snap_eps * 10.0
+    # SoS only needs to break exact d==0 ties: signed_dist is computed once per
+    # vert, so every tet sharing a vert reads the same sign already. Tolerance
+    # only has to cover FP rounding noise from the (pos - origin) @ normal dot
+    # product, which for float32 is ~1e-6 relative. 1e-5 gives a safe margin.
+    # Kept strictly <= snap_eps so anything we relabel to below-side is also
+    # physically snapped onto the plane by the rim-snap block (no jigsaw).
+    sos_eps    = mesh_scale * 1e-5
     on_plane_mask = np.abs(signed_dist) < sos_eps
     if on_plane_mask.any():
         n_above_side = int(((signed_dist > 0) & on_plane_mask).sum())
         n_below_side = int(((signed_dist <= 0) & on_plane_mask).sum())
         signed_dist_split = signed_dist.copy()
-        signed_dist_split[on_plane_mask] = -snap_eps
+        signed_dist_split[on_plane_mask] = -sos_eps
         print(f"[Cut] SoS perturbation: {int(on_plane_mask.sum())} on-plane verts "
               f"labelled below ({n_above_side} above-side + {n_below_side} below-side, "
               f"threshold {sos_eps:.2e})")
