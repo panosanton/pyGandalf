@@ -354,23 +354,28 @@ def _cut_topology_physics(
     print(f"[Cut] {len(surface_tet_set)} surface tets, "
           f"{len(current_tets) - len(surface_tet_set)} interior tets")
 
-    # --- Pre-snap near-plane above verts to below ---
-    # A vert with 0 < dist < snap_eps is effectively on the cut plane.  If left
-    # as above, it becomes the lone above vert in a 1+3 split, producing a
-    # near-degenerate above-half tet [vi, p0, p1, p2] where p0~p1~p2~vi.
-    # Those near-zero-area outer faces accumulate zero normals for vi, causing
-    # the collar lerp in _compute_normals_post_cut to assign zero normals to the
-    # intersection verts (Bug 1 saw-tooth artifact).  Snapping dist to just
-    # below sends the whole tet to the below-half intact, preserving vi's
-    # original surface faces and their normals.
+    # --- Symbolic perturbation of on-plane vertices (SoS-style) ---
+    # For any vert with |signed_dist| < sos_eps, rewrite the CLASSIFICATION
+    # signal to sit just below the plane. Positions are untouched. Because
+    # the perturbation is per-vertex, every tet sharing a plane-hit vert
+    # makes the same above/below decision in _split_crossed_tets, so no
+    # phantom boundary faces get exposed and no extra seam-dup pass is needed.
+    # The vert-side classification for FEM master picking is tracked
+    # explicitly via the side_label array built below, so we do not need to
+    # perturb positions.
+    # Ref: Edelsbrunner-Mucke, Simulation of Simplicity, 1990.
     mesh_scale = float(np.linalg.norm(positions.max(axis=0) - positions.min(axis=0)))
     snap_eps   = mesh_scale * 1e-4
-    near_above = (signed_dist > 0) & (signed_dist < snap_eps)
-    if near_above.any():
+    sos_eps    = snap_eps * 10.0
+    on_plane_mask = np.abs(signed_dist) < sos_eps
+    if on_plane_mask.any():
+        n_above_side = int(((signed_dist > 0) & on_plane_mask).sum())
+        n_below_side = int(((signed_dist <= 0) & on_plane_mask).sum())
         signed_dist_split = signed_dist.copy()
-        signed_dist_split[near_above] = -snap_eps
-        print(f"[Cut] Pre-snap {int(near_above.sum())} near-plane above verts to below "
-              f"(prevents degenerate 1+3 splits, threshold {snap_eps:.2e})")
+        signed_dist_split[on_plane_mask] = -snap_eps
+        print(f"[Cut] SoS perturbation: {int(on_plane_mask.sum())} on-plane verts "
+              f"labelled below ({n_above_side} above-side + {n_below_side} below-side, "
+              f"threshold {sos_eps:.2e})")
     else:
         signed_dist_split = signed_dist
 
@@ -424,38 +429,13 @@ def _cut_topology_physics(
         split_fixed[new_id] = 0
 
     # --- Vertex duplication (seam) ---
-    # Standard case: INTER verts (idx >= n_orig) appearing in both halves.
-    # ORIG verts get classified into exactly one half by pre-snap / signed_dist,
-    # so they never appear in the intersection here -- their below-cap variant
-    # is handled by the "extra case" block below.
+    # INTER verts (idx >= n_orig) appearing in both halves get a below-half
+    # DUP. Because the SoS pass above ensures no ORIG has signed_dist == 0,
+    # every ORIG is classified into exactly one half and never needs duping.
     _shared_all   = np.intersect1d(above_tets.ravel(), below_tets.ravel(),
                                    assume_unique=False)
     shared_list   = [int(v) for v in _shared_all[_shared_all >= n_orig]]
-
-    # Extra case: ORIG verts that the cut plane hits dead on (|signed_dist|
-    # within tolerance).  These are the only ORIGs that cause the "spike face"
-    # bug -- the plane passes through them, so a below-half boundary face
-    # touching them has its "on-plane corner" anchored to a near-plane master
-    # that doesn't move with the below half.  Give them an explicit below-half
-    # DUP so the face uses that instead.  Deep-below or deep-above ORIGs are
-    # unaffected: their masters are deep on their own half and move with it.
-    _plane_hit_eps = snap_eps * 10.0
-    _plane_hit     = np.where(np.abs(signed_dist) < _plane_hit_eps)[0]
-    if len(_plane_hit) > 0:
-        _below_verts = np.unique(below_tets.ravel())
-        _above_verts = np.unique(above_tets.ravel())
-        # Only need dup for plane-hit ORIGs that ended up in below_tets but
-        # not above_tets (a below-half DUP is the remap target). Above-only
-        # cases don't get corrupted by remap and don't produce below-cap
-        # spikes.
-        _hit_in_below = _plane_hit[np.isin(_plane_hit, _below_verts)
-                                    & ~np.isin(_plane_hit, _above_verts)]
-        _extra = _hit_in_below[~np.isin(_hit_in_below, _shared_all)]
-        if len(_extra) > 0:
-            shared_list = shared_list + [int(v) for v in _extra]
-            print(f"[Cut] Extra seam dup: {len(_extra)} plane-hit ORIG verts "
-                  f"(|dist| < {_plane_hit_eps:.2e})")
-    n_shared       = len(shared_list)
+    n_shared      = len(shared_list)
     print(f"[Cut] Duplicating {n_shared} seam vertices")
 
     remap = np.arange(n_split, dtype=np.int32)
@@ -470,6 +450,19 @@ def _cut_topology_physics(
 
     new_below_tets = remap[below_tets]
     all_tets       = np.vstack([above_tets, new_below_tets])
+
+    # --- Per-vertex side label (SOFA/PhysBAM style) ---
+    # Explicit +1 / -1 tag stamped at cut time so downstream code (FEM orphan
+    # master picking, wound-face classification, etc.) does not have to
+    # re-query sign((pos - origin) . normal) later. The SoS pass ensures
+    # every ORIG has a nonzero signed_dist_split, so the sign is unambiguous.
+    #   [0, n_orig)         ORIG   -> +1 or -1 from signed_dist_split sign
+    #   [n_orig, n_split)   INTER  -> +1 (stays with above half after remap)
+    #   [n_split, end)      DUP    -> -1 (below-half copy by construction)
+    side_label                     = np.empty(len(final_pos), dtype=np.int8)
+    side_label[:n_orig]            = np.where(signed_dist_split >= 0, 1, -1).astype(np.int8)
+    side_label[n_orig:n_split]     = 1
+    side_label[n_split:]           = -1
 
     # --- Rebuild simulator (skipped when caller is FEM and only wants topology) ---
     if build_simulator:
@@ -500,7 +493,7 @@ def _cut_topology_physics(
 
     return (new_sim, final_pos, final_vel, final_mass, final_fixed,
             all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set,
-            phantom_above_face_keys)
+            phantom_above_face_keys, side_label)
 
 
 def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
@@ -518,14 +511,12 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
     Classification (index-only, no geometry needed):
       wound face: every vertex is "on the cut plane", meaning:
         - an intersection vertex (n_orig <= v < n_split), or
-        - a dup seam vertex (v >= n_split), or
-        - an original seam vertex (v < n_orig and v in shared_list).
+        - a dup seam vertex (v >= n_split).
       outer face: any face with at least one off-plane original vertex.
 
-      With the plane-hit ORIG augmentation in _cut_topology_physics,
-      shared_list may include ORIG indices whose position was on the cut
-      plane at cut time. Their DUPs also sit on the plane initially, so
-      treating them as on-plane matches the geometry.
+      SoS symbolic perturbation in _cut_topology_physics guarantees no ORIG
+      has signed_dist == 0, so shared_list contains only INTER indices and
+      seam-dup handling has a single uniform case.
     """
     seam_set = set(int(v) for v in shared_list) if shared_list else set()
 

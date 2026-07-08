@@ -655,7 +655,7 @@ def _cut_topology(comp: TaichiSimulationComponent,
 
     (new_sim, final_pos, final_vel, final_mass, final_fixed,
      all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set,
-     phantom_above_face_keys) = result
+     phantom_above_face_keys, side_label) = result
 
     comp.simulator          = new_sim
     comp.current_tetrahedra = all_tets
@@ -667,7 +667,7 @@ def _cut_topology(comp: TaichiSimulationComponent,
 
     return (final_pos, final_vel, final_mass, final_fixed,
             all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set,
-            phantom_above_face_keys)
+            phantom_above_face_keys, side_label)
 
 
 def _perform_cut(comp: TaichiSimulationComponent,
@@ -690,7 +690,7 @@ def _perform_cut(comp: TaichiSimulationComponent,
 
     (final_pos, final_vel, final_mass, final_fixed,
      all_tets, n_orig, n_split, shared_list, remap, inter_data,
-     orig_surf_set, phantom_above_face_keys) = result
+     orig_surf_set, phantom_above_face_keys, _side_label) = result
     comp._n_orig      = n_orig
     comp._n_split     = n_split
     comp._inter_data  = inter_data
@@ -808,7 +808,7 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     # Extract topology data from the cached result tuple for surface computation.
     (_new_sim, final_pos, _final_vel, _final_mass, _final_fixed,
      all_tets, n_orig, n_split, shared_list, remap, inter_data,
-     orig_surf_set, phantom_above_face_keys) = comp.method._topology_result
+     orig_surf_set, phantom_above_face_keys, _side_label) = comp.method._topology_result
 
     comp._n_orig      = n_orig
     comp._n_split     = n_split

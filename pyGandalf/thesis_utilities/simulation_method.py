@@ -378,7 +378,7 @@ class SpringMassMethod(SimulationMethod):
 
         (new_sim, final_pos, _final_vel, _final_mass, _final_fixed,
          all_tets, n_orig, n_split, shared_list, remap, _inter_data, _orig_surf_set,
-         _phantom_keys) = result
+         _phantom_keys, _side_label) = result
 
         self._simulator       = new_sim
         self._current_tets    = all_tets
@@ -743,7 +743,7 @@ class FEMMethod(SimulationMethod):
 
         (_, final_pos, final_vel, _, final_fixed,
          all_tets, n_orig, n_split, shared_list, remap,
-         _inter_data, _orig_surf_set, _phantom_keys) = result
+         _inter_data, _orig_surf_set, _phantom_keys, side_label) = result
 
         # Check 4b: fixed count after topology rebuild
         n_fixed_after = int(final_fixed.sum())
@@ -804,31 +804,23 @@ class FEMMethod(SimulationMethod):
             # Exclude them as masters so orphan verts don't get anchored to the plane.
             _not_inter = (_nonzero_idx < n_orig) | (_nonzero_idx >= n_split)
 
-            # Master-side classification (position-based, not tet-centroid).
-            # DUP verts (>= n_split) are below-half by construction.
-            # ORIG verts (< n_orig) use sign(dot(pos - origin, normal)).
-            # INTER verts (n_orig..n_split-1) are excluded via _not_inter.
-            # Tet-centroid averaging (the previous rule) misclassified near-plane
-            # ORIG masters whose incident tets straddled both halves -- caused
-            # below-labeled orphans to be anchored to above-side masters and
-            # produced stretched "spike" faces after separation.
-            _master_dot = (_nz_pos - origin) @ normal
+            # Master-side classification via side_label (SOFA/PhysBAM-style).
+            # side_label is stamped at cut time from tet membership and SoS
+            # symbolic perturbation, so every ORIG has an unambiguous +1/-1
+            # tag even when its position sits exactly on the cut plane. This
+            # replaces the fragile sign(dot(pos - origin, normal)) query used
+            # previously, which dropped on-plane verts from both above and
+            # below master pools and let orphans anchor across the plane
+            # (spike-face mechanism).
             _is_dup     = _nonzero_idx >= n_split
             _is_orig    = _nonzero_idx < n_orig
+            _master_side = side_label[_nonzero_idx]
 
-            # Side label per orphan: 1 = above, -1 = below, 0 = on-plane (use _not_inter only).
             from scipy.spatial import cKDTree
-            _zero_side = np.zeros(len(_zero_idx), dtype=np.int8)
-            _zero_side[_zero_idx >= n_split] = -1
-            _zero_side[(_zero_idx >= n_orig) & (_zero_idx < n_split)] = 1
-            _orig_pick = _zero_idx < n_orig
-            if _orig_pick.any():
-                _dot = (final_pos[_zero_idx[_orig_pick]] - origin) @ normal
-                _zero_side[_orig_pick] = np.where(_dot > 0, 1,
-                                          np.where(_dot < 0, -1, 0)).astype(np.int8)
+            _zero_side = side_label[_zero_idx]
 
-            _above_mask       = _is_orig & (_master_dot > 0)
-            _below_mask       = _is_dup | (_is_orig & (_master_dot < 0))
+            _above_mask       = _is_orig & (_master_side > 0)
+            _below_mask       = _is_dup | (_is_orig & (_master_side < 0))
             _above_pos        = _nz_pos[_above_mask];    _above_idx_arr    = _nonzero_idx[_above_mask]
             _below_pos        = _nz_pos[_below_mask];    _below_idx_arr    = _nonzero_idx[_below_mask]
             _notinter_pos     = _nz_pos[_not_inter];     _notinter_idx_arr = _nonzero_idx[_not_inter]
