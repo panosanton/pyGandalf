@@ -329,10 +329,20 @@ class TaichiSimulationSystem(System):
                 print(f"[Blade] {'Resumed' if comp.blade_is_active else 'Paused'}")
         self._b_prev = b_now
 
+        # --- N key: step one frame while paused ---
+        # Polled before the blade-advance and physics-step gates so a single N
+        # press advances BOTH the cut cursor and one physics tick.
+        n_now = InputManager().get_key_down(glfw.KEY_N)
+        if n_now and not getattr(self, '_n_prev', False):
+            if comp.sim_paused:
+                comp._step_one_frame = True
+        self._n_prev = n_now
+
         t_blade0 = time.perf_counter()
-        # Blade advances only when physics is running. Pausing (P) freezes both
-        # deformation and the blade cursor so the mesh state can be inspected.
-        if comp.blade_is_active and not comp.sim_paused:
+        # Blade advances when physics is running, or when the user requested a
+        # single frame step (N) while paused.
+        if comp.blade_is_active and (not comp.sim_paused
+                                     or getattr(comp, '_step_one_frame', False)):
             _advance_progressive_blade(comp, mesh_comp, ts)
         t_blade1 = time.perf_counter()
 
@@ -348,13 +358,6 @@ class TaichiSimulationSystem(System):
             comp.sim_paused = not comp.sim_paused
             print(f"[Sim] Physics {'paused' if comp.sim_paused else 'resumed'}")
         self._p_prev = p_now
-
-        # --- N key: step one frame while paused ---
-        n_now = InputManager().get_key_down(glfw.KEY_N)
-        if n_now and not getattr(self, '_n_prev', False):
-            if comp.sim_paused:
-                comp._step_one_frame = True
-        self._n_prev = n_now
 
         # --- X key: disc parallelism check (yellow non-parallel disc faces) ---
         x_now = InputManager().get_key_down(glfw.KEY_X)
