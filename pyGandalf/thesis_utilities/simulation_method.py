@@ -550,6 +550,14 @@ class FEMMethod(SimulationMethod):
         self._opening_ramp_queue  = []
         self._orphan_constraints  = {}   # zero-mass vert -> master vert (post-cut)
         self._debug_orphan_verts  = set()  # indices of all orphaned verts after cut (for purple overlay)
+        # Phase 1b progressive-cut state (populated by setup_cut; unused when
+        # progressive_cut=False, in which case _cut_topology_physics runs once
+        # with split_mask=None at B-press as before).
+        self._progressive_cut     = bool(overrides.get('progressive_cut', False))
+        self._pristine_tets       = None   # (n_tets, 4) pre-cut tet array; input to per-frame split
+        self._split_schedule      = None   # (n_tets,) float32; blade_travel at which each crossing tet splits
+        self._crossing_mask       = None   # (n_tets,) bool; True where the plane crosses (non-crossing tets are ignored by the schedule)
+        self._split_mask          = None   # (n_tets,) bool; monotonically grown; True once tet has been split
         # Debug state
         self._debug_frames_since_cut = None   # None = pre-cut; int = frames since cut
         self._debug_fixed_orig_pos   = None   # fixed-vert positions at cut time
@@ -732,6 +740,28 @@ class FEMMethod(SimulationMethod):
         _pre_force_str = f"{self._debug_pre_cut_force:.4f}" if self._debug_pre_cut_force is not None else "N/A"
         print(f"[DEBUG 4] Fixed verts before cut: {n_fixed_before}  (pre-cut max force on fixed: {_pre_force_str})", flush=True)
 
+        # --- Phase 1b: capture pristine tets + schedule for progressive driver ---
+        # Save the pre-cut tet array so advance_blade can re-invoke
+        # _cut_topology_physics with a growing split_mask each frame. The schedule
+        # is also computed inside _cut_topology_physics for logging; recomputed
+        # here so it is available on self after setup_cut returns.
+        self._pristine_tets = self._current_tets.copy()
+        _signed_dist        = (cur_pos - origin) @ normal
+        _tet_dists          = _signed_dist[self._current_tets]
+        _crossing_mask      = ~(np.all(_tet_dists >= 0, axis=1)
+                                | np.all(_tet_dists <= 0, axis=1))
+        _sched              = np.full(len(self._current_tets), np.inf, dtype=np.float32)
+        _cross_idx          = np.where(_crossing_mask)[0]
+        if len(_cross_idx) > 0:
+            _proj = (cur_pos[self._current_tets[_cross_idx]] - origin) @ blade_dir
+            _sched[_cross_idx] = _proj.min(axis=1)
+        self._crossing_mask = _crossing_mask
+        self._split_schedule = _sched
+        # Initial mask: nothing split yet in progressive mode; all crossings
+        # split in the legacy path. The legacy path preserves current behavior.
+        _initial_mask = np.zeros(len(self._current_tets), dtype=bool) \
+            if self._progressive_cut else None
+
         result = _cut_topology_physics(
             self._current_tets,
             cur_pos, cur_vel, cur_masses, cur_fixed,
@@ -739,9 +769,16 @@ class FEMMethod(SimulationMethod):
             gravity, origin, normal,
             build_simulator=False,  # FEM discards new_sim; skip the build cost
             blade_dir=blade_dir,
+            split_mask=_initial_mask,
         )
         if result is None:
             return False
+
+        # Store the mask used for THIS call. Progressive path starts all-False
+        # and grows monotonically in advance_blade. Legacy path uses all-True
+        # (nothing to progress).
+        self._split_mask = (_initial_mask.copy() if _initial_mask is not None
+                            else np.ones(len(self._current_tets), dtype=bool))
 
         (_, final_pos, final_vel, _, final_fixed,
          all_tets, n_orig, n_split, shared_list, remap,
