@@ -188,7 +188,8 @@ class _SpringMassSimulator:
 def _split_crossed_tets(tetrahedra: np.ndarray,
                          positions:  np.ndarray,
                          signed_dist: np.ndarray,
-                         surface_tet_indices: set = None):
+                         surface_tet_indices: set = None,
+                         split_mask: np.ndarray = None):
     """
     Split tetrahedra that straddle the cut plane by inserting new vertices
     exactly at edge-plane intersections.
@@ -203,19 +204,29 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
       crossing tets NOT in this set are collected in phantom_above_face_keys
       (sorted 3-tuples) so the caller can mark them for debugging / filtering.
 
+    split_mask: optional bool array of shape (len(tetrahedra),). For crossing
+      tets, True means split as usual, False means keep the tet intact as a
+      4-vert tet spanning the plane (returned in `unsplit_cross`). Used by
+      progressive cutting to defer splits until the blade reaches each tet.
+      Non-crossing tets ignore the mask. When None, all crossing tets split.
+
     Returns:
         new_positions            (N_new, 3)
-        above_tets               (M, 4)
-        below_tets               (K, 4)
+        above_tets               (M, 4)   crossing-splits + all above-non-crossing
+        below_tets               (K, 4)   crossing-splits + all below-non-crossing
         inter_data               list of (new_idx, vi, vj, t)
         phantom_above_face_keys  set of sorted int-triple keys for collar faces
                                  originating from non-surface crossing tets
+        unsplit_cross            (U, 4)   crossing tets whose split_mask=False;
+                                          kept as original 4-vert tets (not
+                                          remapped by the caller's seam-dup)
     """
     ext_positions: list = [p for p in positions]
     edge_cache:    dict = {}
     inter_data:    list = []
     above_list:    list = []   # only crossing-tet sub-tets; non-crossing stitched in below
     below_list:    list = []
+    unsplit_list:  list = []   # crossing tets deferred by split_mask (Phase 1b)
     phantom_above_face_keys: set = set()
 
     tet_dists  = signed_dist[tetrahedra]
@@ -245,6 +256,13 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
             phantom_above_face_keys.add(tuple(sorted(f)))
 
     for idx in np.where(~above_mask & ~below_mask)[0]:
+        # Progressive cut: crossing tets whose split_mask is False stay intact
+        # as 4-vert tets spanning the plane -- they mechanically hold the two
+        # halves together until the blade schedule triggers their split.
+        if split_mask is not None and not split_mask[idx]:
+            unsplit_list.append(tetrahedra[idx].tolist())
+            continue
+
         verts = tetrahedra[idx]
         dists = signed_dist[verts]
 
@@ -302,7 +320,9 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
                      if below_list else np.zeros((0, 4), dtype=np.int32))
     above_arr     = np.vstack([above_nocross.astype(np.int32), above_cross])
     below_arr     = np.vstack([below_nocross.astype(np.int32), below_cross])
-    return new_pos, above_arr, below_arr, inter_data, phantom_above_face_keys
+    unsplit_cross = (np.array(unsplit_list, dtype=np.int32)
+                     if unsplit_list else np.zeros((0, 4), dtype=np.int32))
+    return new_pos, above_arr, below_arr, inter_data, phantom_above_face_keys, unsplit_cross
 
 
 def _cut_topology_physics(
@@ -316,7 +336,8 @@ def _cut_topology_physics(
         origin:          np.ndarray,
         normal:          np.ndarray,
         build_simulator: bool = True,
-        blade_dir:       np.ndarray = None):
+        blade_dir:       np.ndarray = None,
+        split_mask:      np.ndarray = None):
     """
     Pure topology-change computation — no Component dependency.
 
@@ -408,9 +429,11 @@ def _cut_topology_physics(
                   f"span={_q[4]-_q[0]:.4f}")
 
     # --- Tet splitting ---
-    split_pos, above_tets, below_tets, inter_data, phantom_above_face_keys = \
+    (split_pos, above_tets, below_tets, inter_data,
+     phantom_above_face_keys, unsplit_cross) = \
         _split_crossed_tets(current_tets, positions, signed_dist_split,
-                            surface_tet_indices=surface_tet_set)
+                            surface_tet_indices=surface_tet_set,
+                            split_mask=split_mask)
 
     n_split = len(split_pos)
     n_inter = n_split - n_orig
@@ -418,8 +441,12 @@ def _cut_topology_physics(
     print(f"[Cut] {len(above_tets):,} above-tets, {len(below_tets):,} below-tets, "
           f"{n_inter} intersection verts")
 
-    if len(above_tets) == 0 or len(below_tets) == 0:
-        print("[Cut] Plane doesn't divide mesh — aborting.")
+    # Abort only when the plane truly does not intersect the mesh. Testing
+    # signed_dist_split covers the progressive-cut case where split_mask=False
+    # leaves crossing tets in unsplit_cross and the above/below arrays only
+    # hold non-crossing subsets (both can be empty for very small meshes).
+    if not (signed_dist_split > 0).any() or not (signed_dist_split < 0).any():
+        print("[Cut] Plane doesn't divide mesh -- aborting.")
         return None
 
     # --- Snap near-plane rim vertices to cut plane ---
@@ -477,7 +504,12 @@ def _cut_topology_physics(
     final_fixed = np.concatenate([split_fixed, split_fixed[shared_arr]])
 
     new_below_tets = remap[below_tets]
-    all_tets       = np.vstack([above_tets, new_below_tets])
+    # Unsplit crossing tets keep their original ORIG indices -- they contain
+    # only ORIGs (no INTERs or DUPs), so the seam remap does not apply.
+    all_tets       = np.vstack([above_tets, new_below_tets, unsplit_cross])
+    if len(unsplit_cross):
+        print(f"[Cut] {len(unsplit_cross)} unsplit crossing tets kept intact "
+              f"(schedule not yet triggered)")
 
     # --- Per-vertex side label (SOFA/PhysBAM style) ---
     # Explicit +1 / -1 tag stamped at cut time so downstream code (FEM orphan
