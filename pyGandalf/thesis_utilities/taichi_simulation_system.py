@@ -643,6 +643,8 @@ def _cut_topology(comp: TaichiSimulationComponent,
     # Active-size views: FEM allocates Taichi fields at capacity, so we must
     # strip the zero-padded tail before handing arrays to topology code.
     n_active = getattr(comp.simulator, 'n_verts', comp.simulator.positions.shape[0])
+    _blade_dir_np = np.array(comp.blade_travel_dir, dtype=np.float32)
+    _blade_dir_np /= np.linalg.norm(_blade_dir_np)
     result = _cut_topology_physics(
         comp.current_tetrahedra,
         comp.simulator.positions.to_numpy()[:n_active],
@@ -652,6 +654,7 @@ def _cut_topology(comp: TaichiSimulationComponent,
         comp.stiffness,
         np.array(comp.gravity, dtype=np.float32),
         origin, normal,
+        blade_dir=_blade_dir_np,
     )
     if result is None:
         return None

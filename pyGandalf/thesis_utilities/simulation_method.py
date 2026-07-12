@@ -372,6 +372,7 @@ class SpringMassMethod(SimulationMethod):
             self._simulator._masses.to_numpy(),
             self._simulator._fixed.to_numpy(),
             stiffness, gravity, origin, normal,
+            blade_dir=blade_dir,
         )
         if result is None:
             return False
@@ -737,6 +738,7 @@ class FEMMethod(SimulationMethod):
             0.0,          # stiffness unused — FEM doesn't need this for topology
             gravity, origin, normal,
             build_simulator=False,  # FEM discards new_sim; skip the build cost
+            blade_dir=blade_dir,
         )
         if result is None:
             return False

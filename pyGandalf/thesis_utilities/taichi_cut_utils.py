@@ -315,7 +315,8 @@ def _cut_topology_physics(
         gravity:         np.ndarray,
         origin:          np.ndarray,
         normal:          np.ndarray,
-        build_simulator: bool = True):
+        build_simulator: bool = True,
+        blade_dir:       np.ndarray = None):
     """
     Pure topology-change computation — no Component dependency.
 
@@ -384,6 +385,27 @@ def _cut_topology_physics(
               f"threshold {sos_eps:.2e})")
     else:
         signed_dist_split = signed_dist
+
+    # --- Phase 1a: per-crossing-tet split schedule ---
+    # For each tet the blade will cut, compute split_travel_dist = the smallest
+    # blade_travel value at which the blade cursor first reaches the tet
+    # (min-projection of tet verts along blade_dir from origin). Progressive
+    # splitting will use this to defer each tet's split until the blade
+    # actually enters it. Phase 1a only logs stats -- no behavior change.
+    if blade_dir is not None:
+        _tet_dists  = signed_dist_split[current_tets]
+        _cross_mask = ~(np.all(_tet_dists >= 0, axis=1)
+                        | np.all(_tet_dists <= 0, axis=1))
+        _cross_idx  = np.where(_cross_mask)[0]
+        if len(_cross_idx) > 0:
+            _tet_vert_pos    = positions[current_tets[_cross_idx]]
+            _tet_travel_proj = (_tet_vert_pos - origin) @ blade_dir
+            _split_schedule  = _tet_travel_proj.min(axis=1)
+            _q = np.quantile(_split_schedule, [0.0, 0.25, 0.5, 0.75, 1.0])
+            print(f"[Sched] {len(_cross_idx)} crossing tets, "
+                  f"split_travel_dist: min={_q[0]:.4f} q25={_q[1]:.4f} "
+                  f"median={_q[2]:.4f} q75={_q[3]:.4f} max={_q[4]:.4f} "
+                  f"span={_q[4]-_q[0]:.4f}")
 
     # --- Tet splitting ---
     split_pos, above_tets, below_tets, inter_data, phantom_above_face_keys = \
