@@ -90,6 +90,14 @@ class SofaMethod(SimulationMethod):
         self._dofs       = None       # MechanicalObject
         self._topo       = None       # TetrahedronSetTopologyContainer
         self._topo_mod   = None       # TetrahedronSetTopologyModifier
+        # ECS compatibility shim. TaichiSimulationSystem sets
+        # `comp.simulator = comp.method._simulator` at init and expects a
+        # non-None object. Spring-mass code paths are all hasattr-guarded on
+        # `_sa` / `_spring_forces`, so a bare self-reference is enough for
+        # rendering + step-driven updates. The B-key progressive-cut path
+        # reads `method._topology_result` which SofaMethod does not have;
+        # do not press B when running with this backend for now.
+        self._simulator  = self
         # Cache captured at initialize time.
         self._n_orig_val   = None
         self._current_tets = None

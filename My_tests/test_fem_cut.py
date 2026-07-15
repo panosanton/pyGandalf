@@ -53,6 +53,7 @@ from pyGandalf.thesis_utilities.taichi_simulation_system import (
     _compute_normals,
 )
 from pyGandalf.thesis_utilities.simulation_method import FEMMethod
+from pyGandalf.thesis_utilities.sofa_method import SofaMethod
 
 
 def _random_cut_plane(rng: np.random.Generator, depth_range: float = 0.7):
@@ -102,6 +103,12 @@ def main():
                         help='Enable GL backface culling (default: off)')
     parser.add_argument('--profile-kernels', action='store_true', default=False,
                         help='Enable Taichi kernel_profiler (~halves fps; sniffed at import time)')
+    parser.add_argument('--backend', default='fem', choices=['fem', 'sofa'],
+                        help='Physics backend: fem (Taichi GPU corotational FEM) or '
+                             'sofa (SOFA v23 CPU corotational FEM). '
+                             'sofa: bunny renders and steps under physics; B-key '
+                             'progressive cut path is NOT wired for sofa yet -- '
+                             'do not press B in that mode.')
     args = parser.parse_args()
 
     mesh_name    = args.mesh
@@ -197,7 +204,10 @@ def main():
         blade_speed           = 0.5,
         split_disc_verts      = True,
         opening_ramp_frames   = 20,
-        method_instance       = FEMMethod(cg_iters=args.cg_iters, sliver_vol_threshold=1e-5),
+        method_instance       = (
+            SofaMethod() if args.backend == 'sofa'
+            else FEMMethod(cg_iters=args.cg_iters, sliver_vol_threshold=1e-5)
+        ),
     )
     # FEM material params — passed through to FEMMethod.initialize() via _sim_params
     taichi_comp.stiffness = 200.0   # reused as cutting spring k
