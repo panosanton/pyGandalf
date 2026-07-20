@@ -38,6 +38,21 @@ import sys
 import taichi as ti
 import numpy as np
 
+
+# When True, suppresses the routine per-cut diagnostic prints that _cut_topology_physics,
+# _split_crossed_tets, _extract_boundary_faces, and _filter_surface_faces produce.
+# Progressive mode toggles this on around every per-frame rebuild so the
+# interactive log stays readable. Toggled off elsewhere for one-shot cuts
+# where those prints are the primary diagnostic.
+_QUIET_CUT_LOGS: bool = False
+
+
+def _log(*args, **kwargs):
+    """Print gated on _QUIET_CUT_LOGS. Used for per-cut diagnostic lines
+    that flood the interactive log in progressive mode."""
+    if not _QUIET_CUT_LOGS:
+        print(*args, **kwargs)
+
 import OpenGL.GL as gl
 
 # kernel_profiler adds non-trivial per-launch overhead. Gate behind the
@@ -226,7 +241,10 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
     inter_data:    list = []
     above_list:    list = []   # only crossing-tet sub-tets; non-crossing stitched in below
     below_list:    list = []
+    above_parent:  list = []   # parent pristine tet idx for each above_list entry
+    below_parent:  list = []   # parent pristine tet idx for each below_list entry
     unsplit_list:  list = []   # crossing tets deferred by split_mask (Phase 1b)
+    unsplit_parent: list = []
     phantom_above_face_keys: set = set()
 
     tet_dists  = signed_dist[tetrahedra]
@@ -261,6 +279,7 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
         # halves together until the blade schedule triggers their split.
         if split_mask is not None and not split_mask[idx]:
             unsplit_list.append(tetrahedra[idx].tolist())
+            unsplit_parent.append(int(idx))
             continue
 
         verts = tetrahedra[idx]
@@ -270,14 +289,17 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
         bv  = [int(verts[i]) for i in range(4) if dists[i] <  0]
         n_a = len(av)
         is_surface = surface_tet_indices is None or int(idx) in surface_tet_indices
+        idx_int = int(idx)
 
         if n_a == 1:
             a, b0, b1, b2 = av[0], bv[0], bv[1], bv[2]
             p0, p1, p2    = iv(a, b0), iv(a, b1), iv(a, b2)
             above_list.append([a, p0, p1, p2])
+            above_parent.append(idx_int)
             below_list += [[b0, b1, b2, p0],
                            [b1, b2, p0, p1],
                            [b2, p0, p1, p2]]
+            below_parent += [idx_int, idx_int, idx_int]
             if not is_surface:
                 _add_phantom_keys([[a,p0,p1],[a,p0,p2],[a,p1,p2]])
 
@@ -285,9 +307,11 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
             a0, a1, a2, b = av[0], av[1], av[2], bv[0]
             p0, p1, p2    = iv(a0, b), iv(a1, b), iv(a2, b)
             below_list.append([b, p0, p1, p2])
+            below_parent.append(idx_int)
             above_list += [[a0, a1, a2, p0],
                            [a1, a2, p0, p1],
                            [a2, p0, p1, p2]]
+            above_parent += [idx_int, idx_int, idx_int]
             if not is_surface:
                 _add_phantom_keys([
                     [a0,a1,p0],[a0,a2,p0],
@@ -303,9 +327,11 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
             above_list += [[a0, p00, p01, p11],
                            [a1, p00, p10, p11],
                            [a0, a1,  p00, p11]]
+            above_parent += [idx_int, idx_int, idx_int]
             below_list += [[b1, p00, p01, p11],
                            [b0, p00, p10, p11],
                            [b0, b1,  p00, p11]]
+            below_parent += [idx_int, idx_int, idx_int]
             if not is_surface:
                 _add_phantom_keys([
                     [a0,p00,p01],[a0,p01,p11],
@@ -322,7 +348,22 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
     below_arr     = np.vstack([below_nocross.astype(np.int32), below_cross])
     unsplit_cross = (np.array(unsplit_list, dtype=np.int32)
                      if unsplit_list else np.zeros((0, 4), dtype=np.int32))
-    return new_pos, above_arr, below_arr, inter_data, phantom_above_face_keys, unsplit_cross
+
+    # Parent pristine tet index per row. For non-crossing tets it's their own
+    # pristine index; for crossing sub-tets it's the pristine tet they came
+    # from; for unsplit_cross it's their pristine index.
+    above_parent_arr = np.concatenate([
+        np.where(above_mask)[0].astype(np.int32),
+        np.asarray(above_parent, dtype=np.int32),
+    ])
+    below_parent_arr = np.concatenate([
+        np.where(below_mask)[0].astype(np.int32),
+        np.asarray(below_parent, dtype=np.int32),
+    ])
+    unsplit_parent_arr = np.asarray(unsplit_parent, dtype=np.int32)
+
+    return (new_pos, above_arr, below_arr, inter_data, phantom_above_face_keys,
+            unsplit_cross, above_parent_arr, below_parent_arr, unsplit_parent_arr)
 
 
 def _cut_topology_physics(
@@ -373,7 +414,7 @@ def _cut_topology_physics(
     # boundary-face mask directly gives the set of tets with a surface face.
     _bnd_mask        = (_cnt == 1)[_inv]
     surface_tet_set  = set(int(t) for t in np.unique(np.where(_bnd_mask)[0] // 4))
-    print(f"[Cut] {len(surface_tet_set)} surface tets, "
+    _log(f"[Cut] {len(surface_tet_set)} surface tets, "
           f"{len(current_tets) - len(surface_tet_set)} interior tets")
 
     # --- Symbolic perturbation of on-plane vertices (SoS-style) ---
@@ -401,7 +442,7 @@ def _cut_topology_physics(
         n_below_side = int(((signed_dist <= 0) & on_plane_mask).sum())
         signed_dist_split = signed_dist.copy()
         signed_dist_split[on_plane_mask] = -sos_eps
-        print(f"[Cut] SoS perturbation: {int(on_plane_mask.sum())} on-plane verts "
+        _log(f"[Cut] SoS perturbation: {int(on_plane_mask.sum())} on-plane verts "
               f"labelled below ({n_above_side} above-side + {n_below_side} below-side, "
               f"threshold {sos_eps:.2e})")
     else:
@@ -423,14 +464,15 @@ def _cut_topology_physics(
             _tet_travel_proj = (_tet_vert_pos - origin) @ blade_dir
             _split_schedule  = _tet_travel_proj.min(axis=1)
             _q = np.quantile(_split_schedule, [0.0, 0.25, 0.5, 0.75, 1.0])
-            print(f"[Sched] {len(_cross_idx)} crossing tets, "
+            _log(f"[Sched] {len(_cross_idx)} crossing tets, "
                   f"split_travel_dist: min={_q[0]:.4f} q25={_q[1]:.4f} "
                   f"median={_q[2]:.4f} q75={_q[3]:.4f} max={_q[4]:.4f} "
                   f"span={_q[4]-_q[0]:.4f}")
 
     # --- Tet splitting ---
     (split_pos, above_tets, below_tets, inter_data,
-     phantom_above_face_keys, unsplit_cross) = \
+     phantom_above_face_keys, unsplit_cross,
+     above_parent, below_parent, unsplit_parent) = \
         _split_crossed_tets(current_tets, positions, signed_dist_split,
                             surface_tet_indices=surface_tet_set,
                             split_mask=split_mask)
@@ -438,7 +480,7 @@ def _cut_topology_physics(
     n_split = len(split_pos)
     n_inter = n_split - n_orig
 
-    print(f"[Cut] {len(above_tets):,} above-tets, {len(below_tets):,} below-tets, "
+    _log(f"[Cut] {len(above_tets):,} above-tets, {len(below_tets):,} below-tets, "
           f"{n_inter} intersection verts")
 
     # Abort only when the plane truly does not intersect the mesh. Testing
@@ -468,7 +510,7 @@ def _cut_topology_physics(
         close    = np.abs(snap_d) < snap_eps
         if close.any():
             split_pos[rim_arr[close]] -= snap_d[close, np.newaxis] * normal
-            print(f"[Cut] Snapped {int(close.sum())} near-plane rim vertices "
+            _log(f"[Cut] Snapped {int(close.sum())} near-plane rim vertices "
                   f"(threshold {snap_eps:.2e})")
 
     # --- Extend per-vertex arrays ---
@@ -491,7 +533,7 @@ def _cut_topology_physics(
                                    assume_unique=False)
     shared_list   = [int(v) for v in _shared_all[_shared_all >= n_orig]]
     n_shared      = len(shared_list)
-    print(f"[Cut] Duplicating {n_shared} seam vertices")
+    _log(f"[Cut] Duplicating {n_shared} seam vertices")
 
     remap = np.arange(n_split, dtype=np.int32)
     for i, v in enumerate(shared_list):
@@ -507,8 +549,9 @@ def _cut_topology_physics(
     # Unsplit crossing tets keep their original ORIG indices -- they contain
     # only ORIGs (no INTERs or DUPs), so the seam remap does not apply.
     all_tets       = np.vstack([above_tets, new_below_tets, unsplit_cross])
+    all_tets_parent = np.concatenate([above_parent, below_parent, unsplit_parent]).astype(np.int32)
     if len(unsplit_cross):
-        print(f"[Cut] {len(unsplit_cross)} unsplit crossing tets kept intact "
+        _log(f"[Cut] {len(unsplit_cross)} unsplit crossing tets kept intact "
               f"(schedule not yet triggered)")
 
     # --- Per-vertex side label (SOFA/PhysBAM style) ---
@@ -542,18 +585,18 @@ def _cut_topology_physics(
         # Collar deformation from opening velocity is physically correct elastic
         # behaviour; reduce opening_speed if it looks too violent.
 
-        print(f"[Cut] Simulator: {len(final_pos):,} verts, "
+        _log(f"[Cut] Simulator: {len(final_pos):,} verts, "
               f"{len(all_tets):,} tets, {len(new_sim._sa):,} springs")
 
         _print_spring_audit(new_sim._sa, new_sim._sb, new_sim._sr, new_sim._sk, n_orig)
     else:
         new_sim = None
-        print(f"[Cut] Topology only: {len(final_pos):,} verts, "
+        _log(f"[Cut] Topology only: {len(final_pos):,} verts, "
               f"{len(all_tets):,} tets (no spring-mass simulator built)")
 
     return (new_sim, final_pos, final_vel, final_mass, final_fixed,
             all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set,
-            phantom_above_face_keys, side_label)
+            phantom_above_face_keys, side_label, all_tets_parent)
 
 
 def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
@@ -605,7 +648,7 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
                     continue   # discard phantom collar face (interior orig vert)
             outer.append(f)
 
-    print(f"[PhantomCollar] discarded {n_phantom} phantom collar faces")
+    _log(f"[PhantomCollar] discarded {n_phantom} phantom collar faces")
 
     # [CollarFilter] Reconstruction-based phantom removal.
     # The virtual-node split algorithm inherently produces extra interior faces when
@@ -630,7 +673,13 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
             has_inter = any(n_orig <= v < n_split for v in (v0, v1, v2))
             has_dup   = any(v >= n_split          for v in (v0, v1, v2))
             if not (has_inter or has_dup):
-                filtered.append(f)
+                # Pure-orig face. It's genuine only if it was on the pristine
+                # mesh boundary. Progressive-cut T-junctions (unsplit crossing
+                # tet next to a split neighbor) expose an interior 4-vert face
+                # that was previously shared between them -- drop those.
+                if tuple(sorted((v0, v1, v2))) in orig_surf_set:
+                    filtered.append(f)
+                # else: T-junction phantom; drop silently.
                 continue
             recon = set()
             for v in (v0, v1, v2):
@@ -650,7 +699,7 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
                     n_removed_b += 1
                 else:
                     n_removed_a += 1
-        print(f"[CollarFilter] removed {n_removed_a} above-collar + "
+        _log(f"[CollarFilter] removed {n_removed_a} above-collar + "
               f"{n_removed_b} below-collar = {n_removed_a + n_removed_b} extra faces; "
               f"{len(filtered)} outer faces remaining")
         outer = filtered
@@ -822,10 +871,10 @@ def _extract_boundary_faces(tetrahedra: np.ndarray,
         still_inward = np.einsum('ij,ij->i', fn_post, to_fourth) > 0
         n_still = int(still_inward.sum())
         if n_still:
-            print(f"[WindingDiag] {n_still} / {len(boundary_faces)} boundary faces still "
+            _log(f"[WindingDiag] {n_still} / {len(boundary_faces)} boundary faces still "
                   f"pointing toward their fourth vertex after winding correction")
         else:
-            print(f"[WindingDiag] 0 / {len(boundary_faces)} boundary faces have residual "
+            _log(f"[WindingDiag] 0 / {len(boundary_faces)} boundary faces have residual "
                   f"winding errors after correction")
 
     return boundary_faces.astype(np.uint32)
@@ -1075,7 +1124,7 @@ def _compute_debug_face_colors(faces: np.ndarray, n_orig: int) -> np.ndarray:
 
     n_green = int((any_new & ~all_new).sum())
     n_red   = int(all_new.sum())
-    print(f"[Cut] Debug colors: {n_green} collar faces (green), {n_red} disc faces (red), "
+    _log(f"[Cut] Debug colors: {n_green} collar faces (green), {n_red} disc faces (red), "
           f"{n - n_green - n_red} outer faces (blue)")
     return colors
 

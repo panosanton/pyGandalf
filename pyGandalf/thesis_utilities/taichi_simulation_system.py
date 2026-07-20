@@ -56,6 +56,7 @@ from pyGandalf.scene.scene_manager import SceneManager
 from pyGandalf.core.application import Application
 
 from . import pick_inspector
+from . import taichi_cut_utils
 
 from .taichi_cut_utils import (
     _SpringMassSimulator,
@@ -661,7 +662,7 @@ def _cut_topology(comp: TaichiSimulationComponent,
 
     (new_sim, final_pos, final_vel, final_mass, final_fixed,
      all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set,
-     phantom_above_face_keys, side_label) = result
+     phantom_above_face_keys, side_label, _all_tets_parent_unused) = result
 
     comp.simulator          = new_sim
     comp.current_tetrahedra = all_tets
@@ -777,6 +778,193 @@ def _perform_cut(comp: TaichiSimulationComponent,
 # Progressive blade cut  (B key)
 # ---------------------------------------------------------------------------
 
+def _rebuild_progressive_render(comp: TaichiSimulationComponent,
+                                 mesh_comp: StaticMeshComponent,
+                                 is_initial: bool,
+                                 normal: np.ndarray,
+                                 blade_dir: np.ndarray,
+                                 origin: np.ndarray):
+    """
+    Rebuild the ECS-side surface + GPU buffers from the current
+    comp.method._topology_result.
+
+    Called both from the initial B-press (`is_initial=True`) and from
+    _advance_progressive_blade when the method has bumped its
+    _topology_version mid-sweep. In the second case blade_travel and
+    _wound_face_ptr are preserved by the caller.
+
+    Rebuilds: outer_faces, wound_faces (sorted by blade travel), collar tet
+    debug set, per-face debug colors, expanded VBO/index buffers. Records
+    comp._topology_version = method._topology_version so the next frame's
+    change-detection is accurate.
+    """
+    (_new_sim, final_pos, _final_vel, _final_mass, _final_fixed,
+     all_tets, n_orig, n_split, shared_list, remap, inter_data,
+     orig_surf_set, phantom_above_face_keys, _side_label,
+     _all_tets_parent) = comp.method._topology_result
+
+    comp._n_orig      = n_orig
+    comp._n_split     = n_split
+    comp._inter_data  = inter_data
+    comp._shared_list = shared_list
+    comp._cut_normal  = normal
+
+    # Share the seam_pairs list so _advance_progressive_blade can observe broken flags.
+    comp._seam_pairs = comp.method._seam_pairs
+
+    _rr_t0 = time.perf_counter()
+    # --- Build progressive wound surface ---
+    raw_surface = _extract_boundary_faces(all_tets, final_pos)
+    _rr_t_boundary = time.perf_counter() - _rr_t0
+    _rr_t1 = time.perf_counter()
+    mesh_centroid = final_pos[:n_orig].mean(axis=0)
+    outer_faces, wound_faces = _filter_surface_faces(
+        raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set, mesh_centroid,
+        inter_data=inter_data, shared_list=shared_list)
+    _rr_t_filter = time.perf_counter() - _rr_t1
+
+    comp._outer_faces = outer_faces
+
+    if comp.split_disc_verts:
+        remapped_wound, split_phys = _split_disc_verts_for_rendering(
+            outer_faces, wound_faces, len(final_pos), n_orig)
+        comp._disc_split_phys_idx = np.array(split_phys, dtype=np.int32) if split_phys else None
+        render_pos = (np.vstack([final_pos, final_pos[split_phys]])
+                      if split_phys else final_pos)
+        wound_for_render = remapped_wound
+    else:
+        comp._disc_split_phys_idx = None
+        render_pos = final_pos
+        wound_for_render = wound_faces
+
+    # Sort wound faces by centroid distance along blade_dir.
+    wound_by_dist = []
+    for orig_wf, rend_wf in zip(wound_faces, wound_for_render):
+        centroid    = final_pos[[int(orig_wf[0]), int(orig_wf[1]), int(orig_wf[2])]].mean(axis=0)
+        travel_dist = float(np.dot(centroid - origin, blade_dir))
+        wound_by_dist.append((travel_dist, rend_wf))
+    wound_by_dist.sort(key=lambda x: x[0])
+    comp._wound_faces_by_dist = wound_by_dist
+    # Wound reveal:
+    #   Legacy (one-shot) cut: all wound faces exist at B-press but are
+    #     hidden until the blade cursor's travel_dist passes each centroid.
+    #     Initial rebuild -> ptr=0; the reveal loop in _advance_progressive_blade
+    #     grows the pointer as blade_travel advances.
+    #   Progressive cut: a wound face exists only because its parent tet has
+    #     ALREADY been split (mask growth caused the rebuild). Deferring its
+    #     visibility by centroid produces see-through gaps behind the blade.
+    #     Reveal all wound faces immediately.
+    progressive = bool(getattr(comp.method, '_progressive_cut', False))
+    if progressive:
+        comp._wound_face_ptr = len(wound_by_dist)
+    elif is_initial:
+        comp._wound_face_ptr = 0
+    else:
+        travel_now = float(comp.blade_travel)
+        comp._wound_face_ptr = sum(1 for td, _ in wound_by_dist if td <= travel_now)
+
+    wound_arr = (np.array([f for _, f in wound_by_dist], dtype=np.uint32)
+                 if wound_by_dist else np.zeros((0, 3), dtype=np.uint32))
+    all_render_faces = (np.vstack([outer_faces, wound_arr])
+                        if len(wound_arr) > 0 else outer_faces.copy())
+
+    # --- Collar tet faces for debug visualization (T key) ---
+    seam_arr = np.array(shared_list, dtype=np.int32) if len(shared_list) > 0 else np.array([], dtype=np.int32)
+    is_inter = (all_tets >= n_orig) & (all_tets < n_split)
+    is_seam  = np.isin(all_tets, seam_arr) if len(seam_arr) > 0 else np.zeros_like(is_inter)
+    is_dup   = all_tets >= n_split
+    orig_surf_verts_arr = np.array(sorted({v for tri in orig_surf_set
+                                           for v in tri}), dtype=np.int32)
+    has_cut_plane    = np.any(is_inter | is_seam | is_dup, axis=1)
+    has_surf_orig    = np.any(np.isin(all_tets, orig_surf_verts_arr), axis=1)
+    collar_tet_mask  = has_cut_plane & has_surf_orig
+    collar_tets      = all_tets[collar_tet_mask]
+    TET_FACE_TRIPLES = [(0,1,2), (0,1,3), (0,2,3), (1,2,3)]
+    if len(collar_tets) > 0:
+        collar_tet_faces = np.array(
+            [[collar_tets[t, i], collar_tets[t, j], collar_tets[t, k]]
+             for t in range(len(collar_tets)) for i, j, k in TET_FACE_TRIPLES],
+            dtype=np.uint32)
+    else:
+        collar_tet_faces = np.zeros((0, 3), dtype=np.uint32)
+
+    collar_face_key_set = {tuple(sorted(f.tolist())) for f in collar_tet_faces}
+    collar_outer_mask = np.array(
+        [tuple(sorted(f.tolist())) in collar_face_key_set for f in outer_faces],
+        dtype=bool)
+
+    collar_tet_face_offset = len(all_render_faces)
+    if len(collar_tet_faces) > 0:
+        all_render_faces = np.vstack([all_render_faces, collar_tet_faces])
+
+    comp._collar_tet_face_offset = collar_tet_face_offset
+    comp._n_collar_tet_faces     = len(collar_tet_faces)
+    comp._collar_outer_mask      = collar_outer_mask
+    comp._show_collar_tets       = False
+
+    comp.surface_indices    = outer_faces.copy()
+    comp._all_render_faces  = all_render_faces
+    comp._n_outer_faces     = len(outer_faces)
+    comp._face_expanded     = True
+
+    face_colors = _compute_debug_face_colors(all_render_faces, n_orig)
+    if len(collar_tet_faces) > 0:
+        face_colors[collar_tet_face_offset:] = [1.0, 0.85, 0.0]
+    comp._debug_colors = face_colors.copy()
+
+    comp._face_categories  = _compute_face_categories(
+        all_render_faces, len(outer_faces), n_orig, n_split,
+        inter_data=inter_data, orig_surf_set=orig_surf_set,
+        phantom_keys=phantom_above_face_keys)
+    comp._color_cycle_mode = -1
+
+    new_normals = _compute_normals_post_cut(render_pos, comp.surface_indices,
+                                            n_orig, n_split, inter_data, shared_list, normal)
+
+    flat_all   = all_render_faces.flatten()
+    exp_pos    = render_pos[flat_all].reshape(-1, 3)
+    exp_norm   = new_normals[flat_all].reshape(-1, 3)
+    _finalize_wound_slot_normals(
+        exp_norm, exp_pos, all_render_faces,
+        n_wound_faces=len(wound_faces),
+        n_outer_faces=len(outer_faces),
+        n_orig=n_orig, n_split=n_split, n_phys=len(final_pos),
+        disc_split_phys_idx=comp._disc_split_phys_idx,
+        cut_normal=normal)
+    exp_tex    = np.zeros((len(all_render_faces) * 3, 2), dtype=np.float32)
+    exp_colors = np.repeat(face_colors, 3, axis=0)
+
+    # Index buffer covers outer + already-revealed wound face slots.
+    ptr = int(comp._wound_face_ptr)
+    n_visible = len(outer_faces) + ptr
+    trivial_idx = np.arange(n_visible * 3, dtype=np.uint32).reshape(-1, 3)
+
+    if is_initial or not getattr(taichi_cut_utils, '_QUIET_CUT_LOGS', False):
+        tag = "[Blade]" if is_initial else "[ProgressiveRender]"
+        print(f"{tag} Surface: {len(outer_faces):,} outer + "
+              f"{len(wound_faces):,} wound (revealed {ptr}) | "
+              f"{len(all_render_faces):,} total expanded faces  "
+              f"topo_ver={comp.method._topology_version}",
+              flush=True)
+
+    _rr_t2 = time.perf_counter()
+    _realloc_gpu_buffers(mesh_comp, exp_pos, exp_norm, exp_tex, trivial_idx,
+                         colors=exp_colors)
+    _rr_t_gl = time.perf_counter() - _rr_t2
+    _rr_total = time.perf_counter() - _rr_t0
+    _rr_middle = _rr_total - _rr_t_boundary - _rr_t_filter - _rr_t_gl
+    print(f"[RenderTiming] total={_rr_total*1000:.1f}ms  "
+          f"boundary={_rr_t_boundary*1000:.1f}  "
+          f"filter={_rr_t_filter*1000:.1f}  "
+          f"collar+normals={_rr_middle*1000:.1f}  "
+          f"gl_upload={_rr_t_gl*1000:.1f}  "
+          f"n_tets={len(all_tets):,}  n_faces={len(all_render_faces):,}",
+          flush=True)
+
+    # Record the version we just rendered so change-detection is accurate.
+    comp._rendered_topology_version = int(comp.method._topology_version)
+
+
 def _setup_progressive_cut(comp: TaichiSimulationComponent,
                              mesh_comp: StaticMeshComponent):
     """
@@ -811,159 +999,24 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
     comp.simulator          = comp.method._simulator
     comp.current_tetrahedra = comp.method._current_tets
 
-    # Extract topology data from the cached result tuple for surface computation.
-    (_new_sim, final_pos, _final_vel, _final_mass, _final_fixed,
-     all_tets, n_orig, n_split, shared_list, remap, inter_data,
-     orig_surf_set, phantom_above_face_keys, _side_label) = comp.method._topology_result
+    _rebuild_progressive_render(comp, mesh_comp, is_initial=True, normal=normal,
+                                blade_dir=blade_dir, origin=origin)
 
-    comp._n_orig      = n_orig
-    comp._n_split     = n_split
-    comp._inter_data  = inter_data
-    comp._shared_list = shared_list
-    comp._cut_normal  = normal
-
-    # Share the seam_pairs list so _advance_progressive_blade can observe broken flags.
-    comp._seam_pairs = comp.method._seam_pairs
-    seam_pairs       = comp._seam_pairs
-
-    # Blade cursor starts just before the first seam pair.
+    # Blade cursor starts just before the first seam pair (progressive mode
+    # with an all-False initial mask has no pairs yet; fall back to the
+    # schedule minimum so the blade cursor visibly moves toward the first
+    # tet split).
+    seam_pairs = comp._seam_pairs
     if seam_pairs:
         comp.blade_travel = seam_pairs[0]['travel_dist'] - 1e-3
+    elif (getattr(comp.method, '_progressive_cut', False)
+          and comp.method._split_schedule is not None
+          and comp.method._crossing_mask is not None
+          and comp.method._crossing_mask.any()):
+        cross_sched = comp.method._split_schedule[comp.method._crossing_mask]
+        comp.blade_travel = float(cross_sched.min()) - 1e-3
     else:
         comp.blade_travel = 0.0
-
-    # --- Build progressive wound surface ---
-    raw_surface = _extract_boundary_faces(all_tets, final_pos)
-    mesh_centroid = final_pos[:n_orig].mean(axis=0)
-    outer_faces, wound_faces = _filter_surface_faces(
-        raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set, mesh_centroid,
-        inter_data=inter_data, shared_list=shared_list)
-
-    comp._outer_faces = outer_faces
-
-    if comp.split_disc_verts:
-        remapped_wound, split_phys = _split_disc_verts_for_rendering(
-            outer_faces, wound_faces, len(final_pos), n_orig)
-        comp._disc_split_phys_idx = np.array(split_phys, dtype=np.int32) if split_phys else None
-        render_pos = (np.vstack([final_pos, final_pos[split_phys]])
-                      if split_phys else final_pos)
-        wound_for_render = remapped_wound
-    else:
-        comp._disc_split_phys_idx = None
-        render_pos = final_pos
-        wound_for_render = wound_faces
-
-    # Sort wound faces by centroid distance along blade_dir.
-    # Centroid uses original wound_faces for correct position lookup;
-    # the stored face uses the (possibly remapped) rendering version.
-    wound_by_dist = []
-    for orig_wf, rend_wf in zip(wound_faces, wound_for_render):
-        centroid    = final_pos[[int(orig_wf[0]), int(orig_wf[1]), int(orig_wf[2])]].mean(axis=0)
-        travel_dist = float(np.dot(centroid - origin, blade_dir))
-        wound_by_dist.append((travel_dist, rend_wf))
-    wound_by_dist.sort(key=lambda x: x[0])
-    comp._wound_faces_by_dist = wound_by_dist
-    comp._wound_face_ptr      = 0
-
-    # Build the full face array (outer first, then ALL wound in travel order).
-    # This is the expansion template: outer faces occupy slots [0..n_outer-1],
-    # wound faces occupy [n_outer..n_outer+n_wound-1] in the same sorted order
-    # as _wound_faces_by_dist, so the trivial index buffer can simply grow.
-    wound_arr = (np.array([f for _, f in wound_by_dist], dtype=np.uint32)
-                 if wound_by_dist else np.zeros((0, 3), dtype=np.uint32))
-    all_render_faces = (np.vstack([outer_faces, wound_arr])
-                        if len(wound_arr) > 0 else outer_faces.copy())
-
-    # --- Collar tet faces for debug visualization (T key) ---
-    # Collect all 4 faces of every tet that touches the cut plane in any way:
-    #   - intersection verts (n_orig <= v < n_split): created at edge-plane crossings
-    #   - seam verts in above tets (v in shared_list, < n_orig): original verts with dist=0
-    #   - seam dup verts in below tets (v >= n_split): remapped copies of shared_list
-    seam_arr = np.array(shared_list, dtype=np.int32) if len(shared_list) > 0 else np.array([], dtype=np.int32)
-    is_inter = (all_tets >= n_orig) & (all_tets < n_split)
-    is_seam  = np.isin(all_tets, seam_arr) if len(seam_arr) > 0 else np.zeros_like(is_inter)
-    is_dup   = all_tets >= n_split
-    # True collar tets: touch the cut plane AND have at least one original SURFACE vert.
-    # Interior split tets also have original verts (< n_orig) but they are interior verts,
-    # not surface verts. Only tets bridging the surface to the cut plane are true collar tets.
-    orig_surf_verts_arr = np.array(sorted({v for tri in orig_surf_set
-                                           for v in tri}), dtype=np.int32)
-    has_cut_plane    = np.any(is_inter | is_seam | is_dup, axis=1)
-    has_surf_orig    = np.any(np.isin(all_tets, orig_surf_verts_arr), axis=1)
-    collar_tet_mask  = has_cut_plane & has_surf_orig
-    collar_tets     = all_tets[collar_tet_mask]
-    TET_FACE_TRIPLES = [(0,1,2), (0,1,3), (0,2,3), (1,2,3)]
-    if len(collar_tets) > 0:
-        collar_tet_faces = np.array(
-            [[collar_tets[t, i], collar_tets[t, j], collar_tets[t, k]]
-             for t in range(len(collar_tets)) for i, j, k in TET_FACE_TRIPLES],
-            dtype=np.uint32)
-    else:
-        collar_tet_faces = np.zeros((0, 3), dtype=np.uint32)
-
-    # Build a set of collar tet face keys (sorted triples) for fast outer-face lookup.
-    collar_face_key_set = {tuple(sorted(f.tolist())) for f in collar_tet_faces}
-
-    # Mark which outer faces belong to collar tets -- these get recolored yellow on T-key.
-    collar_outer_mask = np.array(
-        [tuple(sorted(f.tolist())) in collar_face_key_set for f in outer_faces],
-        dtype=bool)
-
-    collar_tet_face_offset = len(all_render_faces)
-    if len(collar_tet_faces) > 0:
-        all_render_faces = np.vstack([all_render_faces, collar_tet_faces])
-
-    comp._collar_tet_face_offset = collar_tet_face_offset
-    comp._n_collar_tet_faces     = len(collar_tet_faces)
-    comp._collar_outer_mask      = collar_outer_mask   # (n_outer,) bool
-    comp._show_collar_tets       = False
-
-    comp.surface_indices    = outer_faces.copy()   # original indices for normal computation
-    comp._all_render_faces  = all_render_faces      # full set for per-frame expansion
-    comp._n_outer_faces     = len(outer_faces)
-    comp._face_expanded     = True
-
-    # Per-face debug colors: outer/wound as usual, collar tet faces in yellow.
-    face_colors        = _compute_debug_face_colors(all_render_faces, n_orig)
-    if len(collar_tet_faces) > 0:
-        face_colors[collar_tet_face_offset:] = [1.0, 0.85, 0.0]
-    comp._debug_colors = face_colors.copy()
-    print(f"[CollarTets] {len(collar_tets):,} collar tets, "
-          f"{int(collar_outer_mask.sum()):,} outer faces touch collar (T to show)")
-
-    # Face categories for V-key color cycling (requires --debug-colors shader).
-    comp._face_categories  = _compute_face_categories(
-        all_render_faces, len(outer_faces), n_orig, n_split,
-        inter_data=inter_data, orig_surf_set=orig_surf_set,
-        phantom_keys=phantom_above_face_keys)
-    comp._color_cycle_mode = -1
-
-    new_normals = _compute_normals_post_cut(render_pos, comp.surface_indices,
-                                            n_orig, n_split, inter_data, shared_list, normal)
-
-    # Build expanded (unindexed) arrays for the full face set.
-    flat_all   = all_render_faces.flatten()
-    exp_pos    = render_pos[flat_all].reshape(-1, 3)
-    exp_norm   = new_normals[flat_all].reshape(-1, 3)   # hidden wound normals = zero initially (OK)
-    _finalize_wound_slot_normals(
-        exp_norm, exp_pos, all_render_faces,
-        n_wound_faces=len(wound_faces),
-        n_outer_faces=len(outer_faces),
-        n_orig=n_orig, n_split=n_split, n_phys=len(final_pos),
-        disc_split_phys_idx=comp._disc_split_phys_idx,
-        cut_normal=normal)
-    exp_tex    = np.zeros((len(all_render_faces) * 3, 2), dtype=np.float32)
-    exp_colors = np.repeat(face_colors, 3, axis=0)
-
-    # Initially only outer faces visible — trivial index buffer covers first n_outer*3 verts.
-    trivial_outer = np.arange(len(outer_faces) * 3, dtype=np.uint32).reshape(-1, 3)
-
-    print(f"[Blade] Surface: {len(outer_faces):,} outer + "
-          f"{len(wound_faces):,} wound faces (hidden until blade passes) | "
-          f"{len(all_render_faces):,} total expanded faces")
-
-    _realloc_gpu_buffers(mesh_comp, exp_pos, exp_norm, exp_tex, trivial_outer,
-                         colors=exp_colors)
 
     comp.blade_initialized  = True
     comp.blade_is_active    = True
@@ -1006,8 +1059,37 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
                       if not p['broken'] and p['travel_dist'] <= comp.blade_travel]
     if newly_to_break and not any(p['broken'] for p in comp._seam_pairs):
         comp._pending_force_audit = True
+    _adv_t0 = time.perf_counter()
     comp.method.advance_blade(comp.blade_travel)
+    _adv_dt = time.perf_counter() - _adv_t0
     # comp._seam_pairs is the same list as comp.method._seam_pairs — broken flags updated in-place.
+
+    # Progressive backends may have grown the topology inside advance_blade
+    # (FEMMethod._maybe_grow_split). Detect via the version counter and
+    # rebuild the render-side surface + GPU buffers to match.
+    method_ver = int(getattr(comp.method, '_topology_version', 0))
+    rendered_ver = int(getattr(comp, '_rendered_topology_version', 0))
+    _render_dt = 0.0
+    if method_ver != rendered_ver:
+        origin_np    = np.array(comp.cut_plane_origin, dtype=np.float32)
+        blade_dir_np = np.array(comp.blade_travel_dir, dtype=np.float32)
+        blade_dir_np /= np.linalg.norm(blade_dir_np)
+        # Keep the alias current so downstream picks / debug read the latest tets.
+        comp.simulator          = comp.method._simulator
+        comp.current_tetrahedra = comp.method._current_tets
+        _render_t0 = time.perf_counter()
+        taichi_cut_utils._QUIET_CUT_LOGS = True
+        try:
+            _rebuild_progressive_render(comp, mesh_comp, is_initial=False,
+                                        normal=normal, blade_dir=blade_dir_np,
+                                        origin=origin_np)
+        finally:
+            taichi_cut_utils._QUIET_CUT_LOGS = False
+        _render_dt = time.perf_counter() - _render_t0
+        print(f"[AdvTiming] advance_blade={_adv_dt*1000:.1f}ms  "
+              f"render_rebuild={_render_dt*1000:.1f}ms  "
+              f"total={( _adv_dt + _render_dt)*1000:.1f}ms",
+              flush=True)
 
     # --- Reveal wound faces behind the cursor ---
     ptr = comp._wound_face_ptr
@@ -1038,7 +1120,10 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
         gl.glBindVertexArray(0)
 
     # --- Stop when complete ---
-    if all(p['broken'] for p in comp._seam_pairs):
+    # Delegates to the method so progressive backends (FEM w/ progressive_cut)
+    # can hold "done" open until the blade has traveled past all scheduled
+    # tet splits, not just when the currently-existing seam_pairs are broken.
+    if comp.method.is_cut_complete(comp.blade_travel):
         # Force-reveal any remaining wound faces (unless hidden for debug).
         if (not hide_wound) and comp._wound_face_ptr < len(wbd):
             comp._wound_face_ptr = len(wbd)

@@ -197,7 +197,8 @@ def main():
         blade_speed           = 0.5,
         split_disc_verts      = True,
         opening_ramp_frames   = 20,
-        method_instance       = FEMMethod(cg_iters=args.cg_iters, sliver_vol_threshold=1e-5),
+        method_instance       = FEMMethod(cg_iters=args.cg_iters, sliver_vol_threshold=1e-5,
+                                          progressive_cut=True),  # Phase 1b smoke test
     )
     # FEM material params — passed through to FEMMethod.initialize() via _sim_params
     taichi_comp.stiffness = 200.0   # reused as cutting spring k

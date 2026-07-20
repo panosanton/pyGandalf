@@ -164,13 +164,22 @@ class _FEMSimulator:
         field.from_numpy(pad)
 
     def rebuild_topology(self,
-                         vertices:   np.ndarray,
-                         tetrahedra: np.ndarray,
-                         fixed_mask: np.ndarray,
-                         velocities: np.ndarray) -> None:
+                         vertices:      np.ndarray,
+                         tetrahedra:    np.ndarray,
+                         fixed_mask:    np.ndarray,
+                         velocities:    np.ndarray,
+                         rest_positions: np.ndarray = None) -> None:
         """
         Re-upload new mesh state into the existing GPU fields. Avoids JIT
         recompile per cut by keeping SNode IDs stable across calls.
+
+        rest_positions: optional. If provided, temporarily uploaded to the
+        positions field before _init_tet_data computes rest-shape inverses B,
+        then overwritten with the real `vertices` before returning. This lets
+        progressive-cut callers keep the FEM reference config pristine while
+        still stepping the sim on the current deformed geometry -- without
+        this, every rebuild would set rest shape = current deformed positions
+        and the FEM would lose all elastic memory of the pristine mesh.
 
         Raises if the new mesh exceeds the simulator's allocated capacity.
         """
@@ -183,7 +192,12 @@ class _FEMSimulator:
             raise RuntimeError(
                 f"rebuild_topology: tet count {M} exceeds capacity {self._capacity_tets}")
 
-        self._upload_padded_vec3(self.positions,  vertices)
+        # Rest-position first (if supplied) so _init_tet_data reads pristine
+        # geometry off self.positions. Overwrite with current vertices after.
+        if rest_positions is not None:
+            self._upload_padded_vec3(self.positions, rest_positions)
+        else:
+            self._upload_padded_vec3(self.positions, vertices)
         self._upload_padded_vec3(self.velocities, velocities)
         self._upload_padded_int (self._fixed,     fixed_mask)
         self._upload_padded_tet (self._tets,      tetrahedra)
@@ -202,6 +216,9 @@ class _FEMSimulator:
         self._n_tets  = int(M)
 
         self._init_tet_data(self._n_tets)
+        # Now swap in the true current positions for the step to integrate.
+        if rest_positions is not None:
+            self._upload_padded_vec3(self.positions, vertices)
         self._compute_diag_K(self._n_verts, self._n_tets)
 
     # ------------------------------------------------------------------

@@ -31,6 +31,7 @@ from collections import defaultdict
 import numpy as np
 
 from .taichi_cut_utils import _SpringMassSimulator, _cut_topology_physics
+from . import taichi_cut_utils as _tcu  # for _QUIET_CUT_LOGS toggle in progressive mode
 
 
 class SimulationMethod(ABC):
@@ -187,6 +188,23 @@ class SimulationMethod(ABC):
         -------
         bool — True when all cutting constraints are broken (blade done).
         """
+
+    def is_cut_complete(self, blade_travel: float) -> bool:
+        """
+        Return True when the blade has finished cutting.
+
+        Default implementation matches the legacy one-shot pipeline: the cut
+        is complete once every seam pair created at setup_cut() time has been
+        broken. Concrete backends that build seam pairs incrementally (e.g.
+        FEM progressive cut) MUST override this so an initially-empty
+        seam_pairs list doesn't cause a false-positive "done" at B-press
+        (Python's all([]) is vacuously True).
+
+        Callers: FEMMethod.advance_blade uses this as its return value, and
+        the ECS _advance_progressive_blade uses it to decide when to stop
+        the blade cursor / print "Cut complete".
+        """
+        return all(p['broken'] for p in getattr(self, '_seam_pairs', []))
 
     # ------------------------------------------------------------------
     # Properties
@@ -379,7 +397,7 @@ class SpringMassMethod(SimulationMethod):
 
         (new_sim, final_pos, _final_vel, _final_mass, _final_fixed,
          all_tets, n_orig, n_split, shared_list, remap, _inter_data, _orig_surf_set,
-         _phantom_keys, _side_label) = result
+         _phantom_keys, _side_label, _all_tets_parent) = result
 
         self._simulator       = new_sim
         self._current_tets    = all_tets
@@ -494,7 +512,7 @@ class SpringMassMethod(SimulationMethod):
                     'left':       ramp_frames,
                 })
 
-        return all(p['broken'] for p in self._seam_pairs)
+        return self.is_cut_complete(blade_travel)
 
     @property
     def vertex_count(self) -> int:
@@ -555,9 +573,11 @@ class FEMMethod(SimulationMethod):
         # with split_mask=None at B-press as before).
         self._progressive_cut     = bool(overrides.get('progressive_cut', False))
         self._pristine_tets       = None   # (n_tets, 4) pre-cut tet array; input to per-frame split
+        self._pristine_n_orig     = None   # pristine vertex count (never changes after initialize)
         self._split_schedule      = None   # (n_tets,) float32; blade_travel at which each crossing tet splits
         self._crossing_mask       = None   # (n_tets,) bool; True where the plane crosses (non-crossing tets are ignored by the schedule)
         self._split_mask          = None   # (n_tets,) bool; monotonically grown; True once tet has been split
+        self._topology_version    = 0      # bumps each time _split_mask grows; ECS watches this to trigger render-side rebuild
         # Debug state
         self._debug_frames_since_cut = None   # None = pre-cut; int = frames since cut
         self._debug_fixed_orig_pos   = None   # fixed-vert positions at cut time
@@ -588,6 +608,8 @@ class FEMMethod(SimulationMethod):
             gravity       = gravity,
             damping       = float(self._params.get('damping', 1.0)),
         )
+        self._pristine_n_orig   = len(tet_mesh.vertices)
+        self._pristine_positions = tet_mesh.vertices.astype(np.float32).copy()
 
     def step(self, dt: float) -> None:
         self._process_opening_ramp()
@@ -599,6 +621,184 @@ class FEMMethod(SimulationMethod):
         )
         self._apply_orphan_constraints()
         self._debug_step()
+        self._debug_scan_high_velocity()
+        self._debug_scan_seam_separation()
+
+    def _debug_scan_high_velocity(self) -> None:
+        """
+        Flag verts whose speed exceeds a multiple of the configured
+        opening_speed. Progressive mode only (this is where the current
+        force problems live).
+
+        Threshold is controlled by params['debug_vel_threshold_mult']
+        (default 10x). Prints the top 5 offenders each frame the threshold
+        is exceeded, with vertex classification (PRISTINE / INTER / DUP)
+        and connected seam info when relevant.
+        """
+        if not self._progressive_cut:
+            return
+        opening_speed = float(self._params.get('opening_speed', 1.0))
+        # v_max in the sim caps velocities at ~20 m/s by default, so 10x an
+        # opening_speed of 5 would never fire. Default to 2.5x so we catch
+        # anything meaningfully above the impulse magnitude.
+        mult          = float(self._params.get('debug_vel_threshold_mult', 2.5))
+        threshold     = mult * max(opening_speed, 1e-6)
+
+        n_active = int(self._simulator.n_verts)
+        vel = self._simulator.velocities.to_numpy()[:n_active]
+        vmag = np.linalg.norm(vel, axis=1)
+
+        bad_mask = vmag > threshold
+        n_bad = int(bad_mask.sum())
+        if n_bad == 0:
+            return
+
+        # Throttle: skip if it's been repeatedly firing with roughly the same
+        # max speed. Print when the max grows by 20% or every 60 frames.
+        vmax = float(vmag.max())
+        last_max = getattr(self, '_debug_last_vmax', 0.0)
+        last_frame_count = getattr(self, '_debug_last_frame_count', 0)
+        cur_frame_count = last_frame_count + 1
+        self._debug_last_frame_count = cur_frame_count
+        if vmax < last_max * 1.2 and (cur_frame_count % 60 != 0):
+            return
+        self._debug_last_vmax = vmax
+
+        # Classify each vert by index range and current side label if available.
+        n_p     = self._pristine_n_orig or 0
+        n_split = self._n_split         or 0
+        top_idx = np.argsort(vmag)[::-1][:5]
+        print(f"[VelDebug] frame={cur_frame_count}  {n_bad} verts exceed "
+              f"{threshold:.2f} m/s ({mult:.1f}x opening_speed={opening_speed:.2f})  "
+              f"max={vmax:.2f}  n_active={n_active}",
+              flush=True)
+        for i_arr in top_idx:
+            i = int(i_arr)
+            if i < n_p:
+                cls = "PRISTINE"
+            elif i < n_split:
+                cls = "INTER   "
+            else:
+                cls = "DUP     "
+            fixed_str = ""
+            try:
+                fx = int(self._simulator._fixed.to_numpy()[i])
+                if fx != 0:
+                    fixed_str = "  FIXED"
+            except Exception:
+                pass
+            print(f"[VelDebug]   vert {i:>6d} [{cls}]  |v|={vmag[i]:8.2f}  "
+                  f"v=({vel[i,0]:+8.2f},{vel[i,1]:+8.2f},{vel[i,2]:+8.2f})"
+                  f"{fixed_str}",
+                  flush=True)
+
+    def _debug_scan_seam_separation(self) -> None:
+        """
+        For broken seam pairs, report:
+          - INTER-DUP distance (how far the cut has opened locally).
+          - pristine ORIG endpoints' current distance vs their PRISTINE
+            rest distance (how much the surrounding mesh is stretching).
+
+        A healthy progressive cut has the first quantity growing slowly and
+        the second staying close to 1.0 (rest ratio). If both blow up, the
+        FEM's restoring force isn't matching the impulses.
+
+        Throttled to print every N frames or on threshold-crossing events.
+        """
+        if not self._progressive_cut or not self._seam_pairs:
+            return
+        broken_pairs = [p for p in self._seam_pairs if p['broken']]
+        if not broken_pairs:
+            return
+
+        n_active = int(self._simulator.n_verts)
+        pos      = self._simulator.positions.to_numpy()[:n_active]
+
+        v_a = np.array([int(p['v_above']) for p in broken_pairs], dtype=np.int32)
+        v_b = np.array([int(p['v_below']) for p in broken_pairs], dtype=np.int32)
+        sep = np.linalg.norm(pos[v_a] - pos[v_b], axis=1)
+
+        # Recover the two pristine ORIG endpoints for each seam pair from
+        # inter_data cached in _topology_result. Skip if unavailable.
+        stretch_ratio_max = None
+        stretch_edge      = None
+        stretched_over_2  = 0
+        if self._topology_result is not None:
+            inter_data = self._topology_result[10]  # list of (nid, vi, vj, t)
+            inter_to_endpoints = {int(nid): (int(vi), int(vj))
+                                  for nid, vi, vj, _t in inter_data}
+            endpoints = []
+            for p in broken_pairs:
+                ep = inter_to_endpoints.get(int(p['v_above']))
+                if ep is None:
+                    endpoints.append(None)
+                else:
+                    endpoints.append(ep)
+            ratios = []
+            vi_list = []
+            vj_list = []
+            for ep in endpoints:
+                if ep is None:
+                    continue
+                vi, vj = ep
+                cur_d = float(np.linalg.norm(pos[vi] - pos[vj]))
+                rest_d = float(np.linalg.norm(self._pristine_positions[vi]
+                                              - self._pristine_positions[vj]))
+                if rest_d > 1e-6:
+                    ratios.append(cur_d / rest_d)
+                    vi_list.append(vi)
+                    vj_list.append(vj)
+            if ratios:
+                r_arr = np.asarray(ratios, dtype=np.float32)
+                idx_max = int(np.argmax(r_arr))
+                stretch_ratio_max = float(r_arr[idx_max])
+                stretch_edge      = (vi_list[idx_max], vj_list[idx_max])
+                stretched_over_2  = int((r_arr > 2.0).sum())
+
+        # Bounding box scale so the seam-separation threshold is mesh-relative.
+        n_p = int(self._pristine_n_orig or 0)
+        if n_p > 0:
+            mesh_scale = float(np.linalg.norm(
+                self._pristine_positions.max(axis=0)
+                - self._pristine_positions.min(axis=0)))
+        else:
+            mesh_scale = 1.0
+        sep_threshold = 0.15 * mesh_scale   # 15% of mesh scale = clearly excessive
+
+        sep_max = float(sep.max())
+        n_over  = int((sep > sep_threshold).sum())
+
+        # Throttle: print every 60 frames, or when max separation grows by 30%.
+        last_seep_max = getattr(self, '_debug_last_seep_max', 0.0)
+        last_frame    = getattr(self, '_debug_last_seep_frame', 0)
+        cur_frame     = last_frame + 1
+        self._debug_last_seep_frame = cur_frame
+        should_print  = (sep_max > last_seep_max * 1.3
+                         or (cur_frame % 60 == 0)
+                         or (stretch_ratio_max is not None and stretch_ratio_max > 2.0
+                             and stretched_over_2 > getattr(self, '_debug_last_stretched_2', -1)))
+        if not should_print:
+            return
+        self._debug_last_seep_max     = sep_max
+        self._debug_last_stretched_2  = stretched_over_2
+
+        # Top-3 by INTER-DUP separation.
+        top_sep = np.argsort(sep)[::-1][:3]
+        print(f"[SeamDebug] frame={cur_frame}  broken_seams={len(broken_pairs)}  "
+              f"max_INTER_DUP_sep={sep_max:.4f}  "
+              f"(threshold {sep_threshold:.4f} = 15% of mesh_scale={mesh_scale:.4f})  "
+              f"n_over={n_over}",
+              flush=True)
+        for k in top_sep:
+            i = int(k)
+            p = broken_pairs[i]
+            print(f"[SeamDebug]   pair (v_above={int(p['v_above'])}, "
+                  f"v_below={int(p['v_below'])})  sep={sep[i]:.4f}",
+                  flush=True)
+        if stretch_ratio_max is not None:
+            print(f"[SeamDebug] max pristine-edge stretch ratio={stretch_ratio_max:.2f}x  "
+                  f"({stretched_over_2} edges > 2x)  worst edge=({stretch_edge})",
+                  flush=True)
 
     def _apply_orphan_constraints(self) -> None:
         if not self._orphan_constraints:
@@ -626,6 +826,14 @@ class FEMMethod(SimulationMethod):
             return
 
         if self._debug_frames_since_cut >= 30:
+            return
+
+        # Progressive mode: n_orig and _debug_cut_pos grow whenever the split
+        # mask grows, so the "compare current post-cut positions to setup-time
+        # positions" assumption breaks. All prints in this block are commented
+        # out, so just skip the computation entirely under progressive_cut.
+        if self._progressive_cut:
+            self._debug_frames_since_cut += 1
             return
 
         f   = self._debug_frames_since_cut
@@ -692,13 +900,38 @@ class FEMMethod(SimulationMethod):
         if not self._opening_ramp_queue:
             return
         normal = self._cut_normal
+
+        # In progressive mode entries store pristine edge keys; build a
+        # fresh edge -> (v_above, v_below) map from the CURRENT seam_pairs
+        # so impulses always land on the right verts even after rebuilds.
+        edge_to_pair = None
+        if self._progressive_cut:
+            edge_to_pair = {p['edge']: (int(p['v_above']), int(p['v_below']))
+                            for p in self._seam_pairs
+                            if p.get('edge') is not None}
+
         active = []
         for entry in self._opening_ramp_queue:
             dv = (entry['step_speed'] * normal).astype(np.float32)
-            above = np.asarray(entry['above'], dtype=np.int32)
-            below = np.asarray(entry['below'], dtype=np.int32)
-            self._simulator._add_vel_scalar(above,  float(dv[0]),  float(dv[1]),  float(dv[2]))
-            self._simulator._add_vel_scalar(below, -float(dv[0]), -float(dv[1]), -float(dv[2]))
+            if 'edges' in entry:
+                above_list = []
+                below_list = []
+                for e in entry['edges']:
+                    pair = edge_to_pair.get(e) if edge_to_pair is not None else None
+                    if pair is None:
+                        continue
+                    above_list.append(pair[0])
+                    below_list.append(pair[1])
+                if above_list:
+                    above = np.asarray(above_list, dtype=np.int32)
+                    below = np.asarray(below_list, dtype=np.int32)
+                    self._simulator._add_vel_scalar(above,  float(dv[0]),  float(dv[1]),  float(dv[2]))
+                    self._simulator._add_vel_scalar(below, -float(dv[0]), -float(dv[1]), -float(dv[2]))
+            else:
+                above = np.asarray(entry['above'], dtype=np.int32)
+                below = np.asarray(entry['below'], dtype=np.int32)
+                self._simulator._add_vel_scalar(above,  float(dv[0]),  float(dv[1]),  float(dv[2]))
+                self._simulator._add_vel_scalar(below, -float(dv[0]), -float(dv[1]), -float(dv[2]))
             entry['left'] -= 1
             if entry['left'] > 0:
                 active.append(entry)
@@ -758,7 +991,9 @@ class FEMMethod(SimulationMethod):
         self._crossing_mask = _crossing_mask
         self._split_schedule = _sched
         # Initial mask: nothing split yet in progressive mode; all crossings
-        # split in the legacy path. The legacy path preserves current behavior.
+        # split in the legacy path. Progressive mode also caches a full
+        # precompute LAZILY on the first _maybe_grow_split call (see
+        # _ensure_full_precompute) so setup_cut itself stays cheap.
         _initial_mask = np.zeros(len(self._current_tets), dtype=bool) \
             if self._progressive_cut else None
 
@@ -782,7 +1017,11 @@ class FEMMethod(SimulationMethod):
 
         (_, final_pos, final_vel, _, final_fixed,
          all_tets, n_orig, n_split, shared_list, remap,
-         _inter_data, _orig_surf_set, _phantom_keys, side_label) = result
+         _inter_data, _orig_surf_set, _phantom_keys, side_label,
+         all_tets_parent) = result
+        self._full_all_tets_parent = all_tets_parent  # precompute-and-subset cache
+        # Progressive lazy cache -- populated on first _maybe_grow_split call.
+        self._full_precompute_cache = None
 
         # Check 4b: fixed count after topology rebuild
         n_fixed_after = int(final_fixed.sum())
@@ -970,6 +1209,11 @@ class FEMMethod(SimulationMethod):
         self._debug_n_orig           = n_orig
         self._debug_cut_pos          = final_pos.copy()
 
+        # Build v_above -> pristine edge map for stable seam identity across
+        # rebuilds (only meaningful in progressive mode, but harmless in legacy).
+        _va_to_edge_init = {int(nid): (int(min(vi, vj)), int(max(vi, vj)))
+                            for nid, vi, vj, _t in _inter_data}
+
         seam_pairs = []
         for i, v_above in enumerate(shared_list):
             v_below     = int(remap[v_above])
@@ -979,6 +1223,7 @@ class FEMMethod(SimulationMethod):
             seam_pairs.append({
                 'v_above':     _r(v_above),
                 'v_below':     _r(v_below),
+                'edge':        _va_to_edge_init.get(int(v_above)),
                 'spring_idx':  spring_idx,
                 'travel_dist': travel_dist,
                 'broken':      False,
@@ -989,7 +1234,17 @@ class FEMMethod(SimulationMethod):
         return True
 
     def advance_blade(self, blade_travel: float) -> bool:
-        if not self._seam_pairs:
+        # Progressive: grow the split mask if the blade has reached new tets,
+        # rebuild topology + sim + seam_pairs before running the break loop.
+        if self._progressive_cut:
+            self._maybe_grow_split(blade_travel)
+
+        # Legacy short-circuit: no seam pairs means nothing to progress and
+        # the blade is done. In progressive mode we intentionally allow the
+        # blade to keep advancing when seam_pairs is empty so we don't
+        # short-circuit before is_cut_complete has a chance to gate on the
+        # schedule.
+        if not self._seam_pairs and not self._progressive_cut:
             return True
 
         opening_speed = float(self._params.get('opening_speed', 1.0))
@@ -1001,7 +1256,11 @@ class FEMMethod(SimulationMethod):
 
         if newly_broken:
             for p in newly_broken:
-                self._simulator._sk[p['spring_idx']] = 0.0
+                # spring_idx == -1 in progressive mode (no cutting springs);
+                # skip the _sk write in that case.
+                si = int(p['spring_idx'])
+                if si >= 0:
+                    self._simulator._sk[si] = 0.0
                 p['broken'] = True
 
             if ramp_frames <= 1:
@@ -1011,13 +1270,367 @@ class FEMMethod(SimulationMethod):
                 self._simulator._add_vel_scalar(above_np,  float(dv[0]),  float(dv[1]),  float(dv[2]))
                 self._simulator._add_vel_scalar(below_np, -float(dv[0]), -float(dv[1]), -float(dv[2]))
             else:
-                self._opening_ramp_queue.append({
-                    'above':      np.array([p['v_above'] for p in newly_broken], dtype=np.int32),
-                    'below':      np.array([p['v_below'] for p in newly_broken], dtype=np.int32),
-                    'step_speed': opening_speed / ramp_frames,
-                    'left':       ramp_frames,
-                })
+                # Progressive mode: store pristine edge keys (stable across
+                # rebuilds) instead of raw v_above/v_below indices, which
+                # shift every rebuild. _process_opening_ramp resolves them
+                # to the current v_above/v_below at application time.
+                if self._progressive_cut:
+                    self._opening_ramp_queue.append({
+                        'edges':      [p.get('edge') for p in newly_broken],
+                        'step_speed': opening_speed / ramp_frames,
+                        'left':       ramp_frames,
+                    })
+                else:
+                    self._opening_ramp_queue.append({
+                        'above':      np.array([p['v_above'] for p in newly_broken], dtype=np.int32),
+                        'below':      np.array([p['v_below'] for p in newly_broken], dtype=np.int32),
+                        'step_speed': opening_speed / ramp_frames,
+                        'left':       ramp_frames,
+                    })
 
+        return self.is_cut_complete(blade_travel)
+
+    def _maybe_grow_split(self, blade_travel: float) -> None:
+        """
+        Progressive per-frame topology grower.
+
+        Computes the new split_mask from the schedule (crossing tets whose
+        centroid the blade has reached). If it differs from the current
+        _split_mask, re-invokes _cut_topology_physics on the pristine tets
+        with the new mask, rebuilds the FEM sim topology in place, and
+        rebuilds the seam_pairs list. Broken state is preserved by
+        (v_above, v_below) pair keys captured before the rebuild.
+
+        No cutting springs are created in progressive mode: INTER / DUP
+        verts are supposed to be kinematically slaved to their ORIG
+        endpoints (a future step). For now they are regular FEM DOFs, but
+        seam breaking still just applies an opening impulse -- the tets
+        holding the two halves together are the FEM tets, not springs.
+        """
+        if self._split_schedule is None or self._crossing_mask is None:
+            return
+        new_mask = self._crossing_mask & (self._split_schedule <= blade_travel)
+        if self._split_mask is not None and np.array_equal(new_mask, self._split_mask):
+            return
+
+        # Snapshot broken seams by pristine EDGE key (min(vi,vj), max(vi,vj))
+        # of the INTER's underlying edge. Edge keys are stable across
+        # rebuilds; v_above / v_below index shifts every time the split_mask
+        # grows, so using indices would let already-broken seams look fresh
+        # again and get their opening impulse re-applied every rebuild.
+        broken_edge_keys: set = set()
+        old_inter_data_snapshot = None
+        if self._topology_result is not None:
+            old_inter_data_snapshot = self._topology_result[10]
+            old_va_to_edge = {int(nid): (int(min(vi, vj)), int(max(vi, vj)))
+                              for nid, vi, vj, _t in old_inter_data_snapshot}
+            for p in self._seam_pairs:
+                if not p['broken']:
+                    continue
+                stored = p.get('edge')
+                if stored is not None:
+                    broken_edge_keys.add(stored)
+                    continue
+                e = old_va_to_edge.get(int(p['v_above']))
+                if e is not None:
+                    broken_edge_keys.add(e)
+        n_new_split = int(new_mask.sum() - (self._split_mask.sum()
+                                             if self._split_mask is not None else 0))
+        print(f"[Progressive] blade_travel={blade_travel:.4f}  "
+              f"newly-splitting {n_new_split} tets  "
+              f"(cumulative {int(new_mask.sum())}/{int(self._crossing_mask.sum())} crossing tets split)",
+              flush=True)
+
+        # --- Snapshot old state for edge-key based preservation ---
+        # _cut_topology_physics renumbers INTER/DUP verts each call because
+        # iteration order in the split loop can shift when new tets enter the
+        # split_mask (a lower-numbered tet inserts its edges ahead of a
+        # higher-numbered tet's). Without preservation, every existing INTER
+        # and DUP gets teleported back to the interpolated edge-midpoint of
+        # its pristine endpoints each frame, wiping the opening impulse and
+        # any FEM-integrated motion.
+        n_active_old = int(self._simulator.n_verts)
+        old_pos = self._simulator.positions.to_numpy()[:n_active_old].copy()
+        old_vel = self._simulator.velocities.to_numpy()[:n_active_old].copy()
+        old_edge_to_inter: dict = {}
+        old_inter_to_dup: dict  = {}
+        if self._topology_result is not None:
+            old_inter_data = self._topology_result[10]  # list of (nid, vi, vj, t)
+            for nid, vi, vj, _t in old_inter_data:
+                edge = (int(vi), int(vj)) if int(vi) < int(vj) else (int(vj), int(vi))
+                old_edge_to_inter[edge] = int(nid)
+            old_n_split    = int(self._topology_result[7])
+            old_shared_list = self._topology_result[8]
+            for i, v in enumerate(old_shared_list):
+                old_inter_to_dup[int(v)] = old_n_split + i
+
+        # ---- Step 4: precompute + subset ----
+        import time as _t
+        _t0 = _t.perf_counter()
+        # Populate the full-split precompute cache lazily on first call.
+        self._ensure_full_precompute()
+        _t_precomp = _t.perf_counter() - _t0
+
+        n_p     = int(self._pristine_n_orig)
+        n_full  = int(self._full_final_pos.shape[0])
+        full_all_tets   = self._full_all_tets
+        full_parent     = self._full_all_tets_parent
+        pristine_tets   = self._pristine_tets
+        crossing_mask   = self._crossing_mask
+
+        # Build the ACTIVE tet array by subsetting full precompute:
+        # - Sub-tets whose parent pristine tet is currently split (mask=True)
+        #   OR whose parent is non-crossing come from _full_all_tets.
+        # - Crossing pristine tets whose mask=False are added as 4-vert rows.
+        parent_active_lookup = np.ones(len(pristine_tets), dtype=bool)
+        unsplit_crossing_mask = crossing_mask & ~new_mask
+        parent_active_lookup[unsplit_crossing_mask] = False
+        row_active = parent_active_lookup[full_parent]
+        active_sub_tets = full_all_tets[row_active]
+        unsplit_pristine = pristine_tets[unsplit_crossing_mask]
+        if len(unsplit_pristine) > 0:
+            active_tets = np.vstack([active_sub_tets, unsplit_pristine]).astype(np.int32)
+        else:
+            active_tets = active_sub_tets.astype(np.int32)
+
+        # Which verts are used by at least one active tet.
+        active_verts_used = np.zeros(n_full, dtype=bool)
+        if len(active_tets) > 0:
+            active_verts_used[active_tets.ravel()] = True
+
+        # Snapshot old sim state (positions and velocities) up to n_full so we
+        # can preserve INTER/DUP dynamics for verts that stay active across
+        # this rebuild.
+        old_pos = self._simulator.positions.to_numpy()[:n_full].copy()
+        old_vel = self._simulator.velocities.to_numpy()[:n_full].copy()
+
+        # Compute old active-vert mask so we know which INTER/DUPs already had
+        # meaningful sim state (versus verts activating for the first time).
+        old_split_mask = self._split_mask if self._split_mask is not None \
+                         else np.zeros(len(pristine_tets), dtype=bool)
+        old_parent_active_lookup = np.ones(len(pristine_tets), dtype=bool)
+        old_unsplit_crossing = crossing_mask & ~old_split_mask
+        old_parent_active_lookup[old_unsplit_crossing] = False
+        old_row_active = old_parent_active_lookup[full_parent]
+        old_active_sub_tets = full_all_tets[old_row_active]
+        old_unsplit_pristine = pristine_tets[old_unsplit_crossing]
+        was_active_old = np.zeros(n_full, dtype=bool)
+        if len(old_active_sub_tets) > 0:
+            was_active_old[old_active_sub_tets.ravel()] = True
+        if len(old_unsplit_pristine) > 0:
+            was_active_old[old_unsplit_pristine.ravel()] = True
+
+        # ---- Assemble sim upload arrays sized at full topology ----
+        # Positions: start with pristine (from full_final_pos). Overlay current
+        # sim state for pristine ORIGs and for verts that were already active.
+        cur_pristine_pos = self._simulator.positions.to_numpy()[:n_p]
+        cur_pristine_vel = self._simulator.velocities.to_numpy()[:n_p]
+
+        active_pos = self._full_final_pos.copy()
+        active_vel = np.zeros((n_full, 3), dtype=np.float32)
+
+        # ORIGs: always active; use current sim state.
+        active_pos[:n_p] = cur_pristine_pos
+        active_vel[:n_p] = cur_pristine_vel
+
+        # INTERs / DUPs: if they were active before, preserve their sim state.
+        # Otherwise leave them at pristine (from full_final_pos) with zero vel.
+        preserved_mask = np.zeros(n_full, dtype=bool)
+        preserved_mask[n_p:] = was_active_old[n_p:]
+        if preserved_mask.any():
+            idx = np.where(preserved_mask)[0]
+            active_pos[idx] = old_pos[idx]
+            active_vel[idx] = old_vel[idx]
+
+        # For NEW INTERs/DUPs (active now but not before), interpolate
+        # positions/velocities from current pristine ORIG positions using the
+        # full inter_data t-values, so they enter the sim at the current
+        # deformed edge midpoint (not the pristine edge midpoint).
+        newly_active = active_verts_used & ~was_active_old
+        for nid_int, vi_int, vj_int, t_float in self._full_inter_data:
+            nid = int(nid_int)
+            if not newly_active[nid]:
+                continue
+            vi = int(vi_int); vj = int(vj_int); t = float(t_float)
+            active_pos[nid] = cur_pristine_pos[vi] * (1.0 - t) + cur_pristine_pos[vj] * t
+            active_vel[nid] = cur_pristine_vel[vi] * (1.0 - t) + cur_pristine_vel[vj] * t
+        # Newly-active DUPs mirror their INTER's fresh state.
+        full_remap = self._full_remap
+        for i, nid_int in enumerate(self._full_shared_list):
+            dup_idx = int(full_remap[int(nid_int)])
+            if not newly_active[dup_idx]:
+                continue
+            src = int(nid_int)
+            active_pos[dup_idx] = active_pos[src]
+            active_vel[dup_idx] = active_vel[src]
+
+        # Fixed mask: original fixed for active verts; pinned (fixed=1) for
+        # inactive verts so the CG solver doesn't wander with mass=0.
+        active_fixed = self._full_final_fixed.copy()
+        active_fixed[~active_verts_used] = 1
+        active_vel[~active_verts_used]   = 0
+
+        _t_subset = _t.perf_counter() - _t0 - _t_precomp
+        # Rebuild sim topology in place. rest_positions = pristine geometry
+        # (full_final_pos) so FEM strain forces try to restore the pre-cut
+        # rest shape. vertices = current deformed geometry, uploaded after B
+        # is computed so the integrator sees the actual state.
+        _t1 = _t.perf_counter()
+        self._simulator.rebuild_topology(
+            vertices       = active_pos,
+            tetrahedra     = active_tets,
+            fixed_mask     = active_fixed,
+            velocities     = active_vel,
+            rest_positions = self._full_final_pos,
+        )
+        _t_rebuild = _t.perf_counter() - _t1
+
+        self._current_tets    = active_tets
+        self._n_orig_val      = int(self._full_n_orig)
+        self._n_split         = int(self._full_n_split)
+        self._split_mask      = new_mask.copy()
+        self._topology_version += 1
+
+        # Update _topology_result for the ECS to read. Substitute the ACTIVE
+        # tet array in position 5 and current positions/velocities/fixed in
+        # positions 1/2/4; keep the rest from the full precompute (shared_list,
+        # remap, inter_data, orig_surf_set, side_label are all "full" values).
+        full = self._full_precompute_cache
+        self._topology_result = (
+            full[0],           # new_sim (None for FEM)
+            active_pos,        # final_pos (current)
+            active_vel,        # final_vel (current)
+            full[3],           # final_mass (unused by ECS)
+            active_fixed,      # final_fixed
+            active_tets,       # all_tets  (SUBSET)
+            int(self._full_n_orig),
+            int(self._full_n_split),
+            full[8],           # shared_list  (full)
+            full[9],           # remap        (full)
+            full[10],          # inter_data   (full)
+            full[11],          # orig_surf_set
+            full[12],          # phantom_above_face_keys
+            full[13],          # side_label
+            full[14],          # all_tets_parent
+        )
+
+        # ---- Rebuild seam_pairs from the FULL shared_list; filter to active ----
+        full_inter_data = self._full_inter_data
+        inter_to_edge = {int(nid): (int(min(vi, vj)), int(max(vi, vj)))
+                         for nid, vi, vj, _t in full_inter_data}
+        seam_pairs = []
+        for nid_int in self._full_shared_list:
+            nid = int(nid_int)
+            if not active_verts_used[nid]:
+                continue
+            dup_idx = int(full_remap[nid])
+            if not active_verts_used[dup_idx]:
+                continue
+            edge = inter_to_edge.get(nid)
+            pos_seam = self._full_final_pos[nid]
+            travel_dist = float(np.dot(pos_seam - self._cut_origin, self._blade_dir))
+            was_broken = (edge in broken_edge_keys) if edge is not None else False
+            seam_pairs.append({
+                'v_above':     nid,
+                'v_below':     dup_idx,
+                'edge':        edge,
+                'spring_idx':  -1,
+                'travel_dist': travel_dist,
+                'broken':      was_broken,
+            })
+        seam_pairs.sort(key=lambda p: p['travel_dist'])
+        self._seam_pairs = seam_pairs
+        _t_total = _t.perf_counter() - _t0
+        _t_seams = _t_total - _t_precomp - _t_subset - _t_rebuild
+        print(f"[GrowTiming] total={_t_total*1000:.1f}ms  "
+              f"precomp={_t_precomp*1000:.1f}  "
+              f"subset+alloc={_t_subset*1000:.1f}  "
+              f"rebuild_topo={_t_rebuild*1000:.1f}  "
+              f"seams={_t_seams*1000:.1f}  "
+              f"n_active_tets={len(active_tets):,}  "
+              f"n_full_verts={n_full:,}",
+              flush=True)
+
+    def _ensure_full_precompute(self) -> None:
+        """
+        Lazily run one full-split _cut_topology_physics call at the pristine
+        mesh and cache all outputs. Called on the first _maybe_grow_split
+        invocation. Subsequent per-frame rebuilds subset this cache rather
+        than re-running the O(pristine_tets) split logic.
+        """
+        if getattr(self, '_full_precompute_cache', None) is not None:
+            return
+        gravity = np.array(self._params.get('gravity', [0.0, 0.0, 0.0]), dtype=np.float32)
+        n_p = int(self._pristine_n_orig)
+        vel0 = np.zeros((n_p, 3), dtype=np.float32)
+        mass0 = np.ones(n_p, dtype=np.float32)  # placeholder; not used downstream
+        fixed0 = self._simulator._fixed.to_numpy()[:n_p]
+
+        _tcu._QUIET_CUT_LOGS = True
+        try:
+            result = _cut_topology_physics(
+                self._pristine_tets,
+                self._pristine_positions,
+                vel0, mass0, fixed0,
+                0.0, gravity, self._cut_origin, self._cut_normal,
+                build_simulator = False,
+                blade_dir       = self._blade_dir,
+                split_mask      = None,      # FULL split
+            )
+        finally:
+            _tcu._QUIET_CUT_LOGS = False
+        if result is None:
+            raise RuntimeError("_ensure_full_precompute: cut plane misses mesh?")
+
+        self._full_precompute_cache = result
+        self._full_all_tets        = result[5]
+        self._full_n_orig          = int(result[6])
+        self._full_n_split         = int(result[7])
+        self._full_shared_list     = list(result[8])
+        self._full_remap           = result[9]
+        self._full_inter_data      = list(result[10])
+        self._full_final_pos       = result[1].copy()
+        self._full_final_fixed     = result[4].copy()
+        self._full_side_label      = result[13].copy()
+        self._full_all_tets_parent = result[14]
+
+        print(f"[Step4] Precomputed full split: "
+              f"{len(self._full_all_tets):,} tets, "
+              f"{len(self._full_final_pos):,} verts, "
+              f"{len(self._full_inter_data)} INTERs, "
+              f"{len(self._full_shared_list)} DUPs "
+              f"(vs pristine {len(self._pristine_tets):,} tets, {n_p:,} verts)",
+              flush=True)
+
+    def is_cut_complete(self, blade_travel: float) -> bool:
+        """
+        Progressive-aware override.
+
+        Legacy path: same as the base class -- all existing seam pairs broken.
+        Progressive path: the blade must first travel past the largest split
+        schedule entry among crossing tets before "done" can fire. Until then,
+        even an empty seam_pairs list is still "in progress" (step 3 will
+        populate it incrementally as the blade passes crossing tets).
+        """
+        if not self._progressive_cut:
+            return all(p['broken'] for p in self._seam_pairs)
+
+        if self._split_schedule is None or self._crossing_mask is None:
+            # Progressive requested but setup_cut hasn't populated the schedule
+            # yet; treat as in-progress so the blade doesn't short-circuit.
+            return False
+
+        cross_sched = self._split_schedule[self._crossing_mask]
+        if len(cross_sched) == 0:
+            # Plane misses the mesh -- nothing to cut, trivially done.
+            return True
+
+        if blade_travel < float(cross_sched.max()):
+            return False
+
+        # Blade has passed the last scheduled tet split. Cut is done only if
+        # every seam pair that DID get created is also broken. Empty list ->
+        # vacuously True, which is what we want here.
         return all(p['broken'] for p in self._seam_pairs)
 
     @property
