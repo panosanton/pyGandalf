@@ -619,6 +619,16 @@ class FEMMethod(SimulationMethod):
             v_max    = float(self._params.get('v_max',    10.0)),
             cg_iters = int(self._params.get('cg_iters',  20)),
         )
+        # Progressive path: kinematically slave sliver-orphaned INTER/DUPs to
+        # their master ORIG each step, on-GPU (no numpy round-trip).
+        if getattr(self, '_orphan_ids', None) is not None and len(self._orphan_ids) > 0:
+            self._simulator.apply_orphan_kinematics(
+                self._orphan_ids,
+                self._orphan_masters,
+                self._orphan_offsets,
+            )
+        # Legacy one-shot path uses _apply_orphan_constraints (numpy). It's a
+        # no-op when _orphan_constraints is empty (progressive doesn't populate it).
         self._apply_orphan_constraints()
         self._debug_step()
         self._debug_scan_high_velocity()
@@ -1022,6 +1032,24 @@ class FEMMethod(SimulationMethod):
         self._full_all_tets_parent = all_tets_parent  # precompute-and-subset cache
         # Progressive lazy cache -- populated on first _maybe_grow_split call.
         self._full_precompute_cache = None
+        self._precomp_render_cache  = None
+        # Stable-superset delta path state (populated on first grow).
+        self._superset_initialized  = False
+        self._parent_unsplit_slot   = None
+        self._parent_split_slots    = None
+        self._parent_split_slots_off = None
+        self._active_verts_used     = None
+        # Sliver / orphan state (populated by _build_sliver_and_orphan_data).
+        self._sliver_slots   = None
+        self._orphan_ids     = None
+        self._orphan_masters = None
+        self._orphan_offsets = None
+        self._orphan_set     = set()
+        # Cleared here so a re-setup rebuilds it against the new topology.
+        if hasattr(self, '_full_inter_edge_lookup'):
+            del self._full_inter_edge_lookup
+        if hasattr(self, '_inter_vi_full'):
+            self._inter_vi_full = None
 
         # Check 4b: fixed count after topology rebuild
         n_fixed_after = int(final_fixed.sum())
@@ -1290,6 +1318,240 @@ class FEMMethod(SimulationMethod):
 
         return self.is_cut_complete(blade_travel)
 
+    def _build_parent_slot_lookups(self) -> None:
+        """
+        Precompute, per pristine tet:
+          - `_parent_unsplit_slot[p]`: slot ID in the FEM tet field for this
+             tet's unsplit-form representation, or -1 for non-crossing tets.
+          - `_parent_split_slots[start:end]` (via `_parent_split_slots_off`):
+             slot IDs for the sub-tets produced by splitting p, packed CSR-style.
+
+        Slot ID layout (must match init_superset_topology upload order):
+          [0, n_full_tets)                     : full_all_tets sub-tets
+          [n_full_tets, n_full_tets + n_cross) : crossing pristine tets, unsplit
+        """
+        n_pristine    = len(self._pristine_tets)
+        full_parent   = self._full_all_tets_parent
+        n_full_tets   = len(self._full_all_tets)
+        crossing_idx  = np.where(self._crossing_mask)[0].astype(np.int64)
+        n_cross       = len(crossing_idx)
+
+        # Unsplit slot map: -1 for non-crossing, else n_full_tets + rank(p in crossing_idx)
+        self._parent_unsplit_slot = np.full(n_pristine, -1, dtype=np.int32)
+        self._parent_unsplit_slot[crossing_idx] = n_full_tets + np.arange(n_cross, dtype=np.int32)
+
+        # Split slot map: CSR packing. For each pristine p, its sub-tet slots
+        # are contiguous in `_parent_split_slots[_parent_split_slots_off[p] :
+        # _parent_split_slots_off[p+1]]`.
+        sort_order = np.argsort(full_parent, kind='stable')
+        sorted_parents = full_parent[sort_order]
+        self._parent_split_slots = sort_order.astype(np.int32)   # slots in full-block
+
+        # Offsets: for each pristine p, find its first/last position in sorted_parents.
+        ids = np.arange(n_pristine, dtype=np.int64)
+        self._parent_split_slots_off = np.zeros(n_pristine + 1, dtype=np.int32)
+        # np.searchsorted over sorted_parents to get boundaries
+        starts = np.searchsorted(sorted_parents, ids,     side='left')
+        ends   = np.searchsorted(sorted_parents, ids + 1, side='left')
+        self._parent_split_slots_off[:-1] = starts.astype(np.int32)
+        self._parent_split_slots_off[-1]  = ends[-1] if n_pristine > 0 else 0
+
+    def _init_superset_layout(self) -> None:
+        """
+        One-time FEM init at first progressive rebuild. Uploads the FULL
+        superset topology (all possible sub-tets + all unsplit crossings)
+        to the Taichi fields with pristine rest-shape data, computes B/W
+        for all of them, then zeros out W for split-side sub-tets (which
+        start inactive because no crossing tet has flipped yet). Pins
+        inactive INTER/DUP vertices. Subsequent per-frame changes are
+        applied by _apply_split_mask_delta.
+
+        Starts with "everything unsplit" (all crossing tets shown in their
+        pristine 4-vert form). The caller then feeds the current new_mask
+        into _apply_split_mask_delta to activate the tets that should
+        already be split at this blade position.
+        """
+        self._build_parent_slot_lookups()
+
+        n_full_tets = len(self._full_all_tets)
+        crossing_idx = np.where(self._crossing_mask)[0].astype(np.int64)
+        n_cross      = len(crossing_idx)
+        n_super      = n_full_tets + n_cross
+        n_full_v     = int(self._full_final_pos.shape[0])
+
+        # Build stable-order superset tet array (must match slot IDs).
+        unsplit_cross_tets = self._pristine_tets[self._crossing_mask].astype(np.int32)
+        super_tets = np.vstack([self._full_all_tets.astype(np.int32),
+                                unsplit_cross_tets])
+
+        # Initial activation: full-block sub-tets active only if their parent
+        # is non-crossing (they represent the parent as-is); unsplit-block
+        # rows all active (all crossings start unsplit).
+        parent_of_slot = np.empty(n_super, dtype=np.int64)
+        parent_of_slot[:n_full_tets] = self._full_all_tets_parent
+        parent_of_slot[n_full_tets:] = crossing_idx
+        tet_active_mask = np.zeros(n_super, dtype=bool)
+        tet_active_mask[:n_full_tets] = ~self._crossing_mask[parent_of_slot[:n_full_tets]]
+        tet_active_mask[n_full_tets:] = True
+
+        active_verts_used = np.zeros(n_full_v, dtype=bool)
+        active_slots = np.where(tet_active_mask)[0]
+        if len(active_slots) > 0:
+            active_verts_used[super_tets[active_slots].ravel()] = True
+
+        n_p = int(self._pristine_n_orig)
+        cur_pristine_pos = self._simulator.positions.to_numpy()[:n_p]
+        cur_pristine_vel = self._simulator.velocities.to_numpy()[:n_p]
+
+        init_pos = self._full_final_pos.copy()
+        init_vel = np.zeros((n_full_v, 3), dtype=np.float32)
+        init_pos[:n_p] = cur_pristine_pos
+        init_vel[:n_p] = cur_pristine_vel
+
+        init_fixed = self._full_final_fixed.copy()
+        init_fixed[~active_verts_used] = 1  # pin inactive INTER/DUP
+        init_vel[~active_verts_used]   = 0
+
+        self._simulator.init_superset_topology(
+            vertices        = init_pos,
+            super_tets      = super_tets,
+            tet_active_mask = tet_active_mask,
+            fixed_mask      = init_fixed,
+            velocities      = init_vel,
+            rest_positions  = self._full_final_pos,
+        )
+
+        # Permanently disable sliver sub-tets: zero out W_rest so
+        # _activate_tets_kernel becomes a no-op for these slots when their
+        # parent flips split. Also pin all orphan verts so FEM never touches
+        # them (they're driven by the per-step orphan kinematics kernel).
+        if hasattr(self, '_sliver_slots') and len(self._sliver_slots) > 0:
+            # These slots may have been "active" in the initial mask and thus
+            # contributed mass in init_tet_data. Deactivate first, then also
+            # zero W_rest so they never reactivate.
+            self._simulator._deactivate_tets_kernel(self._sliver_slots)
+            self._simulator._zero_W_rest_kernel(self._sliver_slots)
+        if hasattr(self, '_orphan_ids') and len(self._orphan_ids) > 0:
+            # Pin orphan verts unconditionally (they'll be moved by the
+            # orphan-kinematics kernel each step, not by FEM).
+            self._simulator._pin_verts_kernel(self._orphan_ids)
+
+        self._super_tets_ref       = super_tets
+        self._active_verts_used    = active_verts_used
+        self._split_mask           = np.zeros(len(self._pristine_tets), dtype=bool)
+        self._superset_initialized = True
+
+    def _apply_split_mask_delta(self, new_mask: np.ndarray) -> None:
+        """
+        Per-frame delta: for each pristine tet flipping unsplit->split,
+        deactivate its unsplit slot and activate its split slots, then
+        write initial state for any newly-touched INTER/DUP vertices.
+        Assumes _init_superset_layout has been called.
+        """
+        old_mask = (self._split_mask if self._split_mask is not None
+                    else np.zeros(len(self._pristine_tets), dtype=bool))
+        newly_split = new_mask & ~old_mask
+        flipped_ids = np.where(newly_split)[0]
+        if len(flipped_ids) == 0:
+            return
+
+        # Slots to deactivate: parent's unsplit-block slot (one per flip).
+        deact_all = self._parent_unsplit_slot[flipped_ids]
+        deact_slots = deact_all[deact_all >= 0].astype(np.int32)
+
+        # Slots to activate: concat of parent's split-block slots (variable per flip).
+        offs = self._parent_split_slots_off
+        act_parts = [self._parent_split_slots[offs[p]:offs[p+1]]
+                     for p in flipped_ids]
+        if act_parts:
+            act_slots = np.concatenate(act_parts).astype(np.int32)
+        else:
+            act_slots = np.zeros(0, dtype=np.int32)
+
+        # Which vertices are used by any newly-activated slot but weren't
+        # active before? These need initial state written.
+        if len(act_slots) > 0:
+            act_verts = self._super_tets_ref[act_slots].ravel()
+            act_verts_unique = np.unique(act_verts)
+        else:
+            act_verts_unique = np.zeros(0, dtype=np.int32)
+
+        was_active = self._active_verts_used
+        newly_active_v = act_verts_unique[~was_active[act_verts_unique]]
+
+        if len(newly_active_v) > 0:
+            n_p = int(self._pristine_n_orig)
+            cur_pristine_pos = self._simulator.positions.to_numpy()[:n_p]
+            cur_pristine_vel = self._simulator.velocities.to_numpy()[:n_p]
+
+            # For each newly-active vert: interpolate from pristine ORIG endpoints
+            # (INTER via inter_data lookup, DUP via shared_list->INTER->same).
+            n_orig = self._full_n_orig
+            n_split = self._full_n_split
+
+            # Precomputed once at ensure_full_precompute (numpy arrays).
+            nids = self._full_inter_nids
+            vis  = self._full_inter_vis
+            vjs  = self._full_inter_vjs
+            ts   = self._full_inter_ts
+
+            # Map each newly-active vert to (vi, vj, t). DUPs map back to their INTER.
+            # Build a per-full-vert lookup for (vi, vj, t) that supports both INTER and DUP.
+            if not hasattr(self, '_inter_vi_full') or self._inter_vi_full is None:
+                total_v = int(self._full_final_pos.shape[0])
+                vi_full = np.arange(total_v, dtype=np.int64)
+                vj_full = np.arange(total_v, dtype=np.int64)
+                t_full  = np.zeros(total_v, dtype=np.float32)
+                # INTERs
+                if len(nids) > 0:
+                    vi_full[nids] = vis
+                    vj_full[nids] = vjs
+                    t_full[nids]  = ts
+                # DUPs: mirror their INTER's (vi, vj, t)
+                shared = self._full_shared_arr
+                if len(shared) > 0:
+                    dup_ids = self._full_shared_dup_arr
+                    vi_full[dup_ids] = vi_full[shared]
+                    vj_full[dup_ids] = vj_full[shared]
+                    t_full[dup_ids]  = t_full[shared]
+                self._inter_vi_full = vi_full
+                self._inter_vj_full = vj_full
+                self._inter_t_full  = t_full
+
+            na_v = newly_active_v.astype(np.int64)
+            is_new_vert = na_v >= n_orig   # skip ORIGs (already active from B-press)
+            na_v = na_v[is_new_vert]
+
+            # Orphan verts stay pinned; the per-step orphan kinematics kernel
+            # drives them. Only unpin+interpolate normal (non-orphan) INTER/DUPs.
+            if len(na_v) > 0 and len(getattr(self, '_orphan_ids', [])) > 0:
+                orphan_arr = self._orphan_ids.astype(np.int64)
+                keep_mask  = ~np.isin(na_v, orphan_arr)
+                na_v = na_v[keep_mask]
+
+            if len(na_v) > 0:
+                via = self._inter_vi_full[na_v]
+                vjb = self._inter_vj_full[na_v]
+                t   = self._inter_t_full[na_v][:, None]
+                pos_new = cur_pristine_pos[via] * (1.0 - t) + cur_pristine_pos[vjb] * t
+                vel_new = cur_pristine_vel[via] * (1.0 - t) + cur_pristine_vel[vjb] * t
+
+                self._simulator.write_vert_state(
+                    indices    = na_v.astype(np.int32),
+                    positions  = pos_new.astype(np.float32),
+                    velocities = vel_new.astype(np.float32),
+                    fixed      = np.zeros(len(na_v), dtype=np.int32),
+                )
+
+        # Flip tet activations on the FEM.
+        self._simulator.flip_tets_delta(deact_slots, act_slots)
+
+        # Update the maintained active-verts mask.
+        if len(act_verts_unique) > 0:
+            self._active_verts_used[act_verts_unique] = True
+        # Note: we do NOT deactivate any verts. In progressive cut, once a
+        # vert is used it stays used until the cut is done.
+
     def _maybe_grow_split(self, blade_travel: float) -> None:
         """
         Progressive per-frame topology grower.
@@ -1313,27 +1575,18 @@ class FEMMethod(SimulationMethod):
         if self._split_mask is not None and np.array_equal(new_mask, self._split_mask):
             return
 
-        # Snapshot broken seams by pristine EDGE key (min(vi,vj), max(vi,vj))
-        # of the INTER's underlying edge. Edge keys are stable across
-        # rebuilds; v_above / v_below index shifts every time the split_mask
-        # grows, so using indices would let already-broken seams look fresh
-        # again and get their opening impulse re-applied every rebuild.
+        import time as _t
+        _t0 = _t.perf_counter()
+
+        # Snapshot broken seams by pristine EDGE key. seam_pair['edge'] was
+        # stashed at build time so this loop is O(active seams).
         broken_edge_keys: set = set()
-        old_inter_data_snapshot = None
-        if self._topology_result is not None:
-            old_inter_data_snapshot = self._topology_result[10]
-            old_va_to_edge = {int(nid): (int(min(vi, vj)), int(max(vi, vj)))
-                              for nid, vi, vj, _t in old_inter_data_snapshot}
-            for p in self._seam_pairs:
-                if not p['broken']:
-                    continue
+        for p in self._seam_pairs:
+            if p['broken']:
                 stored = p.get('edge')
                 if stored is not None:
                     broken_edge_keys.add(stored)
-                    continue
-                e = old_va_to_edge.get(int(p['v_above']))
-                if e is not None:
-                    broken_edge_keys.add(e)
+
         n_new_split = int(new_mask.sum() - (self._split_mask.sum()
                                              if self._split_mask is not None else 0))
         print(f"[Progressive] blade_travel={blade_travel:.4f}  "
@@ -1341,213 +1594,105 @@ class FEMMethod(SimulationMethod):
               f"(cumulative {int(new_mask.sum())}/{int(self._crossing_mask.sum())} crossing tets split)",
               flush=True)
 
-        # --- Snapshot old state for edge-key based preservation ---
-        # _cut_topology_physics renumbers INTER/DUP verts each call because
-        # iteration order in the split loop can shift when new tets enter the
-        # split_mask (a lower-numbered tet inserts its edges ahead of a
-        # higher-numbered tet's). Without preservation, every existing INTER
-        # and DUP gets teleported back to the interpolated edge-midpoint of
-        # its pristine endpoints each frame, wiping the opening impulse and
-        # any FEM-integrated motion.
-        n_active_old = int(self._simulator.n_verts)
-        old_pos = self._simulator.positions.to_numpy()[:n_active_old].copy()
-        old_vel = self._simulator.velocities.to_numpy()[:n_active_old].copy()
-        old_edge_to_inter: dict = {}
-        old_inter_to_dup: dict  = {}
-        if self._topology_result is not None:
-            old_inter_data = self._topology_result[10]  # list of (nid, vi, vj, t)
-            for nid, vi, vj, _t in old_inter_data:
-                edge = (int(vi), int(vj)) if int(vi) < int(vj) else (int(vj), int(vi))
-                old_edge_to_inter[edge] = int(nid)
-            old_n_split    = int(self._topology_result[7])
-            old_shared_list = self._topology_result[8]
-            for i, v in enumerate(old_shared_list):
-                old_inter_to_dup[int(v)] = old_n_split + i
-
-        # ---- Step 4: precompute + subset ----
-        import time as _t
-        _t0 = _t.perf_counter()
-        # Populate the full-split precompute cache lazily on first call.
         self._ensure_full_precompute()
         _t_precomp = _t.perf_counter() - _t0
 
-        n_p     = int(self._pristine_n_orig)
-        n_full  = int(self._full_final_pos.shape[0])
-        full_all_tets   = self._full_all_tets
-        full_parent     = self._full_all_tets_parent
-        pristine_tets   = self._pristine_tets
-        crossing_mask   = self._crossing_mask
-
-        # Build the ACTIVE tet array by subsetting full precompute:
-        # - Sub-tets whose parent pristine tet is currently split (mask=True)
-        #   OR whose parent is non-crossing come from _full_all_tets.
-        # - Crossing pristine tets whose mask=False are added as 4-vert rows.
-        parent_active_lookup = np.ones(len(pristine_tets), dtype=bool)
-        unsplit_crossing_mask = crossing_mask & ~new_mask
-        parent_active_lookup[unsplit_crossing_mask] = False
-        row_active = parent_active_lookup[full_parent]
-        active_sub_tets = full_all_tets[row_active]
-        unsplit_pristine = pristine_tets[unsplit_crossing_mask]
-        if len(unsplit_pristine) > 0:
-            active_tets = np.vstack([active_sub_tets, unsplit_pristine]).astype(np.int32)
-        else:
-            active_tets = active_sub_tets.astype(np.int32)
-
-        # Which verts are used by at least one active tet.
-        active_verts_used = np.zeros(n_full, dtype=bool)
-        if len(active_tets) > 0:
-            active_verts_used[active_tets.ravel()] = True
-
-        # Snapshot old sim state (positions and velocities) up to n_full so we
-        # can preserve INTER/DUP dynamics for verts that stay active across
-        # this rebuild.
-        old_pos = self._simulator.positions.to_numpy()[:n_full].copy()
-        old_vel = self._simulator.velocities.to_numpy()[:n_full].copy()
-
-        # Compute old active-vert mask so we know which INTER/DUPs already had
-        # meaningful sim state (versus verts activating for the first time).
-        old_split_mask = self._split_mask if self._split_mask is not None \
-                         else np.zeros(len(pristine_tets), dtype=bool)
-        old_parent_active_lookup = np.ones(len(pristine_tets), dtype=bool)
-        old_unsplit_crossing = crossing_mask & ~old_split_mask
-        old_parent_active_lookup[old_unsplit_crossing] = False
-        old_row_active = old_parent_active_lookup[full_parent]
-        old_active_sub_tets = full_all_tets[old_row_active]
-        old_unsplit_pristine = pristine_tets[old_unsplit_crossing]
-        was_active_old = np.zeros(n_full, dtype=bool)
-        if len(old_active_sub_tets) > 0:
-            was_active_old[old_active_sub_tets.ravel()] = True
-        if len(old_unsplit_pristine) > 0:
-            was_active_old[old_unsplit_pristine.ravel()] = True
-
-        # ---- Assemble sim upload arrays sized at full topology ----
-        # Positions: start with pristine (from full_final_pos). Overlay current
-        # sim state for pristine ORIGs and for verts that were already active.
-        cur_pristine_pos = self._simulator.positions.to_numpy()[:n_p]
-        cur_pristine_vel = self._simulator.velocities.to_numpy()[:n_p]
-
-        active_pos = self._full_final_pos.copy()
-        active_vel = np.zeros((n_full, 3), dtype=np.float32)
-
-        # ORIGs: always active; use current sim state.
-        active_pos[:n_p] = cur_pristine_pos
-        active_vel[:n_p] = cur_pristine_vel
-
-        # INTERs / DUPs: if they were active before, preserve their sim state.
-        # Otherwise leave them at pristine (from full_final_pos) with zero vel.
-        preserved_mask = np.zeros(n_full, dtype=bool)
-        preserved_mask[n_p:] = was_active_old[n_p:]
-        if preserved_mask.any():
-            idx = np.where(preserved_mask)[0]
-            active_pos[idx] = old_pos[idx]
-            active_vel[idx] = old_vel[idx]
-
-        # For NEW INTERs/DUPs (active now but not before), interpolate
-        # positions/velocities from current pristine ORIG positions using the
-        # full inter_data t-values, so they enter the sim at the current
-        # deformed edge midpoint (not the pristine edge midpoint).
-        newly_active = active_verts_used & ~was_active_old
-        for nid_int, vi_int, vj_int, t_float in self._full_inter_data:
-            nid = int(nid_int)
-            if not newly_active[nid]:
-                continue
-            vi = int(vi_int); vj = int(vj_int); t = float(t_float)
-            active_pos[nid] = cur_pristine_pos[vi] * (1.0 - t) + cur_pristine_pos[vj] * t
-            active_vel[nid] = cur_pristine_vel[vi] * (1.0 - t) + cur_pristine_vel[vj] * t
-        # Newly-active DUPs mirror their INTER's fresh state.
-        full_remap = self._full_remap
-        for i, nid_int in enumerate(self._full_shared_list):
-            dup_idx = int(full_remap[int(nid_int)])
-            if not newly_active[dup_idx]:
-                continue
-            src = int(nid_int)
-            active_pos[dup_idx] = active_pos[src]
-            active_vel[dup_idx] = active_vel[src]
-
-        # Fixed mask: original fixed for active verts; pinned (fixed=1) for
-        # inactive verts so the CG solver doesn't wander with mass=0.
-        active_fixed = self._full_final_fixed.copy()
-        active_fixed[~active_verts_used] = 1
-        active_vel[~active_verts_used]   = 0
-
-        _t_subset = _t.perf_counter() - _t0 - _t_precomp
-        # Rebuild sim topology in place. rest_positions = pristine geometry
-        # (full_final_pos) so FEM strain forces try to restore the pre-cut
-        # rest shape. vertices = current deformed geometry, uploaded after B
-        # is computed so the integrator sees the actual state.
+        # ---- Physics: superset init on first call, then delta ----
         _t1 = _t.perf_counter()
-        self._simulator.rebuild_topology(
-            vertices       = active_pos,
-            tetrahedra     = active_tets,
-            fixed_mask     = active_fixed,
-            velocities     = active_vel,
-            rest_positions = self._full_final_pos,
-        )
-        _t_rebuild = _t.perf_counter() - _t1
+        if not self._superset_initialized:
+            # First call: initialize with everything unsplit, then apply the
+            # current mask via the same delta logic that runs each frame.
+            self._init_superset_layout()
+        self._apply_split_mask_delta(new_mask)
+        _t_apply = _t.perf_counter() - _t1
 
-        self._current_tets    = active_tets
+        # Snapshot current sim state as a small numpy array for the ECS
+        # to read via _topology_result. Only needed for the render-side
+        # winding correction / wound centroid sort in the fast rebuild.
+        _t2 = _t.perf_counter()
+        n_full  = int(self._full_final_pos.shape[0])
+        final_pos_snap = self._simulator.positions.to_numpy()[:n_full]
+        final_vel_snap = self._simulator.velocities.to_numpy()[:n_full]
+
+        self._split_mask         = new_mask.copy()
+        self._topology_version  += 1
+        # For ECS compatibility: expose the FULL superset as _current_tets so
+        # downstream helpers (pick tool, etc.) can index into positions
+        # correctly. Inactive tets have W=0 and contribute nothing to physics.
+        self._current_tets    = self._super_tets_ref
         self._n_orig_val      = int(self._full_n_orig)
         self._n_split         = int(self._full_n_split)
-        self._split_mask      = new_mask.copy()
-        self._topology_version += 1
 
-        # Update _topology_result for the ECS to read. Substitute the ACTIVE
-        # tet array in position 5 and current positions/velocities/fixed in
-        # positions 1/2/4; keep the rest from the full precompute (shared_list,
-        # remap, inter_data, orig_surf_set, side_label are all "full" values).
         full = self._full_precompute_cache
         self._topology_result = (
-            full[0],           # new_sim (None for FEM)
-            active_pos,        # final_pos (current)
-            active_vel,        # final_vel (current)
-            full[3],           # final_mass (unused by ECS)
-            active_fixed,      # final_fixed
-            active_tets,       # all_tets  (SUBSET)
+            full[0],
+            final_pos_snap,
+            final_vel_snap,
+            full[3],
+            self._full_final_fixed,   # inactive verts pinned=1 (stable across frames)
+            self._super_tets_ref,     # full superset (W=0 disables inactive)
             int(self._full_n_orig),
             int(self._full_n_split),
-            full[8],           # shared_list  (full)
-            full[9],           # remap        (full)
-            full[10],          # inter_data   (full)
-            full[11],          # orig_surf_set
-            full[12],          # phantom_above_face_keys
-            full[13],          # side_label
-            full[14],          # all_tets_parent
+            full[8], full[9], full[10], full[11], full[12], full[13], full[14],
         )
+        _t_snap = _t.perf_counter() - _t2
 
         # ---- Rebuild seam_pairs from the FULL shared_list; filter to active ----
-        full_inter_data = self._full_inter_data
-        inter_to_edge = {int(nid): (int(min(vi, vj)), int(max(vi, vj)))
-                         for nid, vi, vj, _t in full_inter_data}
-        seam_pairs = []
-        for nid_int in self._full_shared_list:
-            nid = int(nid_int)
-            if not active_verts_used[nid]:
-                continue
-            dup_idx = int(full_remap[nid])
-            if not active_verts_used[dup_idx]:
-                continue
-            edge = inter_to_edge.get(nid)
-            pos_seam = self._full_final_pos[nid]
-            travel_dist = float(np.dot(pos_seam - self._cut_origin, self._blade_dir))
-            was_broken = (edge in broken_edge_keys) if edge is not None else False
-            seam_pairs.append({
-                'v_above':     nid,
-                'v_below':     dup_idx,
-                'edge':        edge,
-                'spring_idx':  -1,
-                'travel_dist': travel_dist,
-                'broken':      was_broken,
-            })
-        seam_pairs.sort(key=lambda p: p['travel_dist'])
+        _t3 = _t.perf_counter()
+        shared_arr_np = self._full_shared_arr
+        dup_arr_np    = self._full_shared_dup_arr
+        active_verts_used = self._active_verts_used
+        seam_active_mask = (active_verts_used[shared_arr_np]
+                          & active_verts_used[dup_arr_np])
+        active_seam_nids = shared_arr_np[seam_active_mask]
+        active_seam_dups = dup_arr_np[seam_active_mask]
+
+        if len(active_seam_nids) > 0:
+            positions_seam = self._full_final_pos[active_seam_nids]
+            travel_dists   = ((positions_seam - self._cut_origin)
+                              @ self._blade_dir).astype(np.float32)
+            sort_idx = np.argsort(travel_dists)
+            active_seam_nids = active_seam_nids[sort_idx]
+            active_seam_dups = active_seam_dups[sort_idx]
+            travel_dists     = travel_dists[sort_idx]
+
+            if not hasattr(self, '_full_inter_edge_lookup'):
+                n_full_v = int(self._full_final_pos.shape[0])
+                self._full_inter_edge_lookup = np.full((n_full_v, 2), -1,
+                                                        dtype=np.int64)
+                if len(self._full_inter_nids) > 0:
+                    mn = np.minimum(self._full_inter_vis, self._full_inter_vjs)
+                    mx = np.maximum(self._full_inter_vis, self._full_inter_vjs)
+                    self._full_inter_edge_lookup[self._full_inter_nids, 0] = mn
+                    self._full_inter_edge_lookup[self._full_inter_nids, 1] = mx
+            edges_active = self._full_inter_edge_lookup[active_seam_nids]
+
+            seam_pairs = []
+            for i in range(len(active_seam_nids)):
+                nid = int(active_seam_nids[i])
+                dup = int(active_seam_dups[i])
+                e0 = int(edges_active[i, 0])
+                edge = ((e0, int(edges_active[i, 1])) if e0 >= 0 else None)
+                was_broken = (edge in broken_edge_keys) if edge is not None else False
+                seam_pairs.append({
+                    'v_above':     nid,
+                    'v_below':     dup,
+                    'edge':        edge,
+                    'spring_idx':  -1,
+                    'travel_dist': float(travel_dists[i]),
+                    'broken':      was_broken,
+                })
+        else:
+            seam_pairs = []
         self._seam_pairs = seam_pairs
+        _t_seams = _t.perf_counter() - _t3
         _t_total = _t.perf_counter() - _t0
-        _t_seams = _t_total - _t_precomp - _t_subset - _t_rebuild
         print(f"[GrowTiming] total={_t_total*1000:.1f}ms  "
               f"precomp={_t_precomp*1000:.1f}  "
-              f"subset+alloc={_t_subset*1000:.1f}  "
-              f"rebuild_topo={_t_rebuild*1000:.1f}  "
+              f"apply={_t_apply*1000:.1f}  "
+              f"snap={_t_snap*1000:.1f}  "
               f"seams={_t_seams*1000:.1f}  "
-              f"n_active_tets={len(active_tets):,}  "
+              f"newly_split={n_new_split}  "
               f"n_full_verts={n_full:,}",
               flush=True)
 
@@ -1594,12 +1739,471 @@ class FEMMethod(SimulationMethod):
         self._full_side_label      = result[13].copy()
         self._full_all_tets_parent = result[14]
 
+        # Numpy views of inter_data / shared_list for vectorized use in
+        # _maybe_grow_split. Building these once avoids Python-loop overhead
+        # in every progressive rebuild.
+        if self._full_inter_data:
+            _idata = np.array(
+                [(int(d[0]), int(d[1]), int(d[2]), float(d[3]))
+                 for d in self._full_inter_data],
+                dtype=np.float64,
+            )
+            self._full_inter_nids = _idata[:, 0].astype(np.int64)
+            self._full_inter_vis  = _idata[:, 1].astype(np.int64)
+            self._full_inter_vjs  = _idata[:, 2].astype(np.int64)
+            self._full_inter_ts   = _idata[:, 3].astype(np.float32)
+        else:
+            self._full_inter_nids = np.zeros(0, dtype=np.int64)
+            self._full_inter_vis  = np.zeros(0, dtype=np.int64)
+            self._full_inter_vjs  = np.zeros(0, dtype=np.int64)
+            self._full_inter_ts   = np.zeros(0, dtype=np.float32)
+        self._full_shared_arr = np.asarray(self._full_shared_list, dtype=np.int64)
+        if len(self._full_shared_arr) > 0:
+            self._full_shared_dup_arr = (
+                self._full_remap[self._full_shared_arr].astype(np.int64)
+            )
+        else:
+            self._full_shared_dup_arr = np.zeros(0, dtype=np.int64)
+
         print(f"[Step4] Precomputed full split: "
               f"{len(self._full_all_tets):,} tets, "
               f"{len(self._full_final_pos):,} verts, "
               f"{len(self._full_inter_data)} INTERs, "
               f"{len(self._full_shared_list)} DUPs "
               f"(vs pristine {len(self._pristine_tets):,} tets, {n_p:,} verts)",
+              flush=True)
+
+        self._build_render_precompute_cache()
+        self._build_sliver_and_orphan_data()
+
+    def _build_sliver_and_orphan_data(self) -> None:
+        """
+        Identify sliver sub-tets in the full-split superset (pristine volume
+        below `sliver_vol_threshold`) and build kinematic orphan constraints
+        for any INTER/DUP vertex whose only sub-tets are slivers.
+
+        Slivers stay permanently inactive: _W_rest=0 in _init_superset_layout
+        so _activate_tets_kernel becomes a no-op for them. Orphan verts get
+        their position and velocity slaved to a nearest well-massed master
+        vertex (typically an ORIG one hop away) via a small per-step Taichi
+        kernel.
+        """
+        _thresh = float(self._params.get('sliver_vol_threshold', 0.0))
+        # Compute pristine volumes over the FULL superset (full-block + unsplit-block).
+        n_full_tets = len(self._full_all_tets)
+        crossing_idx = np.where(self._crossing_mask)[0].astype(np.int64)
+        unsplit_cross_tets = self._pristine_tets[self._crossing_mask].astype(np.int32)
+        super_tets = np.vstack([self._full_all_tets.astype(np.int32),
+                                unsplit_cross_tets])
+        v = self._full_final_pos
+        e1 = v[super_tets[:, 1]] - v[super_tets[:, 0]]
+        e2 = v[super_tets[:, 2]] - v[super_tets[:, 0]]
+        e3 = v[super_tets[:, 3]] - v[super_tets[:, 0]]
+        vols = np.abs(np.einsum('ij,ij->i', e1, np.cross(e2, e3))) / 6.0
+        # Only cut-created tets (any vert >= n_orig) are candidates for filtering.
+        # Pristine unsplit tets are already known-good.
+        n_orig = self._full_n_orig
+        has_new_vert = (super_tets >= n_orig).any(axis=1)
+        is_sliver = has_new_vert & (vols < _thresh) if _thresh > 0.0 else np.zeros(len(super_tets), dtype=bool)
+        self._sliver_slots = np.where(is_sliver)[0].astype(np.int32)
+
+        # Orphan detection based on END-OF-CUT topology.
+        # Every crossing parent tet appears in the superset TWICE: once as an
+        # unsplit-block row (all ORIGs, normal volume) and once as several
+        # split-block sub-tets (INTER/DUP verts, potentially slivers). At any
+        # progressive-cut state only ONE of the two is active per parent, and
+        # progressive cutting monotonically moves each parent from unsplit to
+        # split. To predict which verts will end up orphaned we must consider
+        # only the END STATE -- all crossings split. In that state:
+        #   - non-crossing pristine tets contribute (full-block rows whose
+        #     parent isn't crossing)
+        #   - split-block sub-tets of crossing parents contribute
+        #   - unsplit-block rows are all inactive (W=0)
+        # Verts touched only by slivers in the end state are the true orphans.
+        n_full_v = int(self._full_final_pos.shape[0])
+
+        # End-state active mask over superset slots.
+        n_full_tets = len(self._full_all_tets)
+        end_state_active = np.zeros(len(super_tets), dtype=bool)
+        end_state_active[:n_full_tets] = True     # full-block always active at end
+        # unsplit-block rows are all inactive at end (all crossings split)
+        # good_end_slots = active AND non-sliver
+        good_end_slots = np.where(end_state_active & (~is_sliver))[0]
+
+        vol_by_vert = np.zeros(n_full_v, dtype=np.float64)
+        if len(good_end_slots) > 0:
+            contribs = np.repeat(vols[good_end_slots], 4) / 4.0
+            verts_flat = super_tets[good_end_slots].ravel()
+            np.add.at(vol_by_vert, verts_flat, contribs)
+
+        touched_by_any_end = np.zeros(n_full_v, dtype=bool)
+        touched_by_any_end[super_tets[end_state_active].ravel()] = True
+
+        # Volume floor: small fraction of median end-state good-tet volume.
+        if len(good_end_slots) > 0:
+            _median_vol = float(np.median(vols[good_end_slots]))
+            _floor = _median_vol * 1e-4
+        else:
+            _floor = 0.0
+        orphan_mask = touched_by_any_end & (vol_by_vert < _floor)
+        orphan_ids = np.where(orphan_mask)[0].astype(np.int32)
+
+        # Master finding: for each orphan, look at its geometric neighborhood.
+        # For an INTER vert nid, we know its pristine edge (vi, vj) -- those two
+        # ORIG endpoints are its natural masters. Pick the closer one by
+        # pristine distance. For a DUP vert (n_split + i), resolve to its
+        # INTER via _full_shared_arr then use the same rule.
+        if len(orphan_ids) > 0:
+            n_split = self._full_n_split
+            # For each orphan, resolve to underlying INTER
+            underlying_inter = orphan_ids.copy().astype(np.int64)
+            is_dup = underlying_inter >= n_split
+            if is_dup.any() and len(self._full_shared_arr) > 0:
+                # dup_to_inter: n_split + i -> shared_list[i]
+                dup_offsets = underlying_inter[is_dup] - n_split
+                underlying_inter[is_dup] = self._full_shared_arr[dup_offsets]
+
+            # Look up each INTER's (vi, vj, t). Populate INTERs first, then
+            # DUPs (which mirror their shared-INTER's endpoints), so both
+            # this method and _apply_split_mask_delta can index the arrays
+            # by ANY [n_orig, n_full_v) vertex without a DUP-resolution step.
+            if not hasattr(self, '_inter_vi_full') or self._inter_vi_full is None:
+                total_v = n_full_v
+                self._inter_vi_full = np.arange(total_v, dtype=np.int64)
+                self._inter_vj_full = np.arange(total_v, dtype=np.int64)
+                self._inter_t_full  = np.zeros(total_v, dtype=np.float32)
+                if len(self._full_inter_nids) > 0:
+                    self._inter_vi_full[self._full_inter_nids] = self._full_inter_vis
+                    self._inter_vj_full[self._full_inter_nids] = self._full_inter_vjs
+                    self._inter_t_full[self._full_inter_nids]  = self._full_inter_ts
+                if len(self._full_shared_arr) > 0:
+                    src = self._full_shared_arr
+                    dup = self._full_shared_dup_arr
+                    self._inter_vi_full[dup] = self._inter_vi_full[src]
+                    self._inter_vj_full[dup] = self._inter_vj_full[src]
+                    self._inter_t_full[dup]  = self._inter_t_full[src]
+
+            vis = self._inter_vi_full[underlying_inter]
+            vjs = self._inter_vj_full[underlying_inter]
+
+            # Master picking uses side_label (not raw geometric sign):
+            #   - side_label is stamped from signed_dist_split, which drives
+            #     the physics (each half moves with its side_label group).
+            #   - For a near-plane ORIG, raw geometric sign is float noise
+            #     while side_label is stable and consistent with which half
+            #     the vert actually moves with.
+            #   - For the edge to have produced an INTER at all, split logic
+            #     required signed_dist_split[vi] and [vj] to have opposite
+            #     signs. So side_label[vi] and [vj] are always opposite and
+            #     exactly one of them matches the orphan's side_label.
+            side_label  = self._full_side_label
+            orphan_side = side_label[orphan_ids]
+            vi_side     = side_label[vis]
+            vj_side     = side_label[vjs]
+            vi_match    = (vi_side == orphan_side)
+            vj_match    = (vj_side == orphan_side)
+
+            # geom_side is still needed for the kd-tree fallback pool, so
+            # keep computing it. Pool membership is "physically above/below
+            # pristine plane" which is the natural geometric definition.
+            n_p = int(self._pristine_n_orig)
+            pristine_pos = self._full_final_pos[:n_p]
+            geom_dot = (pristine_pos - self._cut_origin) @ self._cut_normal
+            geom_side = np.sign(geom_dot).astype(np.int8)
+
+            # Orphan-vert set for exclusion from master pools. Prevents
+            # orphan-to-orphan slaving chains where an orphan A masters to
+            # orphan B, and B is being slaved elsewhere. Such chains produced
+            # incoherent cluster motion visible as sliver-edge spikes. This
+            # also handles ORIG orphans (idx < n_orig): they self-reference
+            # in the vi/vj lookup (identity), so vi_is_orphan/vj_is_orphan
+            # catches them and forces the kd-tree fallback below.
+            orphan_bool = np.zeros(n_full_v, dtype=bool)
+            orphan_bool[orphan_ids] = True
+            vi_is_orphan = orphan_bool[vis]
+            vj_is_orphan = orphan_bool[vjs]
+            vi_match &= ~vi_is_orphan
+            vj_match &= ~vj_is_orphan
+
+            # Case A: vi matches -> vi. Case B: vj matches -> vj. Case D:
+            # neither matches -> kd-tree fallback among non-orphan same-side
+            # ORIGs and non-orphan DUPs (mimics one-shot's pool).
+            masters = np.where(vi_match, vis, vjs).astype(np.int64)
+
+            neither_matches = ~vi_match & ~vj_match
+            if neither_matches.any():
+                # Master pool: same-side ORIGs (by pristine geometry) PLUS
+                # non-orphan DUPs (side_label = -1 by construction).
+                #   Above pool: ORIGs with geom_side > 0, NOT orphans.
+                #   Below pool: ORIGs with geom_side < 0 + non-orphan DUPs.
+                # Matches one-shot's `_is_dup | (_is_orig & side<0)` selection.
+                above_pool_mask = np.zeros(n_full_v, dtype=bool)
+                above_pool_mask[:n_orig] = (geom_side > 0) & (~orphan_bool[:n_orig])
+                below_pool_mask = np.zeros(n_full_v, dtype=bool)
+                below_pool_mask[:n_orig] = (geom_side < 0) & (~orphan_bool[:n_orig])
+                # DUPs are side_label = -1 by construction (below half).
+                dup_start = self._full_n_split
+                dup_end   = dup_start + len(self._full_shared_arr)
+                if dup_end > dup_start:
+                    below_pool_mask[dup_start:dup_end] = ~orphan_bool[dup_start:dup_end]
+
+                above_pool_idx = np.where(above_pool_mask)[0]
+                below_pool_idx = np.where(below_pool_mask)[0]
+
+                try:
+                    from scipy.spatial import cKDTree
+                    above_tree = (cKDTree(self._full_final_pos[above_pool_idx])
+                                  if len(above_pool_idx) > 0 else None)
+                    below_tree = (cKDTree(self._full_final_pos[below_pool_idx])
+                                  if len(below_pool_idx) > 0 else None)
+                    stray_idx = np.where(neither_matches)[0]
+                    stray_orphans = orphan_ids[stray_idx]
+                    stray_side    = orphan_side[stray_idx]
+                    for j, o_local in enumerate(stray_idx):
+                        o_global = int(stray_orphans[j])
+                        o_pos    = self._full_final_pos[o_global]
+                        if stray_side[j] > 0 and above_tree is not None:
+                            _, k = above_tree.query(o_pos)
+                            masters[o_local] = int(above_pool_idx[k])
+                        elif stray_side[j] < 0 and below_tree is not None:
+                            _, k = below_tree.query(o_pos)
+                            masters[o_local] = int(below_pool_idx[k])
+                        # else: no pool on this side -- keep vj fallback.
+                except ImportError:
+                    pass  # scipy not available; keep the vj fallback
+
+            # Offset: orphan_pristine_pos - master_pristine_pos.
+            offsets = (self._full_final_pos[orphan_ids]
+                     - self._full_final_pos[masters]).astype(np.float32)
+
+            self._orphan_ids     = orphan_ids
+            self._orphan_masters = masters.astype(np.int32)
+            self._orphan_offsets = offsets
+            self._orphan_set     = set(int(v) for v in orphan_ids)
+        else:
+            self._orphan_ids     = np.zeros(0, dtype=np.int32)
+            self._orphan_masters = np.zeros(0, dtype=np.int32)
+            self._orphan_offsets = np.zeros((0, 3), dtype=np.float32)
+            self._orphan_set     = set()
+
+        print(f"[Sliver] threshold={_thresh:.2e}  slivers={len(self._sliver_slots):,} "
+              f"orphans={len(self._orphan_ids):,}", flush=True)
+
+    def _build_render_precompute_cache(self) -> None:
+        """
+        Build a per-face render classification cache over the union of:
+          - all sub-tets produced by the full split (each present when its
+            parent pristine tet's mask == True)
+          - all crossing pristine tets in unsplit form (each present when its
+            parent's mask == False)
+          - non-crossing pristine tets are already covered by the full-split
+            output (they show up in `unsplit_arr` inside _cut_topology_physics
+            with parent==self and active-always).
+
+        Everything the current per-frame render pipeline computes from vertex
+        indices alone (wound/outer/drop verdict, debug color, category) is
+        precomputed here. Per-frame work in the fast render path reduces to
+          - masking rows by split state
+          - packed-key unique+count for boundary detection
+          - indexing precomputed classification arrays
+          - winding correction on the outer subset only
+          - normals kernel + GL upload
+        """
+        import time as _t
+        _t0 = _t.perf_counter()
+
+        full_all_tets  = self._full_all_tets                # (n_full, 4)
+        full_parent    = self._full_all_tets_parent         # (n_full,)
+        pristine_tets  = self._pristine_tets
+        crossing_mask  = self._crossing_mask
+        n_orig         = self._full_n_orig
+        n_split        = self._full_n_split
+        shared_list    = self._full_shared_list
+        inter_data     = self._full_inter_data
+        orig_surf_set  = self._full_precompute_cache[11]
+
+        crossing_idx = np.where(crossing_mask)[0].astype(np.int64)
+        n_full_tets  = len(full_all_tets)
+        n_cross      = len(crossing_idx)
+
+        # Superset tet table
+        unsplit_cross_tets = pristine_tets[crossing_mask].astype(np.int32)
+        super_tets = np.vstack([full_all_tets.astype(np.int32),
+                                unsplit_cross_tets])
+        tet_parent = np.concatenate([full_parent.astype(np.int64),
+                                     crossing_idx])
+        tet_active_when_split = np.concatenate([
+            np.ones(n_full_tets, dtype=bool),
+            np.zeros(n_cross,     dtype=bool),
+        ])
+        # Which pristine tets are crossing (per-row).
+        tet_parent_is_crossing = crossing_mask[tet_parent]
+
+        # 4 faces per tet
+        FACE_COMBOS = np.array([[0,1,2],[0,1,3],[0,2,3],[1,2,3]], dtype=np.int32)
+        FOURTH_PER_FACE = np.array([3, 2, 1, 0], dtype=np.int32)
+        n_super = len(super_tets)
+        face_verts  = super_tets[:, FACE_COMBOS].reshape(-1, 3).astype(np.int64)
+        face_fourth = super_tets[np.arange(n_super)[:, None],
+                                 FOURTH_PER_FACE[None, :]].reshape(-1).astype(np.int64)
+        face_parent = np.repeat(tet_parent, 4)
+        face_parent_is_crossing = np.repeat(tet_parent_is_crossing, 4)
+        face_active_when_split  = np.repeat(tet_active_when_split, 4)
+
+        # Sorted verts + packed int64 keys
+        face_sorted = np.sort(face_verts, axis=1)
+        assert int(face_sorted.max()) < (1 << 21), "vertex index too large to pack"
+        face_keys = ((face_sorted[:, 0] << 42)
+                   | (face_sorted[:, 1] << 21)
+                   |  face_sorted[:, 2])
+
+        # -- On-plane vertex mask --
+        n_v_max = max(int(face_verts.max()) + 1,
+                      n_split + len(shared_list) + 1)
+        on_plane = np.zeros(n_v_max, dtype=bool)
+        on_plane[n_orig:] = True  # everything >= n_orig is on-plane
+        if shared_list:
+            seam_arr = np.array(shared_list, dtype=np.int64)
+            on_plane[seam_arr] = True
+
+        v_onplane   = on_plane[face_verts]              # (M, 3)
+        all_onplane = v_onplane.all(axis=1)
+        any_onplane = v_onplane.any(axis=1)
+        face_wound     = all_onplane
+        face_pure_orig = ~any_onplane
+        face_collar    = any_onplane & ~all_onplane
+
+        # -- orig_surf_set as packed keys + orig_surf_verts lookup --
+        if orig_surf_set:
+            surf_key_arr = np.array(sorted(orig_surf_set), dtype=np.int64)
+            orig_surf_keys = ((surf_key_arr[:, 0] << 42)
+                            | (surf_key_arr[:, 1] << 21)
+                            |  surf_key_arr[:, 2])
+            orig_surf_keys.sort()
+            orig_surf_verts_arr = np.unique(surf_key_arr.ravel())
+        else:
+            orig_surf_keys      = np.array([], dtype=np.int64)
+            orig_surf_verts_arr = np.array([], dtype=np.int64)
+        in_surf_lookup = np.zeros(n_v_max, dtype=bool)
+        if len(orig_surf_verts_arr) > 0:
+            in_surf_lookup[orig_surf_verts_arr] = True
+
+        # PhantomCollar: collar face where an off-plane orig vert is NOT in
+        # orig_surf_verts (matches the first Python filter block).
+        is_off_plane_orig = (face_verts < n_orig) & ~v_onplane   # (M, 3)
+        in_surf_val = in_surf_lookup[face_verts]                 # (M, 3)
+        bad_orig_v  = is_off_plane_orig & ~in_surf_val
+        bad_orig_face = bad_orig_v.any(axis=1)
+        has_off_plane_orig = is_off_plane_orig.any(axis=1)
+        phantom_collar_drop = (face_collar
+                               & has_off_plane_orig
+                               & bad_orig_face
+                               & (len(orig_surf_verts_arr) > 0))
+
+        # Pure-orig T-junction: drop if the sorted triple is not in orig_surf_set.
+        face_in_orig_surf = (np.isin(face_keys, orig_surf_keys)
+                             if len(orig_surf_keys) > 0
+                             else np.zeros(len(face_keys), dtype=bool))
+        pure_orig_drop = face_pure_orig & ~face_in_orig_surf
+
+        # [CollarFilter] reconstruction filter (vectorized).
+        vi_above_lookup = np.arange(n_v_max, dtype=np.int64)
+        vj_below_lookup = np.arange(n_v_max, dtype=np.int64)
+        if inter_data:
+            idata = np.array([(int(d[0]), int(d[1]), int(d[2])) for d in inter_data],
+                             dtype=np.int64)
+            vi_above_lookup[idata[:, 0]] = idata[:, 1]
+            vj_below_lookup[idata[:, 0]] = idata[:, 2]
+        dup_to_inter = np.arange(n_v_max, dtype=np.int64)
+        if shared_list:
+            for i, v in enumerate(shared_list):
+                dup_to_inter[n_split + i] = int(v)
+
+        fv_inter  = np.where(face_verts >= n_split,
+                             dup_to_inter[face_verts], face_verts)
+        is_inter_v = (fv_inter >= n_orig) & (fv_inter < n_split)
+        fv_above = np.where(is_inter_v, vi_above_lookup[fv_inter], fv_inter)
+        fv_below = np.where(is_inter_v, vj_below_lookup[fv_inter], fv_inter)
+
+        recon6 = np.column_stack([fv_above[:, 0], fv_below[:, 0],
+                                  fv_above[:, 1], fv_below[:, 1],
+                                  fv_above[:, 2], fv_below[:, 2]])
+        recon6.sort(axis=1)
+        diffs = np.diff(recon6, axis=1) != 0
+        recon_size = 1 + diffs.sum(axis=1)
+
+        collar_recon_drop = np.zeros(len(face_verts), dtype=bool)
+        is_three = (recon_size == 3)
+        if is_three.any():
+            keep_mask = np.hstack([np.ones((len(recon6), 1), dtype=bool), diffs])
+            rows3         = np.where(is_three)[0]
+            recon6_three  = recon6[rows3]
+            keep_three    = keep_mask[rows3]
+            unique_recon  = recon6_three[keep_three].reshape(-1, 3)
+            three_keys = ((unique_recon[:, 0] << 42)
+                        | (unique_recon[:, 1] << 21)
+                        |  unique_recon[:, 2])
+            three_in_surf = (np.isin(three_keys, orig_surf_keys)
+                             if len(orig_surf_keys) > 0
+                             else np.zeros(len(three_keys), dtype=bool))
+            collar_recon_drop[rows3] = ~three_in_surf
+        # Only collar faces are subject to this filter.
+        collar_recon_drop &= face_collar
+
+        # Verdict: 0 outer, 1 wound, 2 drop
+        VERDICT_OUTER, VERDICT_WOUND, VERDICT_DROP = 0, 1, 2
+        face_verdict = np.full(len(face_verts), VERDICT_OUTER, dtype=np.int8)
+        face_verdict[face_wound]           = VERDICT_WOUND
+        face_verdict[pure_orig_drop]       = VERDICT_DROP
+        face_verdict[phantom_collar_drop]  = VERDICT_DROP
+        face_verdict[collar_recon_drop]    = VERDICT_DROP
+
+        # Category (see _compute_face_categories, cats 0..2 -- 3/4 are handled
+        # by the drop verdicts above, so we don't need cat 3/4 here).
+        face_category = np.zeros(len(face_verts), dtype=np.int8)
+        is_all_orig = (face_verts < n_orig).all(axis=1)
+        face_category[is_all_orig] = 0
+        face_category[any_onplane & ~all_onplane] = 1
+        face_category[all_onplane] = 2
+
+        # Debug colors (see _compute_debug_face_colors).
+        face_debug_color = np.tile([0.3, 0.5, 0.8],
+                                   (len(face_verts), 1)).astype(np.float32)
+        any_new = np.any(face_verts >= n_orig, axis=1)
+        all_new = np.all(face_verts >= n_orig, axis=1)
+        face_debug_color[any_new & ~all_new] = [0.3, 0.7, 0.4]  # collar
+        face_debug_color[all_new]            = [0.85, 0.1, 0.1] # disc/wound
+
+        # Map each row to a unique-key index so per-frame boundary detection
+        # uses O(K) np.bincount instead of O(M log M) np.unique. The unique
+        # key set is stable across frames because it depends only on vertex
+        # indices; only membership (which keys are currently active) changes.
+        _unique_keys, face_key_idx = np.unique(face_keys, return_inverse=True)
+        n_unique_keys = int(len(_unique_keys))
+
+        self._precomp_render_cache = {
+            'face_verts':               face_verts.astype(np.uint32),
+            'face_fourth':              face_fourth.astype(np.int32),
+            'face_keys':                face_keys,
+            'face_key_idx':             face_key_idx.astype(np.int32),
+            'n_unique_keys':            n_unique_keys,
+            'face_parent':              face_parent.astype(np.int32),
+            'face_parent_is_crossing':  face_parent_is_crossing,
+            'face_active_when_split':   face_active_when_split,
+            'face_verdict':             face_verdict,
+            'face_category':            face_category,
+            'face_debug_color':         face_debug_color,
+            'n_super_tets':             n_super,
+        }
+
+        _t_elapsed = _t.perf_counter() - _t0
+        n_wound_p = int((face_verdict == VERDICT_WOUND).sum())
+        n_outer_p = int((face_verdict == VERDICT_OUTER).sum())
+        n_drop_p  = int((face_verdict == VERDICT_DROP).sum())
+        print(f"[RenderPrecomp] built face table in {_t_elapsed*1000:.1f}ms: "
+              f"{len(face_verts):,} rows  "
+              f"(outer_candidates={n_outer_p:,}  wound_candidates={n_wound_p:,}  "
+              f"drops={n_drop_p:,})",
               flush=True)
 
     def is_cut_complete(self, blade_travel: float) -> bool:

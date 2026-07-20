@@ -80,8 +80,13 @@ class CameraControllerSystem(System):
 
                 invert_value = -1.0 if self.invert_controls else 1.0
 
-                dx *= invert_value * camera_controller.mouse_sensitivity * ts
-                dy *= -invert_value * camera_controller.mouse_sensitivity * ts
+                # Rotation is proportional to mouse pixel delta only, NOT to
+                # frame time. Scaling by `ts` at low fps caused huge camera
+                # swings on tiny mouse movements. Reference frame time keeps
+                # the effective sensitivity matching the historical 60fps feel.
+                _ROT_REF_TS = 1.0 / 60.0
+                dx *= invert_value * camera_controller.mouse_sensitivity * _ROT_REF_TS
+                dy *= -invert_value * camera_controller.mouse_sensitivity * _ROT_REF_TS
 
                 camera_controller.yaw += dx
                 camera_controller.pitch += dy

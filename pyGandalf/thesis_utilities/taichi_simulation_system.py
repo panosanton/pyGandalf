@@ -555,17 +555,21 @@ class TaichiSimulationSystem(System):
         if not hasattr(self, '_fc'):
             self._fc = 0
         self._fc += 1
-        if self._fc % 60 == 0:
+        if self._fc % 10 == 0 and getattr(comp, 'blade_is_active', False):
+            ti.sync()  # ensure all GPU work up to here is done, for honest timings
+            t_end = time.perf_counter()
             blade_ms = (t_blade1 - t_blade0) * 1000
-            # print(
-            #     f"[Frame {self._fc:4d}] "
-            #     f"blade {blade_ms:4.2f}ms | "
-            #     f"sim {(t1-t0)*1000:5.2f}ms | "
-            #     f"readback {(t2-t1)*1000:4.2f}ms | "
-            #     f"normals {(t3-t2)*1000:4.2f}ms | "
-            #     f"upload {(t4-t3)*1000:4.2f}ms | "
-            #     f"total {(t4-t_blade0)*1000:5.2f}ms"
-            # )
+            print(
+                f"[Frame {self._fc:4d}] "
+                f"blade {blade_ms:5.1f}ms | "
+                f"sim {(t1-t0)*1000:5.1f}ms | "
+                f"readback {(t2-t1)*1000:4.1f}ms | "
+                f"normals {(t3-t2)*1000:4.1f}ms | "
+                f"vbo_upload {(t4-t3)*1000:4.1f}ms | "
+                f"gpu_sync {(t_end-t4)*1000:4.1f}ms | "
+                f"frame_total {(t_end-t_blade0)*1000:5.1f}ms",
+                flush=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -730,9 +734,10 @@ def _perform_cut(comp: TaichiSimulationComponent,
     if comp.split_disc_verts:
         remapped_wound, split_phys = _split_disc_verts_for_rendering(
             outer_faces, wound_faces, len(final_pos), n_orig)
-        comp._disc_split_phys_idx = np.array(split_phys, dtype=np.int32) if split_phys else None
+        comp._disc_split_phys_idx = (np.asarray(split_phys, dtype=np.int32)
+                                     if len(split_phys) > 0 else None)
         render_pos = (np.vstack([final_pos, final_pos[split_phys]])
-                      if split_phys else final_pos)
+                      if len(split_phys) > 0 else final_pos)
         disc_faces = remapped_wound
     else:
         comp._disc_split_phys_idx = None
@@ -778,6 +783,216 @@ def _perform_cut(comp: TaichiSimulationComponent,
 # Progressive blade cut  (B key)
 # ---------------------------------------------------------------------------
 
+def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
+                                      mesh_comp: StaticMeshComponent,
+                                      normal: np.ndarray,
+                                      blade_dir: np.ndarray,
+                                      origin: np.ndarray):
+    """
+    Fast render rebuild path for progressive cutting.
+
+    Uses the FEMMethod._precomp_render_cache built by
+    _build_render_precompute_cache: a per-face table (over the union of all
+    possible sub-tets + all unsplit crossing tets) with wound/outer/drop
+    verdicts, categories, and debug colors precomputed from vertex indices.
+
+    Per-frame work:
+      - mask rows by current split state
+      - packed-key unique+count for boundary detection
+      - index precomputed classification arrays
+      - winding correction on the outer subset
+      - centroid sort for wound reveal
+      - normals kernel + GL upload
+
+    Does NOT compute the T-key collar-tet-face debug set (comp._show_collar_tets
+    is always False during a live cut and cheap to rebuild lazily if needed).
+    """
+    _rr_t0 = time.perf_counter()
+
+    method = comp.method
+    cache = method._precomp_render_cache
+    (_new_sim, final_pos, _final_vel, _final_mass, _final_fixed,
+     _all_tets, n_orig, n_split, shared_list, remap, inter_data,
+     orig_surf_set, phantom_above_face_keys, _side_label,
+     _all_tets_parent) = method._topology_result
+
+    face_verts             = cache['face_verts']
+    face_key_idx           = cache['face_key_idx']
+    n_unique_keys          = cache['n_unique_keys']
+    face_fourth            = cache['face_fourth']
+    face_parent            = cache['face_parent']
+    face_parent_is_crossing = cache['face_parent_is_crossing']
+    face_active_when_split = cache['face_active_when_split']
+    face_verdict           = cache['face_verdict']
+    split_mask    = method._split_mask
+    crossing_mask = method._crossing_mask
+
+    # -- Row activity mask over the full face table --
+    # Slivers are physics-disabled (W=0) but stay in the render so their
+    # neighboring faces don't get exposed as newly-boundary and produce
+    # collar spikes. Their orphan verts are kinematically slaved so the
+    # sliver's visible geometry moves rigidly with its master, avoiding
+    # visual explosions while staying attached to the rest of the mesh.
+    parent_split      = split_mask[face_parent]
+    row_active_all    = (~face_parent_is_crossing) | (parent_split == face_active_when_split)
+
+    # -- Boundary detection via bincount on precomputed unique-key indices --
+    # A face is boundary iff exactly one active row references its unique key.
+    # bincount over int32 indices is a single-pass C-level histogram, faster
+    # than np.unique(sort + inverse + count) which was ~65ms/frame on bunny.
+    active_key_idx = face_key_idx[row_active_all]
+    key_count      = np.bincount(active_key_idx, minlength=n_unique_keys)
+    is_boundary_key = (key_count == 1)
+    boundary_row_mask = row_active_all & is_boundary_key[face_key_idx]
+
+    outer_row_mask = boundary_row_mask & (face_verdict == 0)
+    wound_row_mask = boundary_row_mask & (face_verdict == 1)
+    outer_rows = np.where(outer_row_mask)[0]
+    wound_rows = np.where(wound_row_mask)[0]
+
+    outer_faces = face_verts[outer_rows].copy()  # (n_outer, 3) uint32
+    wound_faces = face_verts[wound_rows]         # (n_wound, 3) uint32
+
+    _rr_t_boundary = time.perf_counter() - _rr_t0
+    _rr_t1 = time.perf_counter()
+
+    # -- Winding correction on outer faces --
+    if len(outer_faces) > 0:
+        fourth_v = face_fourth[outer_rows]
+        v0 = final_pos[outer_faces[:, 0]]
+        v1 = final_pos[outer_faces[:, 1]]
+        v2 = final_pos[outer_faces[:, 2]]
+        fp = final_pos[fourth_v]
+        face_n    = np.cross(v1 - v0, v2 - v0)
+        to_fourth = fp - (v0 + v1 + v2) / 3.0
+        inward    = np.einsum('ij,ij->i', face_n, to_fourth) > 0
+        if inward.any():
+            outer_faces[inward] = outer_faces[inward][:, [0, 2, 1]]
+
+    _rr_t_wind = time.perf_counter() - _rr_t1
+    _rr_t2 = time.perf_counter()
+
+    # -- Sort wound faces by blade-travel centroid distance --
+    if len(wound_faces) > 0:
+        centroids  = final_pos[wound_faces].mean(axis=1)         # (n_w, 3)
+        travel_ds  = (centroids - origin) @ blade_dir            # (n_w,)
+        order      = np.argsort(travel_ds)
+        wound_faces = wound_faces[order]
+        sorted_ds  = travel_ds[order]
+    else:
+        sorted_ds = np.zeros(0, dtype=np.float32)
+
+    # ECS state
+    comp._n_orig      = n_orig
+    comp._n_split     = n_split
+    comp._inter_data  = inter_data
+    comp._shared_list = shared_list
+    comp._cut_normal  = normal
+    comp._seam_pairs  = method._seam_pairs
+
+    # Disc/collar split (vectorized).
+    if comp.split_disc_verts:
+        remapped_wound, split_phys = _split_disc_verts_for_rendering(
+            outer_faces, wound_faces, len(final_pos), n_orig)
+        comp._disc_split_phys_idx = (split_phys if len(split_phys) > 0 else None)
+        render_pos = (np.vstack([final_pos, final_pos[split_phys]])
+                      if len(split_phys) > 0 else final_pos)
+        wound_for_render = remapped_wound
+    else:
+        comp._disc_split_phys_idx = None
+        render_pos = final_pos
+        wound_for_render = wound_faces
+
+    # Progressive: reveal all wound immediately (parent tet is split before
+    # its wound face enters the boundary). _wound_faces_by_dist is consumed
+    # only by the D-key disc check -- build it via C-level zip over the
+    # sorted arrays (no Python row loop).
+    if len(wound_faces) > 0:
+        comp._wound_faces_by_dist = list(zip(sorted_ds.tolist(),
+                                             wound_for_render))
+    else:
+        comp._wound_faces_by_dist = []
+    comp._wound_face_ptr = len(comp._wound_faces_by_dist)
+
+    wound_arr = (np.asarray(wound_for_render, dtype=np.uint32)
+                 if len(wound_faces) > 0 else np.zeros((0, 3), dtype=np.uint32))
+    all_render_faces = (np.vstack([outer_faces, wound_arr])
+                        if len(wound_arr) > 0 else outer_faces.copy())
+
+    # T-key debug collar-tet-faces: skipped during a live cut. If the user
+    # toggles it on with the current topology, the slow rebuild path still
+    # handles the initial B-press population.
+    comp._collar_tet_face_offset = len(all_render_faces)
+    comp._n_collar_tet_faces     = 0
+    comp._collar_outer_mask      = np.zeros(len(outer_faces), dtype=bool)
+    comp._show_collar_tets       = False
+
+    comp.surface_indices    = outer_faces.copy()
+    comp._all_render_faces  = all_render_faces
+    comp._outer_faces       = outer_faces
+    comp._n_outer_faces     = len(outer_faces)
+    comp._face_expanded     = True
+
+    # Debug colors: index the precomputed per-row colors so the shader sees
+    # the same blue/green/red material as the pre-progressive path. Wound
+    # rows have to be picked up in the sorted order set above.
+    face_debug_color_all = cache['face_debug_color']
+    outer_colors = face_debug_color_all[outer_rows]
+    if len(wound_rows) > 0:
+        wound_colors = face_debug_color_all[wound_rows][order]
+    else:
+        wound_colors = np.zeros((0, 3), dtype=np.float32)
+    face_colors = np.vstack([outer_colors, wound_colors])
+    comp._debug_colors     = face_colors
+    comp._face_categories  = None    # V-key still needs manual precompute
+    comp._color_cycle_mode = -1
+    n_all_faces = len(all_render_faces)
+
+    _rr_t_class = time.perf_counter() - _rr_t2
+    _rr_t3 = time.perf_counter()
+
+    # Normals + expanded buffers.
+    new_normals = _compute_normals_post_cut(render_pos, comp.surface_indices,
+                                            n_orig, n_split, inter_data, shared_list, normal)
+
+    flat_all   = all_render_faces.flatten()
+    exp_pos    = render_pos[flat_all].reshape(-1, 3)
+    exp_norm   = new_normals[flat_all].reshape(-1, 3)
+    _finalize_wound_slot_normals(
+        exp_norm, exp_pos, all_render_faces,
+        n_wound_faces=len(wound_faces),
+        n_outer_faces=len(outer_faces),
+        n_orig=n_orig, n_split=n_split, n_phys=len(final_pos),
+        disc_split_phys_idx=comp._disc_split_phys_idx,
+        cut_normal=normal)
+    exp_tex    = np.zeros((len(all_render_faces) * 3, 2), dtype=np.float32)
+    exp_colors = np.repeat(face_colors, 3, axis=0)
+
+    ptr = int(comp._wound_face_ptr)
+    n_visible = len(outer_faces) + ptr
+    trivial_idx = np.arange(n_visible * 3, dtype=np.uint32).reshape(-1, 3)
+
+    _rr_t_norm = time.perf_counter() - _rr_t3
+    _rr_t4 = time.perf_counter()
+
+    _realloc_gpu_buffers(mesh_comp, exp_pos, exp_norm, exp_tex, trivial_idx,
+                         colors=exp_colors)
+    _rr_t_gl = time.perf_counter() - _rr_t4
+    _rr_total = time.perf_counter() - _rr_t0
+
+    print(f"[RenderTiming/fast] total={_rr_total*1000:.1f}ms  "
+          f"boundary={_rr_t_boundary*1000:.1f}  "
+          f"wind={_rr_t_wind*1000:.1f}  "
+          f"class={_rr_t_class*1000:.1f}  "
+          f"norm={_rr_t_norm*1000:.1f}  "
+          f"gl_upload={_rr_t_gl*1000:.1f}  "
+          f"n_active_rows={int(row_active_all.sum()):,}  "
+          f"n_faces={n_all_faces:,}",
+          flush=True)
+
+    comp._rendered_topology_version = int(method._topology_version)
+
+
 def _rebuild_progressive_render(comp: TaichiSimulationComponent,
                                  mesh_comp: StaticMeshComponent,
                                  is_initial: bool,
@@ -798,6 +1013,17 @@ def _rebuild_progressive_render(comp: TaichiSimulationComponent,
     comp._topology_version = method._topology_version so the next frame's
     change-detection is accurate.
     """
+    # Fast path: use precomputed face table if available (populated by
+    # FEMMethod._ensure_full_precompute on the first _maybe_grow_split call).
+    # This shortcuts the O(active_tets) boundary + filter + collar rebuild that
+    # dominates the frame time on large meshes. Skipped for is_initial=True
+    # because setup_cut runs before the first grow, so the cache does not exist
+    # yet -- the initial B-press mesh is small (pristine, no INTERs/DUPs).
+    if (not is_initial
+        and getattr(comp.method, '_precomp_render_cache', None) is not None):
+        _fast_rebuild_progressive_render(comp, mesh_comp, normal, blade_dir, origin)
+        return
+
     (_new_sim, final_pos, _final_vel, _final_mass, _final_fixed,
      all_tets, n_orig, n_split, shared_list, remap, inter_data,
      orig_surf_set, phantom_above_face_keys, _side_label,
@@ -828,9 +1054,10 @@ def _rebuild_progressive_render(comp: TaichiSimulationComponent,
     if comp.split_disc_verts:
         remapped_wound, split_phys = _split_disc_verts_for_rendering(
             outer_faces, wound_faces, len(final_pos), n_orig)
-        comp._disc_split_phys_idx = np.array(split_phys, dtype=np.int32) if split_phys else None
+        comp._disc_split_phys_idx = (np.asarray(split_phys, dtype=np.int32)
+                                     if len(split_phys) > 0 else None)
         render_pos = (np.vstack([final_pos, final_pos[split_phys]])
-                      if split_phys else final_pos)
+                      if len(split_phys) > 0 else final_pos)
         wound_for_render = remapped_wound
     else:
         comp._disc_split_phys_idx = None

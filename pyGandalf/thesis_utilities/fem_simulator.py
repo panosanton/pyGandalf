@@ -108,9 +108,10 @@ class _FEMSimulator:
         self._diag   = ti.field(dtype=ti.f32, shape=cv)
 
         # Per-tet rest-shape data
-        self._tets = ti.Vector.field(4, dtype=ti.i32,  shape=ct)
-        self._B    = ti.Matrix.field(3, 3, dtype=ti.f32, shape=ct)   # Dm^-1
-        self._W    = ti.field(dtype=ti.f32, shape=ct)                 # vol/6
+        self._tets   = ti.Vector.field(4, dtype=ti.i32,  shape=ct)
+        self._B      = ti.Matrix.field(3, 3, dtype=ti.f32, shape=ct)  # Dm^-1
+        self._W      = ti.field(dtype=ti.f32, shape=ct)                # vol/6 (0 = inactive)
+        self._W_rest = ti.field(dtype=ti.f32, shape=ct)                # pristine W stash
 
         # Cutting springs -- same interface as _SpringMassSimulator
         self._sa = np.zeros(0, dtype=np.int32)
@@ -220,6 +221,219 @@ class _FEMSimulator:
         if rest_positions is not None:
             self._upload_padded_vec3(self.positions, vertices)
         self._compute_diag_K(self._n_verts, self._n_tets)
+
+    # ------------------------------------------------------------------
+    # Stable-layout (superset) topology API for progressive cutting.
+    #
+    # The idea: upload the FULL superset of possible tets (currently-active +
+    # currently-inactive) once, compute rest-shape B and W for all of them,
+    # then use W=0 to disable a tet without moving it in the field. This
+    # avoids re-uploading the whole mesh every frame; per-frame work drops
+    # to O(newly-flipped tets) via _flip_tets_delta below.
+    # ------------------------------------------------------------------
+
+    def init_superset_topology(self,
+                                vertices:       np.ndarray,
+                                super_tets:     np.ndarray,
+                                tet_active_mask: np.ndarray,
+                                fixed_mask:     np.ndarray,
+                                velocities:     np.ndarray,
+                                rest_positions: np.ndarray = None) -> None:
+        """
+        Upload the full superset topology into the Taichi fields once.
+        `tet_active_mask[c]`=True keeps the tet's W at its real pristine
+        value; False sets W=0 so that tet contributes nothing to force /
+        mass / stiffness while remaining resident in the field.
+
+        Callers (progressive-cut FEMMethod) run this on the first
+        _maybe_grow_split call after B is pressed. Subsequent rebuilds
+        use flip_tets_delta() to swap tet activation on a per-frame basis.
+        """
+        N = len(vertices)
+        M = len(super_tets)
+        if N > self._capacity_verts:
+            raise RuntimeError(
+                f"init_superset_topology: vertex count {N} exceeds capacity {self._capacity_verts}")
+        if M > self._capacity_tets:
+            raise RuntimeError(
+                f"init_superset_topology: tet count {M} exceeds capacity {self._capacity_tets}")
+
+        # Upload state.
+        if rest_positions is not None:
+            self._upload_padded_vec3(self.positions, rest_positions)
+        else:
+            self._upload_padded_vec3(self.positions, vertices)
+        self._upload_padded_vec3(self.velocities, velocities)
+        self._upload_padded_int (self._fixed,     fixed_mask)
+        self._upload_padded_tet (self._tets,      super_tets)
+
+        # Cutting springs cleared -- progressive-cut FEMMethod doesn't use them.
+        self._sa = np.zeros(0, dtype=np.int32)
+        self._sb = np.zeros(0, dtype=np.int32)
+        self._sr = np.zeros(0, dtype=np.float32)
+        self._sk = np.zeros(0, dtype=np.float32)
+
+        self._n_verts = int(N)
+        self._n_tets  = int(M)
+
+        # Compute B and W (pristine) for all superset tets, and accumulate
+        # masses from ALL of them; then subtract contributions from inactive
+        # tets and zero their W.
+        self._masses.fill(0)
+        self._forces.fill(0)
+        self._init_tet_data(self._n_tets)
+
+        # Now current positions become the sim state (B was computed from rest).
+        if rest_positions is not None:
+            self._upload_padded_vec3(self.positions, vertices)
+
+        # Zero W for currently-inactive tets and subtract their mass contribs.
+        inactive_slots = np.where(~tet_active_mask)[0].astype(np.int32)
+        if len(inactive_slots) > 0:
+            self._deactivate_tets_kernel(inactive_slots)
+
+        self._compute_diag_K(self._n_verts, self._n_tets)
+
+    def flip_tets_delta(self,
+                         deact_slots: np.ndarray,
+                         act_slots:   np.ndarray) -> None:
+        """
+        Per-frame progressive-cut delta: deactivate `deact_slots` (set W=0,
+        subtract mass) and reactivate `act_slots` (set W back to its stored
+        rest value, add mass). B stays fixed since rest shape doesn't change.
+        `act_slots` must have had real W computed at init and then zeroed by
+        this method previously -- we store the pristine W separately so it
+        can be restored.
+        """
+        if len(deact_slots) == 0 and len(act_slots) == 0:
+            return
+        if len(deact_slots) > 0:
+            self._deactivate_tets_kernel(deact_slots.astype(np.int32))
+        if len(act_slots) > 0:
+            self._activate_tets_kernel(act_slots.astype(np.int32))
+        # diag_K depends on W, so refresh. Fast on GPU (~5ms at 250k tets).
+        self._compute_diag_K(self._n_verts, self._n_tets)
+
+    @ti.kernel
+    def _deactivate_tets_kernel(self,
+                                 slots: ti.types.ndarray(dtype=ti.i32, ndim=1)):
+        """
+        For each slot: read current W (must be > 0), stash into _W_rest[c],
+        subtract mass contribution from its 4 verts, set _W[c] = 0. Safe to
+        call idempotently -- if _W[c] was already 0, this is a no-op because
+        _W_rest[c] already holds the pristine value and the subtraction sees 0.
+        """
+        for i in range(slots.shape[0]):
+            c = slots[i]
+            w = self._W[c]
+            if w > 0.0:
+                self._W_rest[c] = w
+                verts = self._tets[c]
+                contrib = w * self._density / 4.0
+                for k in ti.static(range(4)):
+                    self._masses[verts[k]] -= contrib
+                self._W[c] = 0.0
+
+    @ti.kernel
+    def _activate_tets_kernel(self,
+                               slots: ti.types.ndarray(dtype=ti.i32, ndim=1)):
+        """
+        For each slot: restore _W[c] from _W_rest[c] and add the mass
+        contribution back to its 4 verts. Idempotent for slots already
+        active (their W_rest matches their current W).
+        """
+        for i in range(slots.shape[0]):
+            c = slots[i]
+            if self._W[c] == 0.0:
+                w = self._W_rest[c]
+                self._W[c] = w
+                verts = self._tets[c]
+                contrib = w * self._density / 4.0
+                for k in ti.static(range(4)):
+                    self._masses[verts[k]] += contrib
+
+    def write_vert_state(self,
+                          indices:    np.ndarray,
+                          positions:  np.ndarray,
+                          velocities: np.ndarray,
+                          fixed:      np.ndarray = None) -> None:
+        """
+        Write per-vertex state for a small batch of newly-activated verts.
+        `positions` / `velocities` are (K, 3) float32, `fixed` is (K,) int32
+        or None. Uses a Taichi kernel so the writes stay on-GPU and avoid a
+        full padded upload.
+        """
+        if len(indices) == 0:
+            return
+        idx_i32 = indices.astype(np.int32)
+        pos_f32 = positions.astype(np.float32)
+        vel_f32 = velocities.astype(np.float32)
+        if fixed is None:
+            fixed_i32 = np.zeros(len(indices), dtype=np.int32)
+        else:
+            fixed_i32 = fixed.astype(np.int32)
+        self._write_vert_state_kernel(idx_i32, pos_f32, vel_f32, fixed_i32)
+
+    @ti.kernel
+    def _write_vert_state_kernel(self,
+                                  indices:    ti.types.ndarray(dtype=ti.i32, ndim=1),
+                                  positions:  ti.types.ndarray(dtype=ti.f32, ndim=2),
+                                  velocities: ti.types.ndarray(dtype=ti.f32, ndim=2),
+                                  fixed:      ti.types.ndarray(dtype=ti.i32, ndim=1)):
+        for i in range(indices.shape[0]):
+            v = indices[i]
+            self.positions[v]  = ti.Vector([positions[i, 0], positions[i, 1], positions[i, 2]])
+            self.velocities[v] = ti.Vector([velocities[i, 0], velocities[i, 1], velocities[i, 2]])
+            self._fixed[v]     = fixed[i]
+
+    @ti.kernel
+    def _apply_orphan_kinematics_kernel(self,
+                                         orphans:  ti.types.ndarray(dtype=ti.i32, ndim=1),
+                                         masters:  ti.types.ndarray(dtype=ti.i32, ndim=1),
+                                         offsets:  ti.types.ndarray(dtype=ti.f32, ndim=2)):
+        """
+        Kinematic slaving: orphan[i].position = master[i].position + offset[i],
+        orphan[i].velocity = master[i].velocity. All on-GPU, no numpy round-trip.
+        Called every FEM step for verts whose only sub-tets were slivers.
+        """
+        for i in range(orphans.shape[0]):
+            o = orphans[i]
+            m = masters[i]
+            off = ti.Vector([offsets[i, 0], offsets[i, 1], offsets[i, 2]])
+            self.positions[o]  = self.positions[m] + off
+            self.velocities[o] = self.velocities[m]
+
+    def apply_orphan_kinematics(self,
+                                 orphans: np.ndarray,
+                                 masters: np.ndarray,
+                                 offsets: np.ndarray) -> None:
+        """
+        Wrap the Taichi kernel. Skips work if there are no orphans.
+        """
+        if len(orphans) == 0:
+            return
+        self._apply_orphan_kinematics_kernel(
+            orphans.astype(np.int32),
+            masters.astype(np.int32),
+            offsets.astype(np.float32),
+        )
+
+    @ti.kernel
+    def _zero_W_rest_kernel(self,
+                             slots: ti.types.ndarray(dtype=ti.i32, ndim=1)):
+        """
+        Zero the stashed pristine W for the given slots so
+        _activate_tets_kernel treats them as permanently disabled.
+        """
+        for i in range(slots.shape[0]):
+            self._W_rest[slots[i]] = 0.0
+
+    @ti.kernel
+    def _pin_verts_kernel(self,
+                           indices: ti.types.ndarray(dtype=ti.i32, ndim=1)):
+        """Set fixed=1 for given verts so FEM never integrates them."""
+        for i in range(indices.shape[0]):
+            self._fixed[indices[i]] = 1
 
     # ------------------------------------------------------------------
     # Initialisation

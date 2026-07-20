@@ -720,31 +720,44 @@ def _split_disc_verts_for_rendering(outer_faces, wound_faces, n_phys, n_orig):
     vertices use a fresh index backed by a duplicate position entry.
 
     Returns:
-        remapped_wound  — list of wound face arrays; disc-boundary vertices
-                          replaced with new rendering-only indices >= n_phys.
-        split_phys_idx  — list of physics vertex indices for the duplicates
-                          (duplicate i lives at rendering index n_phys + i).
+        remapped_wound  — (N, 3) uint32 array; disc-boundary vertices replaced
+                          with new rendering-only indices >= n_phys. Callers
+                          that expect a list can `list(remapped_wound)`.
+        split_phys_idx  — 1D int32 array of physics vertex indices for the
+                          duplicates (duplicate i lives at rendering index
+                          n_phys + i). Empty array if no split needed.
     """
-    disc_verts = set()
-    for wf in wound_faces:
-        if all(int(v) >= n_orig for v in wf):
-            disc_verts.update(int(v) for v in wf)
+    wf_arr = (np.asarray(wound_faces, dtype=np.int64)
+              if not isinstance(wound_faces, np.ndarray)
+              else wound_faces.astype(np.int64, copy=False))
+    of_arr = (np.asarray(outer_faces, dtype=np.int64)
+              if not isinstance(outer_faces, np.ndarray)
+              else outer_faces.astype(np.int64, copy=False))
 
-    if not disc_verts:
-        return wound_faces, []
+    if wf_arr.size == 0:
+        return (wf_arr.astype(np.uint32).reshape(-1, 3),
+                np.array([], dtype=np.int32))
 
-    collar_verts = set()
-    for f in outer_faces:
-        collar_verts.update(int(v) for v in f)
+    # Disc verts: verts in an all->=n_orig wound face.
+    all_ge = (wf_arr >= n_orig).all(axis=1)
+    if not all_ge.any():
+        return wf_arr.astype(np.uint32), np.array([], dtype=np.int32)
+    disc_v = np.unique(wf_arr[all_ge].ravel())
 
-    split_verts = sorted(disc_verts & collar_verts)
-    if not split_verts:
-        return wound_faces, []
+    if of_arr.size == 0:
+        return wf_arr.astype(np.uint32), np.array([], dtype=np.int32)
+    collar_v = np.unique(of_arr.ravel())
 
-    remap = {v: n_phys + i for i, v in enumerate(split_verts)}
-    remapped = [np.array([remap.get(int(v), int(v)) for v in wf], dtype=np.uint32)
-                for wf in wound_faces]
-    return remapped, split_verts
+    split_verts = np.intersect1d(disc_v, collar_v, assume_unique=True)
+    if len(split_verts) == 0:
+        return wf_arr.astype(np.uint32), np.array([], dtype=np.int32)
+
+    # Table lookup: v -> remapped index (n_phys + i) or v unchanged.
+    max_v = int(max(wf_arr.max(), split_verts.max())) + 1
+    remap_lookup = np.arange(max_v, dtype=np.int64)
+    remap_lookup[split_verts] = n_phys + np.arange(len(split_verts), dtype=np.int64)
+    remapped = remap_lookup[wf_arr].astype(np.uint32)
+    return remapped, split_verts.astype(np.int32)
 
 
 # ---------------------------------------------------------------------------
