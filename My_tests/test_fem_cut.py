@@ -92,8 +92,9 @@ def main():
                         help='Mesh to simulate (default: sphere)')
     parser.add_argument('--seed', type=int, default=5,
                         help='RNG seed for cut plane (default: 5)')
-    parser.add_argument('--cg_iters', type=int, default=20,
-                        help='CG solver iterations (default: 20; increase for larger/stiffer meshes)')
+    parser.add_argument('--cg_iters', type=int, default=25,
+                        help='CG solver iterations (default: 25, matching the CGLinearSolver '
+                             'cap in the SOFA comparison scenes; increase for larger/stiffer meshes)')
     parser.add_argument('--tet_scale', type=float, default=1.0,
                         help='Interior tet size relative to surface (default: 1.0; try 5-20 for fewer tets)')
     parser.add_argument('--debug-colors', action='store_true', default=False,
@@ -102,7 +103,23 @@ def main():
                         help='Enable GL backface culling (default: off)')
     parser.add_argument('--profile-kernels', action='store_true', default=False,
                         help='Enable Taichi kernel_profiler (~halves fps; sniffed at import time)')
+    parser.add_argument('--bench', action='store_true', default=False,
+                        help='Print rolling wall-clock fps per phase + memory reports '
+                             '(sniffed at import time; implies you want --no-vsync)')
+    parser.add_argument('--no-vsync', action='store_true', default=False,
+                        help='Disable vsync. REQUIRED for meaningful fps numbers: with '
+                             'vsync on, frame time is clamped to the monitor refresh')
+    parser.add_argument('--bench-json', default=None, metavar='PATH',
+                        help='Write the per-phase frame-time summary, memory snapshots, '
+                             'cut setup time and mesh sizes to this JSON file on exit')
     args = parser.parse_args()
+
+    if args.bench and not args.no_vsync:
+        print("[Bench] WARNING: --bench without --no-vsync. Frame times are "
+              "clamped by vsync and the fps numbers are not benchmark-valid.")
+    if args.bench_json and not args.bench:
+        print("[Bench] WARNING: --bench-json without --bench. Nothing is being "
+              "measured, so no file will be written.")
 
     mesh_name    = args.mesh
     target_faces = MESH_CONFIG[mesh_name]
@@ -120,7 +137,9 @@ def main():
     print(f"  blade_dir = [{blade_dir[0]:.3f}, {blade_dir[1]:.3f}, {blade_dir[2]:.3f}]")
     print("=" * 50)
 
-    Application().create(OpenGLWindow(f'Taichi FEM -- {mesh_name}', 1280, 720, True), OpenGLRenderer)
+    Application().create(
+        OpenGLWindow(f'Taichi FEM -- {mesh_name}', 1280, 720, not args.no_vsync),
+        OpenGLRenderer)
 
     scene = Scene('FEM Cut Simulation')
 

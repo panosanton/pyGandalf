@@ -34,6 +34,14 @@ from .taichi_cut_utils import _SpringMassSimulator, _cut_topology_physics
 from . import taichi_cut_utils as _tcu  # for _QUIET_CUT_LOGS toggle in progressive mode
 
 
+# Per-frame progressive-cut diagnostics: the [Progressive] and [GrowTiming]
+# lines, and the [SeamDebug] scan. Off by default -- they drown out benchmark
+# output, and the seam scan additionally does a full GPU readback plus a Python
+# loop over every broken seam pair EVERY frame, which distorts the timings it
+# sits next to. Flip to True to restore the diagnostics.
+_PROGRESS_DEBUG: bool = False
+
+
 class SimulationMethod(ABC):
     """
     Abstract base class for soft-body simulation backends.
@@ -630,9 +638,15 @@ class FEMMethod(SimulationMethod):
         # Legacy one-shot path uses _apply_orphan_constraints (numpy). It's a
         # no-op when _orphan_constraints is empty (progressive doesn't populate it).
         self._apply_orphan_constraints()
-        self._debug_step()
-        self._debug_scan_high_velocity()
-        self._debug_scan_seam_separation()
+        # All three do GPU readbacks every step even when they print nothing
+        # (_debug_step reads _fixed and, pre-cut, _forces; the velocity and seam
+        # scans read the whole velocity / position field), so they are gated as
+        # a group rather than only silenced -- otherwise they would inflate the
+        # per-step timings being measured.
+        if _PROGRESS_DEBUG:
+            self._debug_step()
+            self._debug_scan_high_velocity()
+            self._debug_scan_seam_separation()
 
     def _debug_scan_high_velocity(self) -> None:
         """
@@ -715,6 +729,8 @@ class FEMMethod(SimulationMethod):
 
         Throttled to print every N frames or on threshold-crossing events.
         """
+        if not _PROGRESS_DEBUG:
+            return
         if not self._progressive_cut or not self._seam_pairs:
             return
         broken_pairs = [p for p in self._seam_pairs if p['broken']]
@@ -1589,10 +1605,11 @@ class FEMMethod(SimulationMethod):
 
         n_new_split = int(new_mask.sum() - (self._split_mask.sum()
                                              if self._split_mask is not None else 0))
-        print(f"[Progressive] blade_travel={blade_travel:.4f}  "
-              f"newly-splitting {n_new_split} tets  "
-              f"(cumulative {int(new_mask.sum())}/{int(self._crossing_mask.sum())} crossing tets split)",
-              flush=True)
+        if _PROGRESS_DEBUG:
+            print(f"[Progressive] blade_travel={blade_travel:.4f}  "
+                  f"newly-splitting {n_new_split} tets  "
+                  f"(cumulative {int(new_mask.sum())}/{int(self._crossing_mask.sum())} crossing tets split)",
+                  flush=True)
 
         self._ensure_full_precompute()
         _t_precomp = _t.perf_counter() - _t0
@@ -1687,14 +1704,15 @@ class FEMMethod(SimulationMethod):
         self._seam_pairs = seam_pairs
         _t_seams = _t.perf_counter() - _t3
         _t_total = _t.perf_counter() - _t0
-        print(f"[GrowTiming] total={_t_total*1000:.1f}ms  "
-              f"precomp={_t_precomp*1000:.1f}  "
-              f"apply={_t_apply*1000:.1f}  "
-              f"snap={_t_snap*1000:.1f}  "
-              f"seams={_t_seams*1000:.1f}  "
-              f"newly_split={n_new_split}  "
-              f"n_full_verts={n_full:,}",
-              flush=True)
+        if _PROGRESS_DEBUG:
+            print(f"[GrowTiming] total={_t_total*1000:.1f}ms  "
+                  f"precomp={_t_precomp*1000:.1f}  "
+                  f"apply={_t_apply*1000:.1f}  "
+                  f"snap={_t_snap*1000:.1f}  "
+                  f"seams={_t_seams*1000:.1f}  "
+                  f"newly_split={n_new_split}  "
+                  f"n_full_verts={n_full:,}",
+                  flush=True)
 
     def _ensure_full_precompute(self) -> None:
         """

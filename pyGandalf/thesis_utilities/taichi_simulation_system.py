@@ -45,6 +45,11 @@ import time
 # used by mesh_lib.py / taichi_cut_utils.py to enable Taichi's kernel_profiler.
 _PROFILE_KERNELS = "--profile-kernels" in sys.argv
 
+# Wall-clock fps / memory reporting for the thesis benchmark numbers. Cheap
+# enough to leave in, but it prints once a second, so it is opt-in. Sniffed
+# from argv for the same reason as the flag above (ti.init runs before argparse).
+_BENCH = "--bench" in sys.argv
+
 import glfw
 import taichi as ti
 import OpenGL.GL as gl
@@ -57,6 +62,7 @@ from pyGandalf.core.application import Application
 
 from . import pick_inspector
 from . import taichi_cut_utils
+from .bench_utils import FrameMeter, mem_report, record_event
 
 from .taichi_cut_utils import (
     _SpringMassSimulator,
@@ -151,6 +157,7 @@ class TaichiSimulationComponent(Component):
         self.blade_speed       = float(blade_speed)
         self.blade_is_active   = False
         self.blade_initialized = False
+        self._cut_done         = False  # True once the blade finishes its sweep
         self.blade_travel      = 0.0  # current distance traveled along blade_travel_dir
 
         # Internal state populated by _setup_progressive_cut
@@ -268,6 +275,19 @@ class TaichiSimulationSystem(System):
               "white=surface, orange=collar, yellow=reclassified, cyan=wound-above, magenta=wound-dup")
         print("  Z — toggle wireframe mode")
 
+        if _BENCH:
+            import atexit
+            self._meter = FrameMeter()
+            self._meter.enable()
+            atexit.register(self._meter.summary)
+            print("  M — print host RSS / GPU memory snapshot")
+            record_event('mesh',
+                         verts=int(len(tet.vertices)),
+                         tets=int(len(tet.tetrahedra)),
+                         surface_faces=int(len(comp.surface_indices)),
+                         fixed_verts=int(fixed_mask.sum()))
+            mem_report('after init (uncut)', comp.simulator)
+
     def on_update_entity(self, ts: float, entity, components):
         comp: TaichiSimulationComponent
         mesh_comp: StaticMeshComponent
@@ -277,6 +297,25 @@ class TaichiSimulationSystem(System):
             return
         if mesh_comp.render_pipeline is None or len(mesh_comp.buffers) < 2:
             return
+
+        # --- Wall-clock frame meter (ts is the full frame delta from
+        # Application.begin_frame, so it includes draw + buffer swap). Phase
+        # labels keep the uncut baseline and the during-cut numbers separate.
+        if _BENCH:
+            if not comp.blade_initialized:
+                _phase = 'idle'
+            elif getattr(comp, '_cut_done', False):
+                _phase = 'settling'
+            elif comp.sim_paused:
+                _phase = 'paused'
+            else:
+                _phase = 'cutting'
+            self._meter.tick(ts, _phase)
+
+            m_now = InputManager().get_key_down(glfw.KEY_M)
+            if m_now and not getattr(self, '_m_prev', False):
+                mem_report(f'on demand ({_phase})', comp.simulator)
+            self._m_prev = m_now
 
         # --- C key: one-shot cut (blocked once progressive cut is initialized) ---
         c_now = InputManager().get_key_down(glfw.KEY_C)
@@ -324,7 +363,18 @@ class TaichiSimulationSystem(System):
                         except Exception as _e:
                             print(f"[TaichiProfile] unavailable: {_e}", flush=True)
                 else:
+                    # Unconditional wall time: this is the "one-shot cut setup"
+                    # number for the thesis. Measured WITHOUT cProfile, which
+                    # inflates it by roughly the interpreter overhead of every
+                    # call in the setup path.
+                    _t0 = time.perf_counter()
                     _setup_progressive_cut(comp, mesh_comp)
+                    _setup_s = time.perf_counter() - _t0
+                    print(f"[Bench] cut setup (B press -> ready): "
+                          f"{_setup_s:.3f} s", flush=True)
+                    record_event('cut_setup', seconds=_setup_s)
+                    if _BENCH:
+                        mem_report('after cut setup', comp.simulator)
             else:
                 comp.blade_is_active = not comp.blade_is_active
                 print(f"[Blade] {'Resumed' if comp.blade_is_active else 'Paused'}")
@@ -1370,8 +1420,14 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
             gl.glBindVertexArray(0)
 
         comp.blade_is_active = False
+        comp._cut_done       = True
         n_broken = sum(1 for p in comp._seam_pairs if p['broken'])
         print(f"[Blade] Cut complete — {n_broken:,} seam springs broken.")
+        record_event('cut_complete',
+                     seam_springs_broken=int(n_broken),
+                     verts_after_cut=int(comp.method.vertex_count))
+        if _BENCH:
+            mem_report('after cut complete', comp.simulator)
 
 
 # ---------------------------------------------------------------------------
