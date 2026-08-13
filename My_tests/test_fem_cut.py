@@ -102,6 +102,11 @@ def main():
                         help='Enable GL backface culling (default: off)')
     parser.add_argument('--profile-kernels', action='store_true', default=False,
                         help='Enable Taichi kernel_profiler (~halves fps; sniffed at import time)')
+    parser.add_argument('--resident-sliver-bake', action='store_true', default=False,
+                        help='Multi-cut: keep slivers resident (physics-inert) across a '
+                             'bake so the baked surface stays watertight, instead of the '
+                             'legacy carried-surface snapshot. A/B toggle for the missing-'
+                             'faces fix.')
     args = parser.parse_args()
 
     mesh_name    = args.mesh
@@ -198,7 +203,16 @@ def main():
         split_disc_verts      = True,
         opening_ramp_frames   = 20,
         method_instance       = FEMMethod(cg_iters=args.cg_iters, sliver_vol_threshold=1e-5,
-                                          progressive_cut=True),  # Phase 1b smoke test
+                                          progressive_cut=True,
+                                          # --resident-sliver-bake: keep slivers
+                                          # resident across a bake (watertight
+                                          # surface) vs. legacy carried-surface.
+                                          resident_sliver_bake=args.resident_sliver_bake,
+                                          # Set True to render dropped faces in
+                                          # classification colors for pick-based
+                                          # inspection (magenta = pure-orig,
+                                          # cyan = collar-recon, orange = phantom-collar).
+                                          debug_show_dropped=False),
     )
     # FEM material params — passed through to FEMMethod.initialize() via _sim_params
     taichi_comp.stiffness = 200.0   # reused as cutting spring k
@@ -213,6 +227,16 @@ def main():
     taichi_comp.hide_wound_faces  = False
     taichi_comp.use_culling       = args.culling
     # taichi_comp.use_culling       = False
+
+    # Multi-cut helper: pressing R regenerates a random cut plane.
+    # Call it once here so subsequent B-presses can retry with new planes.
+    def _regen_plane():
+        _n, _o, _bd = _random_cut_plane(rng)
+        taichi_comp.cut_plane_origin = _o.tolist()
+        taichi_comp.cut_plane_normal = _n.tolist()
+        taichi_comp.blade_travel_dir = _bd.tolist()
+    taichi_comp.randomize_cut_plane_cb = _regen_plane
+
     scene.add_component(sphere, taichi_comp)
 
     scene.add_component(light, InfoComponent('light'))

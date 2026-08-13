@@ -209,12 +209,49 @@ def pick_and_dump(comp, mesh_comp, camera_comp, camera_transform,
     tets_np = comp.simulator._tets.to_numpy()[:comp.simulator.n_tets]
     parent_tets = _find_tets_containing_vectorised(face_verts, tets_np)
     print(f"[Pick] Parent tets ({len(parent_tets)}): {parent_tets}")
+
+    # FEM activation + sliver bookkeeping for each parent slot.
+    method  = comp.method
+    W_np      = comp.simulator._W.to_numpy()[:comp.simulator.n_tets]
+    Wrest_np  = comp.simulator._W_rest.to_numpy()[:comp.simulator.n_tets]
+    sliver_set = set()
+    _ss = getattr(method, '_sliver_slots', None)
+    if _ss is not None and len(_ss) > 0:
+        sliver_set = set(int(s) for s in _ss)
+    full_parent   = getattr(method, '_full_all_tets_parent', None)
+    crossing_mask = getattr(method, '_crossing_mask', None)
+    n_full_tets   = (len(method._full_all_tets)
+                     if getattr(method, '_full_all_tets', None) is not None else None)
+    crossing_idx  = (np.where(crossing_mask)[0]
+                     if crossing_mask is not None else None)
+
     for ti in parent_tets:
         tv = tets_np[ti]
         tp = pos_active[tv]
         vol = _tet_volume(tp)
         tv_cls = [_classify_vert(int(v), n_orig, n_split, n_phys) for v in tv]
-        print(f"[Pick]   tet #{ti}: verts={tv.tolist()} classes={tv_cls} vol={vol:.6e}")
+        w  = float(W_np[ti])
+        wr = float(Wrest_np[ti])
+        if w > 0.0:
+            state = "ACTIVE"
+        elif wr > 0.0:
+            state = "INERT(activatable)"
+        else:
+            state = "INERT(permanent)"
+        flag_str = " [SLIVER]" if ti in sliver_set else ""
+        parent_str = ""
+        if n_full_tets is not None:
+            if ti < n_full_tets and full_parent is not None:
+                parent_str = (f" parent_pristine={int(full_parent[ti])}"
+                              f"(split-block)")
+            elif crossing_idx is not None and ti - n_full_tets < len(crossing_idx):
+                parent_str = (f" parent_pristine={int(crossing_idx[ti - n_full_tets])}"
+                              f"(unsplit-block)")
+        print(f"[Pick]   tet #{ti}: verts={tv.tolist()} classes={tv_cls} "
+              f"vol={vol:.6e} W={w:.3e} W_rest={wr:.3e} {state}{flag_str}{parent_str}")
+
+    # ---- Bake history (why is this face in/out of the carried set?) --------
+    _dump_bake_history(method, face_verts, n_orig)
 
     # ---- Per-vertex live state ---------------------------------------------
     _dump_vertex_states(comp, list(set(int(v) for v in face_verts)
@@ -394,6 +431,85 @@ def _dump_vertex_states(comp, vert_indices, n_orig=None, n_split=None):
                     print(f"[Pick]     spring #{int(si)}: partner={other} "
                           f"k={float(sk[si]):.3f} rest={float(sr[si]):.6f} "
                           f"current_len={cur:.6f}")
+
+
+_DROP_REASON_NAMES = {0: "kept", 1: "PURE_ORIG_DROP", 2: "PHANTOM_COLLAR_DROP",
+                      3: "COLLAR_RECON_DROP"}
+_VERDICT_NAMES = {0: "OUTER", 1: "WOUND", 2: "DROP"}
+
+
+def _dump_bake_history(method, face_verts, n_orig):
+    """
+    For an all-ORIG (baked) face after a multi-cut bake, explain its
+    carried-surface status using the bake-time evidence stashed by
+    _bake_current_state under method._bake_debug (debug_show_dropped runs
+    only). Prints: carried-set membership, the cut-N face-table rows that
+    matched this triple (verdict / drop reason / bake-time activity), and
+    the cut-N superset tets that owned it (W, sliver flag, kept status).
+    """
+    bd = getattr(method, '_bake_debug', None)
+    if bd is None:
+        return
+    fv = [int(v) for v in face_verts]
+    if n_orig is None or any(v >= int(n_orig) for v in fv):
+        print("[BakeHist] face has non-ORIG verts (cut-N+1 INTER/DUP); "
+              "no bake history for it")
+        return
+
+    tri_baked = tuple(sorted(fv))
+    carried = getattr(method, '_carried_surf_set', None)
+    in_carried = (carried is not None) and (tri_baked in carried)
+
+    used = bd['used_verts']
+    old3 = tuple(sorted(int(used[v]) for v in fv))
+    key  = (old3[0] << 42) | (old3[1] << 21) | old3[2]
+
+    print(f"[BakeHist] baked triple={tri_baked}  cut-N triple={old3}  "
+          f"in_carried_set={in_carried}")
+
+    cache = bd['cache_old']
+    fk    = cache['face_keys']
+    rows  = np.where(fk == key)[0]
+    fp    = cache['face_parent']
+    fic   = cache['face_parent_is_crossing']
+    faws  = cache['face_active_when_split']
+    fverd = cache['face_verdict']
+    freas = cache.get('face_dropped_reason')
+    smask = bd['split_mask_old']
+
+    n_active_rows = 0
+    print(f"[BakeHist] cut-N face-table rows matching: {len(rows)}")
+    for r in rows:
+        r = int(r)
+        parent = int(fp[r])
+        active = (not bool(fic[r])) or (bool(smask[parent]) == bool(faws[r]))
+        n_active_rows += int(active)
+        reason_str = ""
+        if freas is not None:
+            reason_str = f"  reason={_DROP_REASON_NAMES.get(int(freas[r]), '?')}"
+        print(f"[BakeHist]   row={r}  parent_pristine={parent}  "
+              f"active_at_bake={active}  "
+              f"verdict={_VERDICT_NAMES.get(int(fverd[r]), '?')}{reason_str}")
+    print(f"[BakeHist] active rows at bake = {n_active_rows}  "
+          f"(count==1 needed for drawable)")
+
+    tets_old = bd['tets_old']
+    W_old    = bd['W_old']
+    sliver_set = set(int(s) for s in bd['sliver_slots'])
+    has = ((tets_old == old3[0]).any(axis=1)
+           & (tets_old == old3[1]).any(axis=1)
+           & (tets_old == old3[2]).any(axis=1))
+    owners = np.where(has)[0]
+    print(f"[BakeHist] cut-N superset tets owning the triple: {len(owners)}")
+    for t in owners:
+        t = int(t)
+        w = float(W_old[t])
+        tags = []
+        tags.append("kept" if w > 0.0 else "dropped-at-bake")
+        if t in sliver_set:
+            tags.append("SLIVER")
+        print(f"[BakeHist]   tet #{t}  verts={tets_old[t].tolist()}  "
+              f"W={w:.3e}  [{', '.join(tags)}]")
 
 
 # ---------------------------------------------------------------------------

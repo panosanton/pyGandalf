@@ -294,7 +294,12 @@ class TaichiSimulationSystem(System):
         # --- B key: progressive blade cut ---
         b_now = InputManager().get_key_down(glfw.KEY_B)
         if b_now and not getattr(self, '_b_prev', False):
-            if not comp.blade_initialized:
+            # Treat B as a fresh-cut trigger whenever no cut is in progress:
+            # either the very first press (blade never initialized) OR the
+            # previous cut has completed. Otherwise it's a pause/resume toggle.
+            _needs_new_cut = (not comp.blade_initialized
+                              or getattr(comp, 'blade_cut_completed', False))
+            if _needs_new_cut:
                 if _PROFILE_KERNELS:
                     # Python + Taichi profile of the one-shot setup, gated behind
                     # --profile-kernels so interactive runs aren't slowed down.
@@ -329,6 +334,22 @@ class TaichiSimulationSystem(System):
                 comp.blade_is_active = not comp.blade_is_active
                 print(f"[Blade] {'Resumed' if comp.blade_is_active else 'Paused'}")
         self._b_prev = b_now
+
+        # --- R key: regenerate the cut plane (for multi-cut testing) ---
+        # If the test/component installed a `randomize_cut_plane_cb` callback,
+        # invoke it. The callback is expected to update
+        # comp.cut_plane_origin / cut_plane_normal / blade_travel_dir in place.
+        r_now = InputManager().get_key_down(glfw.KEY_R)
+        if r_now and not getattr(self, '_r_prev', False):
+            _cb = getattr(comp, 'randomize_cut_plane_cb', None)
+            if callable(_cb):
+                _cb()
+                print(f"[Blade] New cut plane: origin={tuple(round(float(x), 3) for x in comp.cut_plane_origin)} "
+                      f"normal={tuple(round(float(x), 3) for x in comp.cut_plane_normal)}")
+            else:
+                print("[Blade] No randomize_cut_plane_cb registered on the component; "
+                      "R key has no effect.")
+        self._r_prev = r_now
 
         # --- N key: step one frame while paused ---
         # Polled before the blade-advance and physics-step gates so a single N
@@ -833,6 +854,8 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
     # collar spikes. Their orphan verts are kinematically slaved so the
     # sliver's visible geometry moves rigidly with its master, avoiding
     # visual explosions while staying attached to the rest of the mesh.
+    # Slivers are removed from the topology at bake; the carried surface
+    # set (_bake_current_state) takes over their spots for the next cut.
     parent_split      = split_mask[face_parent]
     row_active_all    = (~face_parent_is_crossing) | (parent_split == face_active_when_split)
 
@@ -1247,6 +1270,7 @@ def _setup_progressive_cut(comp: TaichiSimulationComponent,
 
     comp.blade_initialized  = True
     comp.blade_is_active    = True
+    comp.blade_cut_completed = False   # reset -- new cut in progress
     comp._step_timing_left  = 5  # time the first 5 step() calls to expose first-touch JIT
 
     # Warm-up step: trigger first-touch JIT of the FEM per-frame kernels while
@@ -1370,8 +1394,12 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
             gl.glBindVertexArray(0)
 
         comp.blade_is_active = False
+        # Mark the cut as done so B-press triggers a fresh cut instead of
+        # toggling the resume/pause state.
+        comp.blade_cut_completed = True
         n_broken = sum(1 for p in comp._seam_pairs if p['broken'])
-        print(f"[Blade] Cut complete — {n_broken:,} seam springs broken.")
+        print(f"[Blade] Cut complete — {n_broken:,} seam springs broken. "
+              f"Press B (with a new cut plane) to start another cut.")
 
 
 # ---------------------------------------------------------------------------

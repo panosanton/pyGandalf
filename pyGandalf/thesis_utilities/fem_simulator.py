@@ -220,6 +220,7 @@ class _FEMSimulator:
         # Now swap in the true current positions for the step to integrate.
         if rest_positions is not None:
             self._upload_padded_vec3(self.positions, vertices)
+
         self._compute_diag_K(self._n_verts, self._n_tets)
 
     # ------------------------------------------------------------------

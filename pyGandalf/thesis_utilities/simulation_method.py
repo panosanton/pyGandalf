@@ -572,8 +572,19 @@ class FEMMethod(SimulationMethod):
         # progressive_cut=False, in which case _cut_topology_physics runs once
         # with split_mask=None at B-press as before).
         self._progressive_cut     = bool(overrides.get('progressive_cut', False))
+        # resident_sliver_bake: at a multi-cut bake, keep sliver tets RESIDENT
+        # in the baked mesh (physics-inert, but present for boundary extraction)
+        # instead of deleting them. Keeps the baked surface watertight so the
+        # next cut's orig_surf_set is exact -- no carried-surface snapshot. When
+        # False, the legacy carried-surface path runs (delete slivers + snapshot
+        # the drawable surface). Flag so the two can be A/B compared in one run.
+        self._resident_sliver_bake = bool(overrides.get('resident_sliver_bake', False))
         self._pristine_tets       = None   # (n_tets, 4) pre-cut tet array; input to per-frame split
         self._pristine_n_orig     = None   # pristine vertex count (never changes after initialize)
+        self._carried_surf_set    = None   # visible-surface triples snapshotted at bake; overrides orig_surf_set for the next cut (carried-surface path only)
+        # bool mask over pristine tets: True = a resident sliver carried across a
+        # bake, permanently physics-inert on every subsequent cut (resident path).
+        self._persistent_inert_pristine = None
         self._split_schedule      = None   # (n_tets,) float32; blade_travel at which each crossing tet splits
         self._crossing_mask       = None   # (n_tets,) bool; True where the plane crosses (non-crossing tets are ignored by the schedule)
         self._split_mask          = None   # (n_tets,) bool; monotonically grown; True once tet has been split
@@ -703,112 +714,8 @@ class FEMMethod(SimulationMethod):
                   flush=True)
 
     def _debug_scan_seam_separation(self) -> None:
-        """
-        For broken seam pairs, report:
-          - INTER-DUP distance (how far the cut has opened locally).
-          - pristine ORIG endpoints' current distance vs their PRISTINE
-            rest distance (how much the surrounding mesh is stretching).
-
-        A healthy progressive cut has the first quantity growing slowly and
-        the second staying close to 1.0 (rest ratio). If both blow up, the
-        FEM's restoring force isn't matching the impulses.
-
-        Throttled to print every N frames or on threshold-crossing events.
-        """
-        if not self._progressive_cut or not self._seam_pairs:
-            return
-        broken_pairs = [p for p in self._seam_pairs if p['broken']]
-        if not broken_pairs:
-            return
-
-        n_active = int(self._simulator.n_verts)
-        pos      = self._simulator.positions.to_numpy()[:n_active]
-
-        v_a = np.array([int(p['v_above']) for p in broken_pairs], dtype=np.int32)
-        v_b = np.array([int(p['v_below']) for p in broken_pairs], dtype=np.int32)
-        sep = np.linalg.norm(pos[v_a] - pos[v_b], axis=1)
-
-        # Recover the two pristine ORIG endpoints for each seam pair from
-        # inter_data cached in _topology_result. Skip if unavailable.
-        stretch_ratio_max = None
-        stretch_edge      = None
-        stretched_over_2  = 0
-        if self._topology_result is not None:
-            inter_data = self._topology_result[10]  # list of (nid, vi, vj, t)
-            inter_to_endpoints = {int(nid): (int(vi), int(vj))
-                                  for nid, vi, vj, _t in inter_data}
-            endpoints = []
-            for p in broken_pairs:
-                ep = inter_to_endpoints.get(int(p['v_above']))
-                if ep is None:
-                    endpoints.append(None)
-                else:
-                    endpoints.append(ep)
-            ratios = []
-            vi_list = []
-            vj_list = []
-            for ep in endpoints:
-                if ep is None:
-                    continue
-                vi, vj = ep
-                cur_d = float(np.linalg.norm(pos[vi] - pos[vj]))
-                rest_d = float(np.linalg.norm(self._pristine_positions[vi]
-                                              - self._pristine_positions[vj]))
-                if rest_d > 1e-6:
-                    ratios.append(cur_d / rest_d)
-                    vi_list.append(vi)
-                    vj_list.append(vj)
-            if ratios:
-                r_arr = np.asarray(ratios, dtype=np.float32)
-                idx_max = int(np.argmax(r_arr))
-                stretch_ratio_max = float(r_arr[idx_max])
-                stretch_edge      = (vi_list[idx_max], vj_list[idx_max])
-                stretched_over_2  = int((r_arr > 2.0).sum())
-
-        # Bounding box scale so the seam-separation threshold is mesh-relative.
-        n_p = int(self._pristine_n_orig or 0)
-        if n_p > 0:
-            mesh_scale = float(np.linalg.norm(
-                self._pristine_positions.max(axis=0)
-                - self._pristine_positions.min(axis=0)))
-        else:
-            mesh_scale = 1.0
-        sep_threshold = 0.15 * mesh_scale   # 15% of mesh scale = clearly excessive
-
-        sep_max = float(sep.max())
-        n_over  = int((sep > sep_threshold).sum())
-
-        # Throttle: print every 60 frames, or when max separation grows by 30%.
-        last_seep_max = getattr(self, '_debug_last_seep_max', 0.0)
-        last_frame    = getattr(self, '_debug_last_seep_frame', 0)
-        cur_frame     = last_frame + 1
-        self._debug_last_seep_frame = cur_frame
-        should_print  = (sep_max > last_seep_max * 1.3
-                         or (cur_frame % 60 == 0)
-                         or (stretch_ratio_max is not None and stretch_ratio_max > 2.0
-                             and stretched_over_2 > getattr(self, '_debug_last_stretched_2', -1)))
-        if not should_print:
-            return
-        self._debug_last_seep_max     = sep_max
-        self._debug_last_stretched_2  = stretched_over_2
-
-        # Top-3 by INTER-DUP separation.
-        top_sep = np.argsort(sep)[::-1][:3]
-        print(f"[SeamDebug] frame={cur_frame}  broken_seams={len(broken_pairs)}  "
-              f"max_INTER_DUP_sep={sep_max:.4f}  "
-              f"(threshold {sep_threshold:.4f} = 15% of mesh_scale={mesh_scale:.4f})  "
-              f"n_over={n_over}",
-              flush=True)
-        for k in top_sep:
-            i = int(k)
-            p = broken_pairs[i]
-            print(f"[SeamDebug]   pair (v_above={int(p['v_above'])}, "
-                  f"v_below={int(p['v_below'])})  sep={sep[i]:.4f}",
-                  flush=True)
-        if stretch_ratio_max is not None:
-            print(f"[SeamDebug] max pristine-edge stretch ratio={stretch_ratio_max:.2f}x  "
-                  f"({stretched_over_2} edges > 2x)  worst edge=({stretch_edge})",
-                  flush=True)
+        """Disabled -- kept as no-op for callers."""
+        return
 
     def _apply_orphan_constraints(self) -> None:
         if not self._orphan_constraints:
@@ -960,7 +867,328 @@ class FEMMethod(SimulationMethod):
         vels[np.asarray(indices)] = velocities
         self._simulator.velocities.from_numpy(vels.astype(np.float32))
 
+    def _bake_current_state(self) -> None:
+        """
+        Freeze the current live mesh as a fresh pristine mesh for the next
+        cut. Called at the start of setup_cut when a previous progressive cut
+        left the FEM in superset layout (with W=0 slivers, kinematically-
+        slaved orphans, and INTER/DUP verts of that cut baked into the
+        geometry).
+
+        Steps:
+          1. Snapshot current positions / velocities / fixed from Taichi.
+          2. Snapshot the currently-drawable surface (same row-activity +
+             count + verdict logic as the per-frame render) and carry it
+             across the bake as `_carried_surf_set`. The next cut uses it as
+             its orig_surf_set, so every visibility verdict of this cut
+             (including the reconstruction filter's phantom drops) survives
+             the bake, where the INTER/DUP metadata those filters need is
+             erased by renumbering.
+          3. Keep only active tets (W > 0). Slivers and unsplit-block rows
+             are discarded -- render filtering is handled by the carried
+             surface set, not by topology counts.
+          4. Renumber vertices: keep only those used by kept tets, remap
+             tet indices densely.
+          5. rebuild_topology with the baked mesh -- FEM sim goes back to a
+             regular (non-superset) layout, ready for a fresh setup_cut.
+          6. Reset all progressive-cut caches so setup_cut can re-populate
+             them for the new cut plane.
+        """
+        n_v_old = int(self._simulator.n_verts)
+        n_t_old = int(self._simulator.n_tets)
+        pos_old   = self._simulator.positions.to_numpy()[:n_v_old]
+        vel_old   = self._simulator.velocities.to_numpy()[:n_v_old]
+        fixed_old = self._simulator._fixed.to_numpy()[:n_v_old]
+        W_old     = self._simulator._W.to_numpy()[:n_t_old]
+        tets_old  = self._super_tets_ref  # (n_t_old, 4) numpy
+
+        # ---- [WeldProbe] diagnostic (MEASUREMENT ONLY -- no behavior change) ---
+        # For each cut-1 seam pair, measure how far its two coincident copies
+        # (v_above vs v_below) have moved apart in the CURRENT deformed positions,
+        # as a fraction of the mesh size. If the gaps split into two clean groups
+        # -- near-zero (faces still touching = weld candidate) and clearly-open
+        # (real exposed wound) -- with nothing in the middle, a weld at bake is
+        # safe. Anything in the fuzzy middle is where a weld could create a dent.
+        # Also split by the blade `broken` flag to see whether "broken" actually
+        # tracks "opened". Wrapped in try/except so it can never break the bake.
+        try:
+            _pairs = getattr(self, '_seam_pairs', None) or []
+            _va = np.array([int(p['v_above']) for p in _pairs], dtype=np.int64)
+            _vb = np.array([int(p['v_below']) for p in _pairs], dtype=np.int64)
+            if len(_va) > 0:
+                _ok = (_va < n_v_old) & (_vb < n_v_old)
+                _va, _vb = _va[_ok], _vb[_ok]
+                _brk = np.array([bool(p['broken']) for p in _pairs], dtype=bool)[_ok]
+                _bb  = float(np.linalg.norm(pos_old.max(0) - pos_old.min(0))) or 1.0
+                _gap = np.linalg.norm(pos_old[_va] - pos_old[_vb], axis=1) / _bb
+                _edges = np.array([0, 1e-5, 1e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 1e9])
+                _lbl = ['0', '1e-5', '1e-4', '1e-3', '3e-3', '1e-2', '3e-2', '1e-1', 'inf']
+                def _hist(g, name):
+                    if len(g) == 0:
+                        return
+                    h = np.histogram(g, bins=_edges)[0]
+                    cells = "  ".join(f"[{_lbl[k]},{_lbl[k+1]}):{int(h[k])}"
+                                      for k in range(len(h)))
+                    q = np.percentile(g, [50, 90, 99])
+                    print(f"[WeldProbe] {name:6s} n={len(g):<6d} {cells}", flush=True)
+                    print(f"[WeldProbe] {name:6s} gap/scale median={q[0]:.2e} "
+                          f"p90={q[1]:.2e} p99={q[2]:.2e} max={g.max():.2e}", flush=True)
+                print(f"[WeldProbe] seam-pair gaps as fraction of mesh bbox diag="
+                      f"{_bb:.4f}; buckets = gap/scale ranges", flush=True)
+                _hist(_gap, "ALL")
+                if _brk.any():    _hist(_gap[_brk],  "broken")
+                if (~_brk).any(): _hist(_gap[~_brk], "intact")
+                _near = int((_gap < 1e-3).sum())
+                _open = int((_gap > 1e-2).sum())
+                _mid  = int(len(_gap) - _near - _open)
+                print(f"[WeldProbe] SUMMARY: touching(<1e-3)={_near}  "
+                      f"open(>1e-2)={_open}  FUZZY-MIDDLE={_mid}  "
+                      f"(fuzzy-middle ~0 => weld is safe)", flush=True)
+            else:
+                print("[WeldProbe] no seam pairs to measure", flush=True)
+        except Exception as _e:
+            print(f"[WeldProbe] skipped ({_e})", flush=True)
+        # ---- end [WeldProbe] --------------------------------------------------
+
+        # Which tets survive the bake into the new pristine mesh?
+        #   - Active tets (W > 0) always: they are the live solid.
+        #   - Resident-sliver path ALSO keeps sliver rows. Deleting slivers
+        #     punches holes that make the next cut's boundary extraction expose
+        #     phantoms (the carried-surface path exists only to paper over those
+        #     holes). Kept resident, slivers keep the baked surface watertight
+        #     and stay physics-inert (deactivated again after rebuild + threaded
+        #     into the next cut's sliver mask so they never re-activate).
+        #   - Unsplit-block duplicate rows (W==0, not slivers) are always
+        #     dropped: they are redundant with their split sub-tets.
+        _resident = self._resident_sliver_bake
+        _sliv = (np.asarray(self._sliver_slots, dtype=np.int64)
+                 if getattr(self, '_sliver_slots', None) is not None
+                 else np.zeros(0, dtype=np.int64))
+        keep_mask = W_old > 0.0
+        if _resident and len(_sliv) > 0:
+            keep_mask[_sliv] = True
+        kept_slot_ids = np.where(keep_mask)[0]     # superset row -> baked row j
+        kept_tets = tets_old[keep_mask]
+
+        # Renumber verts: keep only those referenced by kept_tets.
+        used_verts = np.unique(kept_tets.ravel())
+        n_baked = len(used_verts)
+        remap = np.full(n_v_old, -1, dtype=np.int32)
+        remap[used_verts] = np.arange(n_baked, dtype=np.int32)
+        baked_tets  = remap[kept_tets].astype(np.int32)
+        baked_pos   = pos_old[used_verts].astype(np.float32)
+        baked_vel   = vel_old[used_verts].astype(np.float32)
+        baked_fixed = fixed_old[used_verts].astype(np.int32)
+
+        # Persistent-inert mask over the baked (= next pristine) tets. Marks the
+        # resident slivers so cut N+1 keeps them physics-inert; volume re-
+        # detection can't catch them (they become all-ORIG after renumber, and
+        # _build_sliver_and_orphan_data only flags tets with a new vert). Since
+        # prior-bake slivers are already threaded into self._sliver_slots, this
+        # mask accumulates across successive bakes automatically.
+        baked_is_sliver = (np.isin(kept_slot_ids, _sliv) if len(_sliv) > 0
+                           else np.zeros(len(kept_tets), dtype=bool))
+        self._persistent_inert_pristine = (baked_is_sliver
+                                           if _resident and baked_is_sliver.any()
+                                           else None)
+
+        print(f"[Bake] {n_t_old:,} tets -> {len(kept_tets):,} kept, "
+              f"{n_v_old:,} verts -> {n_baked:,} kept "
+              f"(dropped {n_t_old - len(kept_tets):,} inert tets, "
+              f"{n_v_old - n_baked:,} orphaned verts)", flush=True)
+        if _resident:
+            print(f"[ResidentBake] kept {int(baked_is_sliver.sum()):,} resident "
+                  f"sliver tets in baked mesh (persistent-inert next cut)",
+                  flush=True)
+
+        # ---- Carry the visible surface across the bake -----------------------
+        # Reproduce the per-frame render's drawable-face computation (see
+        # _rebuild_render_from_precompute in taichi_simulation_system.py) at
+        # the current split state, then remap the triples into baked vertex
+        # indices. This set becomes the next cut's orig_surf_set.
+        cache = self._precomp_render_cache
+        carried = set()
+        if _resident:
+            # Resident-sliver path: baked mesh is watertight, so the next cut's
+            # orig_surf_set is recomputed exactly. No carried snapshot; leave
+            # carried empty (-> _carried_surf_set = None below).
+            pass
+        elif cache is not None and self._split_mask is not None:
+            face_verts   = cache['face_verts'].astype(np.int64)
+            face_key_idx = cache['face_key_idx']
+            face_parent  = cache['face_parent']
+            face_parent_is_crossing = cache['face_parent_is_crossing']
+            face_active_when_split  = cache['face_active_when_split']
+            face_verdict = cache['face_verdict']
+
+            parent_split   = self._split_mask[face_parent]
+            row_active_all = ((~face_parent_is_crossing)
+                              | (parent_split == face_active_when_split))
+            key_count = np.bincount(face_key_idx[row_active_all],
+                                    minlength=cache['n_unique_keys'])
+            boundary_rows = row_active_all & (key_count == 1)[face_key_idx]
+            drawable_rows = boundary_rows & (face_verdict != 2)  # OUTER or WOUND
+            # With debug_show_dropped, dropped faces are rendered (for
+            # picking) but keep their drop reason -- exclude them here so
+            # the carried surface is identical to a non-debug run.
+            _reason = cache.get('face_dropped_reason')
+            if _reason is not None:
+                drawable_rows &= (_reason == 0)
+
+            tri = face_verts[drawable_rows]           # old (superset) indices
+            tri_new = remap[tri]                      # baked indices, -1 = dropped
+            ok = (tri_new >= 0).all(axis=1)
+            tri_new = np.sort(tri_new[ok], axis=1)
+            carried = set(map(tuple, tri_new.tolist()))
+            print(f"[Bake] carried surface: {int(drawable_rows.sum()):,} "
+                  f"drawable faces -> {len(carried):,} baked triples "
+                  f"({int((~ok).sum()):,} referenced dropped verts)", flush=True)
+
+            # Sliver replacement faces: every face a kept (active) tet shares
+            # with a sliver. Slivers form only along the cut plane, so when
+            # they are deleted at bake these interfaces become the real
+            # wound-adjacent surface of the baked solid -- regardless of
+            # whether the sliver itself ever drew a face (its own faces are
+            # routinely count==2 against further slivers or recon-dropped
+            # collar faces). True non-conforming phantoms are NOT in this
+            # class: they are shared with nothing, sliver or otherwise. That
+            # ownership information exists only at bake time; after the bake
+            # both kinds are identical all-ORIG count==1 faces.
+            _sslots = getattr(self, '_sliver_slots', None)
+            if _sslots is not None and len(_sslots) > 0:
+                _COMBOS = np.array([[0, 1, 2], [0, 1, 3],
+                                    [0, 2, 3], [1, 2, 3]], dtype=np.int64)
+                def _face_keys_of(tet_arr):
+                    f = np.sort(tet_arr[:, _COMBOS].reshape(-1, 3), axis=1)
+                    return f, ((f[:, 0] << 42) | (f[:, 1] << 21) | f[:, 2])
+                sliver_tets = tets_old[np.asarray(_sslots, dtype=np.int64)] \
+                                  .astype(np.int64)
+                kept64 = kept_tets.astype(np.int64)
+                _, sliver_keys = _face_keys_of(sliver_tets)
+                kept_faces, kept_keys = _face_keys_of(kept64)
+                covered = np.isin(kept_keys, sliver_keys)
+                cov_new = remap[kept_faces[covered]]
+                cov_ok  = (cov_new >= 0).all(axis=1)
+                cov_new = np.sort(cov_new[cov_ok], axis=1)
+                n_before = len(carried)
+                carried.update(map(tuple, cov_new.tolist()))
+                print(f"[Bake] carried surface: +{len(carried) - n_before:,} "
+                      f"sliver replacement faces (from {int(covered.sum()):,} "
+                      f"kept-tet/sliver shared faces)", flush=True)
+        else:
+            print("[Bake] WARNING: no render cache at bake; "
+                  "carried surface unavailable", flush=True)
+        self._carried_surf_set = carried if carried else None
+
+        # debug_show_dropped: persist the bake-time evidence so the pick
+        # tool can explain, for any face dropped in cut N+1, why it did not
+        # make the carried set (cut-N face rows + verdicts, owner tets,
+        # sliver flags). Guarded by the flag -- this holds the whole cut-N
+        # face table alive across the bake.
+        if bool(self._params.get('debug_show_dropped', False)) and cache is not None:
+            _ss_dbg = getattr(self, '_sliver_slots', None)
+            self._bake_debug = {
+                'used_verts':     used_verts.copy(),   # baked idx -> cut-N superset idx
+                'tets_old':       np.asarray(tets_old),
+                'W_old':          W_old.copy(),
+                'sliver_slots':   (np.asarray(_ss_dbg, dtype=np.int64).copy()
+                                   if _ss_dbg is not None and len(_ss_dbg) > 0
+                                   else np.zeros(0, dtype=np.int64)),
+                'split_mask_old': self._split_mask.copy(),
+                'cache_old':      cache,
+            }
+
+        # Re-upload as a fresh mesh via the standard (non-superset) path.
+        self._simulator.rebuild_topology(
+            vertices   = baked_pos,
+            tetrahedra = baked_tets,
+            fixed_mask = baked_fixed,
+            velocities = baked_vel,
+        )
+
+        # Resident-sliver path: rebuild_topology activated every uploaded tet
+        # (real W from _init_tet_data). Deactivate + zero W_rest the resident
+        # slivers again so they contribute no force/mass/stiffness while present
+        # for boundary extraction -- same treatment they got within the cut. This
+        # covers the settling window before the next cut's superset init; edit 4
+        # re-applies it inside that superset.
+        if _resident and baked_is_sliver.any():
+            _baked_sliver_rows = np.where(baked_is_sliver)[0].astype(np.int32)
+            self._simulator._deactivate_tets_kernel(_baked_sliver_rows)
+            self._simulator._zero_W_rest_kernel(_baked_sliver_rows)
+
+        # Reset all progressive-cut state so setup_cut runs cleanly for
+        # the new cut plane. _current_tets is the FULL baked set (resident
+        # slivers included) -- it must equal what the sim actually steps, so
+        # boundary extraction and forces see the same topology.
+        self._current_tets       = baked_tets
+        self._pristine_positions = baked_pos.copy()
+        self._pristine_n_orig    = n_baked
+        self._pristine_tets      = None      # set by setup_cut
+
+        self._split_mask         = None
+        self._crossing_mask      = None
+        self._split_schedule     = None
+        self._topology_result    = None
+        self._n_orig_val         = None
+        self._n_split            = None
+        self._cut_normal         = None
+        self._cut_origin         = None
+        self._blade_dir          = None
+        self._seam_pairs         = []
+        self._opening_ramp_queue = []
+        self._orphan_constraints = {}
+        self._debug_orphan_verts = set()
+
+        # Progressive-cut caches (all rebuilt on first grow of the next cut).
+        self._superset_initialized  = False
+        self._full_precompute_cache = None
+        self._precomp_render_cache  = None
+        self._super_tets_ref        = None
+        self._active_verts_used     = None
+        self._parent_unsplit_slot   = None
+        self._parent_split_slots    = None
+        self._parent_split_slots_off = None
+        self._sliver_slots   = None
+        self._orphan_ids     = None
+        self._orphan_masters = None
+        self._orphan_offsets = None
+        self._orphan_set     = set()
+        if hasattr(self, '_full_inter_edge_lookup'):
+            del self._full_inter_edge_lookup
+        if hasattr(self, '_inter_vi_full'):
+            self._inter_vi_full = None
+
+    def _apply_carried_surf_set(self, result):
+        """
+        Replace the recomputed orig_surf_set (result[11]) with the surface
+        snapshot carried across the last bake, when one exists.
+
+        After a bake, _cut_topology_physics recomputes orig_surf_set as the
+        boundary (count==1) faces of the baked topology. That set wrongly
+        includes phantom faces: cut-N's non-conforming splits leave count==1
+        faces that cut-N's reconstruction filter dropped from the render, but
+        the bake erases the INTER/DUP metadata the filter needs, so the
+        recomputed set cannot re-drop them. The carried snapshot IS cut-N's
+        final filtered surface, so using it as orig_surf_set makes every
+        orig_surf-based filter (pure_orig_drop, PhantomCollar, the collar
+        reconstruction filter) inherit cut-N's visibility verdicts exactly.
+        """
+        if getattr(self, '_carried_surf_set', None) is None:
+            return result
+        r = list(result)
+        r[11] = self._carried_surf_set
+        return tuple(r)
+
     def setup_cut(self, cut_normal, cut_origin, blade_travel_dir) -> bool:
+        # If a previous progressive cut set up the superset layout, bake
+        # the current live mesh as a fresh pristine mesh before running the
+        # new cut. Without this, _cut_topology_physics would run on the
+        # superset (W=0 placeholders + INTER/DUP verts from cut 1), which
+        # it does not understand.
+        if getattr(self, '_superset_initialized', False):
+            self._bake_current_state()
+
         normal    = np.array(cut_normal,       dtype=np.float32)
         origin    = np.array(cut_origin,       dtype=np.float32)
         blade_dir = np.array(blade_travel_dir, dtype=np.float32)
@@ -1018,6 +1246,7 @@ class FEMMethod(SimulationMethod):
         )
         if result is None:
             return False
+        result = self._apply_carried_surf_set(result)
 
         # Store the mask used for THIS call. Progressive path starts all-False
         # and grows monotonically in advance_blade. Legacy path uses all-True
@@ -1726,6 +1955,15 @@ class FEMMethod(SimulationMethod):
             _tcu._QUIET_CUT_LOGS = False
         if result is None:
             raise RuntimeError("_ensure_full_precompute: cut plane misses mesh?")
+        result = self._apply_carried_surf_set(result)
+
+        if self._resident_sliver_bake and self._persistent_inert_pristine is not None:
+            # Watertight-surface sanity: with slivers resident the recomputed
+            # orig_surf_set (result[11]) should be the exact pre-cut surface --
+            # no carried snapshot involved. Log its size to compare against the
+            # carried-surface run.
+            print(f"[ResidentBake] recomputed orig_surf_set = "
+                  f"{len(result[11]):,} faces (watertight baked mesh)", flush=True)
 
         self._full_precompute_cache = result
         self._full_all_tets        = result[5]
@@ -1773,8 +2011,8 @@ class FEMMethod(SimulationMethod):
               f"(vs pristine {len(self._pristine_tets):,} tets, {n_p:,} verts)",
               flush=True)
 
-        self._build_render_precompute_cache()
         self._build_sliver_and_orphan_data()
+        self._build_render_precompute_cache()
 
     def _build_sliver_and_orphan_data(self) -> None:
         """
@@ -1805,6 +2043,24 @@ class FEMMethod(SimulationMethod):
         n_orig = self._full_n_orig
         has_new_vert = (super_tets >= n_orig).any(axis=1)
         is_sliver = has_new_vert & (vols < _thresh) if _thresh > 0.0 else np.zeros(len(super_tets), dtype=bool)
+
+        # Resident-sliver path: slivers carried across a previous bake are
+        # degenerate but now all-ORIG in this cut's pristine mesh, so the
+        # new-vert + volume test above cannot flag them. Mark their superset
+        # rows inert explicitly (via the persistent mask over pristine tets) so
+        # they are deactivated + orphan-slaved exactly like freshly detected
+        # slivers. full-block rows -> parent via _full_all_tets_parent;
+        # unsplit-block rows -> parent via crossing_idx.
+        _pip = getattr(self, '_persistent_inert_pristine', None)
+        if _pip is not None:
+            full_parent = self._full_all_tets_parent.astype(np.int64)
+            row_inert = np.zeros(len(super_tets), dtype=bool)
+            row_inert[:n_full_tets] = _pip[full_parent]
+            row_inert[n_full_tets:] = _pip[crossing_idx]
+            is_sliver = is_sliver | row_inert
+            print(f"[ResidentBake] threaded {int(row_inert.sum()):,} persistent-"
+                  f"inert rows into cut sliver mask", flush=True)
+
         self._sliver_slots = np.where(is_sliver)[0].astype(np.int32)
 
         # Orphan detection based on END-OF-CUT topology.
@@ -1976,6 +2232,49 @@ class FEMMethod(SimulationMethod):
             offsets = (self._full_final_pos[orphan_ids]
                      - self._full_final_pos[masters]).astype(np.float32)
 
+            # ---- Targeted debug trace ---------------------------------
+            # Set params['trace_orphan_id'] to a vert index (from the pick
+            # tool) to print the full master-picking decision trail for
+            # just that orphan. Off by default (-1). Left in place instead
+            # of removed so it can be re-enabled without patching.
+            _TRACE_ORPHAN_ID = int(self._params.get('trace_orphan_id', -1))
+            if _TRACE_ORPHAN_ID >= 0:
+                _pos = np.where(orphan_ids == _TRACE_ORPHAN_ID)[0]
+                if len(_pos) == 1:
+                    i = int(_pos[0])
+                    o_id  = int(orphan_ids[i])
+                    o_pos = self._full_final_pos[o_id]
+                    o_dist = float((o_pos - self._cut_origin) @ self._cut_normal)
+                    print(f"\n[TRACE orphan={_TRACE_ORPHAN_ID}] ------------------")
+                    print(f"  vert class    : {'ORIG' if o_id < n_orig else ('INTER' if o_id < n_split else 'DUP')}")
+                    print(f"  pristine pos  : {tuple(round(float(x), 4) for x in o_pos)}")
+                    print(f"  dist_to_plane : {o_dist:+.4f}")
+                    print(f"  side_label    : {int(orphan_side[i]):+d}")
+                    print(f"  underlying INTER: {int(underlying_inter[i])}")
+                    print(f"  edge vi/vj    : {int(vis[i])} / {int(vjs[i])}")
+                    print(f"  vi side_label : {int(vi_side[i]):+d}  (pristine dist "
+                          f"{float((self._full_final_pos[int(vis[i])] - self._cut_origin) @ self._cut_normal):+.4f})")
+                    print(f"  vj side_label : {int(vj_side[i]):+d}  (pristine dist "
+                          f"{float((self._full_final_pos[int(vjs[i])] - self._cut_origin) @ self._cut_normal):+.4f})")
+                    print(f"  vi_is_orphan  : {bool(vi_is_orphan[i])}")
+                    print(f"  vj_is_orphan  : {bool(vj_is_orphan[i])}")
+                    print(f"  vi_match      : {bool(vi_match[i])}")
+                    print(f"  vj_match      : {bool(vj_match[i])}")
+                    print(f"  neither_match : {bool(neither_matches[i])}  (kd-tree fallback used = {bool(neither_matches[i])})")
+                    print(f"  picked master : {int(masters[i])}")
+                    _mp = self._full_final_pos[int(masters[i])]
+                    _md = float((_mp - self._cut_origin) @ self._cut_normal)
+                    print(f"  master class  : {'ORIG' if int(masters[i]) < n_orig else ('INTER' if int(masters[i]) < n_split else 'DUP')}")
+                    print(f"  master pos    : {tuple(round(float(x), 4) for x in _mp)}")
+                    print(f"  master dist   : {_md:+.4f}")
+                    print(f"  master side_label: {int(self._full_side_label[int(masters[i])]):+d}")
+                    print(f"  offset        : {tuple(round(float(x), 4) for x in offsets[i])}")
+                    print(f"[TRACE end] ------------------------------------\n", flush=True)
+                elif len(_pos) == 0:
+                    print(f"[TRACE orphan={_TRACE_ORPHAN_ID}] NOT in orphan set "
+                          f"(no orphan handling applied to this vert)", flush=True)
+            # ---- end trace --------------------------------------------
+
             self._orphan_ids     = orphan_ids
             self._orphan_masters = masters.astype(np.int32)
             self._orphan_offsets = offsets
@@ -2049,6 +2348,13 @@ class FEMMethod(SimulationMethod):
         face_parent = np.repeat(tet_parent, 4)
         face_parent_is_crossing = np.repeat(tet_parent_is_crossing, 4)
         face_active_when_split  = np.repeat(tet_active_when_split, 4)
+
+        # Sliver rows stay in the face table: within a cut, a sliver's own
+        # (orphan-slaved) face IS the visible surface over its spot, and its
+        # count keeps the active|sliver interface faces classified interior.
+        # Slivers are removed from the topology at bake; the carried surface
+        # set (see _bake_current_state) handles their disappearance for the
+        # next cut.
 
         # Sorted verts + packed int64 keys
         face_sorted = np.sort(face_verts, axis=1)
@@ -2154,9 +2460,25 @@ class FEMMethod(SimulationMethod):
         VERDICT_OUTER, VERDICT_WOUND, VERDICT_DROP = 0, 1, 2
         face_verdict = np.full(len(face_verts), VERDICT_OUTER, dtype=np.int8)
         face_verdict[face_wound]           = VERDICT_WOUND
-        face_verdict[pure_orig_drop]       = VERDICT_DROP
-        face_verdict[phantom_collar_drop]  = VERDICT_DROP
-        face_verdict[collar_recon_drop]    = VERDICT_DROP
+
+        # Drop reason (0 = kept). Recorded regardless of the debug flag; the
+        # bake snapshot uses it so debug-visible dropped faces are still
+        # excluded from the carried surface.
+        REASON_NONE, REASON_PURE_ORIG, REASON_PHANTOM_COLLAR, REASON_RECON = 0, 1, 2, 3
+        face_dropped_reason = np.zeros(len(face_verts), dtype=np.int8)
+        face_dropped_reason[pure_orig_drop]      = REASON_PURE_ORIG
+        face_dropped_reason[phantom_collar_drop] = REASON_PHANTOM_COLLAR
+        face_dropped_reason[collar_recon_drop]   = REASON_RECON
+
+        # debug_show_dropped: draw dropped faces in classification colors
+        # instead of hiding them, so they can be picked and inspected.
+        #   magenta = pure_orig_drop (not in orig_surf / carried set)
+        #   cyan    = collar_recon_drop (reconstruction not in surf set)
+        #   orange  = phantom_collar_drop (off-plane vert not on surface)
+        _dbg_show_dropped = bool(self._params.get('debug_show_dropped', False))
+        if not _dbg_show_dropped:
+            face_verdict[face_dropped_reason != REASON_NONE] = VERDICT_DROP
+
 
         # Category (see _compute_face_categories, cats 0..2 -- 3/4 are handled
         # by the drop verdicts above, so we don't need cat 3/4 here).
@@ -2173,6 +2495,10 @@ class FEMMethod(SimulationMethod):
         all_new = np.all(face_verts >= n_orig, axis=1)
         face_debug_color[any_new & ~all_new] = [0.3, 0.7, 0.4]  # collar
         face_debug_color[all_new]            = [0.85, 0.1, 0.1] # disc/wound
+        if _dbg_show_dropped:
+            face_debug_color[face_dropped_reason == REASON_PURE_ORIG]      = [1.0, 0.0, 1.0]
+            face_debug_color[face_dropped_reason == REASON_RECON]          = [0.0, 1.0, 1.0]
+            face_debug_color[face_dropped_reason == REASON_PHANTOM_COLLAR] = [1.0, 0.55, 0.0]
 
         # Map each row to a unique-key index so per-frame boundary detection
         # uses O(K) np.bincount instead of O(M log M) np.unique. The unique
@@ -2191,6 +2517,7 @@ class FEMMethod(SimulationMethod):
             'face_parent_is_crossing':  face_parent_is_crossing,
             'face_active_when_split':   face_active_when_split,
             'face_verdict':             face_verdict,
+            'face_dropped_reason':      face_dropped_reason,
             'face_category':            face_category,
             'face_debug_color':         face_debug_color,
             'n_super_tets':             n_super,
