@@ -579,6 +579,16 @@ class FEMMethod(SimulationMethod):
         # False, the legacy carried-surface path runs (delete slivers + snapshot
         # the drawable surface). Flag so the two can be A/B compared in one run.
         self._resident_sliver_bake = bool(overrides.get('resident_sliver_bake', False))
+        # Diagnostic A/B: when False, the carried-surface bake skips the sliver
+        # replacement-face patch. Used to test whether that patch is the source
+        # of the post-cut-2 non-manifold (overlapping) faces.
+        self._bake_add_replacement_faces = bool(
+            overrides.get('bake_add_replacement_faces', True))
+        # Resident path: carry cut-1's clean drawn surface as the next cut's
+        # orig_surf_set (fix for the old-wound overlaps). False = legacy behavior
+        # (recompute from baked topology). A/B via --resident-legacy-surf.
+        self._resident_carry_clean_surface = bool(
+            overrides.get('resident_carry_clean_surface', True))
         self._pristine_tets       = None   # (n_tets, 4) pre-cut tet array; input to per-frame split
         self._pristine_n_orig     = None   # pristine vertex count (never changes after initialize)
         self._carried_surf_set    = None   # visible-surface triples snapshotted at bake; overrides orig_surf_set for the next cut (carried-surface path only)
@@ -867,6 +877,120 @@ class FEMMethod(SimulationMethod):
         vels[np.asarray(indices)] = velocities
         self._simulator.velocities.from_numpy(vels.astype(np.float32))
 
+    def _surface_manifold_probe(self, label: str) -> None:
+        """
+        MEASUREMENT ONLY. Watertightness of the CURRENTLY-DRAWN surface at the
+        current split state. A closed manifold has every triangle edge shared by
+        exactly two triangles: edges shared by 1 = holes, by >=3 = non-manifold.
+
+        Reports two ways:
+          - BY VERTEX-NUMBER: edges keyed on raw vertex indices. Sensitive to
+            duplicated coincident points (seam dups, render dups).
+          - BY POSITION: coincident points welded first (tol ~ 1e-5 * mesh), so
+            the count reflects true geometry regardless of numbering.
+        Plus a per-piece breakdown of the welded surface (which half leaks).
+        Used to sanity-check the surface right after cut 1 (known-good) vs at
+        bake time. Wrapped so it can never affect the run.
+        """
+        try:
+            cache = self._precomp_render_cache
+            if cache is None or self._split_mask is None:
+                print(f"[SurfProbe:{label}] no render cache yet", flush=True)
+                return
+            fv   = cache['face_verts'].astype(np.int64)
+            fki  = cache['face_key_idx']
+            fp   = cache['face_parent']
+            fpc  = cache['face_parent_is_crossing']
+            faws = cache['face_active_when_split']
+            fver = cache['face_verdict']
+            psplit  = self._split_mask[fp]
+            ractive = (~fpc) | (psplit == faws)
+            kc = np.bincount(fki[ractive], minlength=cache['n_unique_keys'])
+            boundary_rows = ractive & (kc == 1)[fki]
+            drawn = boundary_rows & (fver != 2)        # OUTER or WOUND only
+            tri = fv[drawn]
+            nO = int((fver[drawn] == 0).sum())
+            nW = int((fver[drawn] == 1).sum())
+
+            def _stats(tris):
+                # (n_edges, n_holes, n_nonmanifold) with endpoints sorted PER EDGE
+                if len(tris) == 0:
+                    return 0, 0, 0
+                e = np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]],
+                                    tris[:, [0, 2]]], axis=0)
+                e = np.sort(e, axis=1)               # sort the 2 endpoints per edge
+                e = e[e[:, 0] != e[:, 1]]            # drop degenerate edges
+                _, cnt = np.unique(e, axis=0, return_counts=True)
+                return len(cnt), int((cnt == 1).sum()), int((cnt >= 3).sum())
+
+            ne, nb, nnm = _stats(tri)
+            print(f"[SurfProbe:{label}] drawn {int(drawn.sum()):,} tris "
+                  f"(outer={nO:,} wound={nW:,})", flush=True)
+            print(f"[SurfProbe:{label}]  BY VERTEX-NUMBER: edges={ne:,} "
+                  f"holes={nb:,} non-manifold={nnm:,} => "
+                  f"{'CLEAN' if (nb == 0 and nnm == 0) else 'NOT clean'}", flush=True)
+
+            # Localize overlaps: old = both endpoints < n_orig (geometry baked in
+            # from a previous cut), new = both >= n_orig (created by THIS cut),
+            # mixed = the junction between them. Tells us whether the overlaps
+            # sit on the previous wound, the fresh cut, or where they meet.
+            n_orig_c = int(getattr(self, '_full_n_orig', 0) or 0)
+            if nnm > 0 and n_orig_c > 0 and len(tri):
+                _e = np.concatenate([tri[:, [0, 1]], tri[:, [1, 2]],
+                                     tri[:, [0, 2]]], axis=0)
+                _e = np.sort(_e, axis=1)
+                _e = _e[_e[:, 0] != _e[:, 1]]
+                _ue, _c = np.unique(_e, axis=0, return_counts=True)
+                _nm = _ue[_c >= 3]
+                _old = (_nm < n_orig_c).all(axis=1)
+                _new = (_nm >= n_orig_c).all(axis=1)
+                _mix = ~_old & ~_new
+                print(f"[SurfProbe:{label}]  non-manifold location (n_orig="
+                      f"{n_orig_c:,}): old/prev-wound={int(_old.sum()):,}  "
+                      f"new/this-cut={int(_new.sum()):,}  junction={int(_mix.sum()):,}",
+                      flush=True)
+
+            # By position: weld coincident points, recount.
+            n_active = int(self._simulator.n_verts)
+            if len(tri) and int(tri.max()) < n_active:
+                P = self._simulator.positions.to_numpy()[:n_active]
+                bb = float(np.linalg.norm(P.max(0) - P.min(0))) or 1.0
+                tol = 1e-5 * bb
+                _, canon = np.unique(np.round(P / tol).astype(np.int64),
+                                     axis=0, return_inverse=True)
+                triw = canon[tri]
+                triw = triw[(triw[:, 0] != triw[:, 1])
+                            & (triw[:, 1] != triw[:, 2])
+                            & (triw[:, 0] != triw[:, 2])]
+                pe, pb, pnm = _stats(triw)
+                print(f"[SurfProbe:{label}]  BY POSITION(weld {tol:.1e}): edges={pe:,} "
+                      f"holes={pb:,} non-manifold={pnm:,} => "
+                      f"{'CLEAN' if (pb == 0 and pnm == 0) else 'NOT clean'}", flush=True)
+                try:
+                    from scipy.sparse import csr_matrix
+                    from scipy.sparse.csgraph import connected_components
+                    nv = int(triw.max()) + 1
+                    ew = np.sort(np.concatenate([triw[:, [0, 1]], triw[:, [1, 2]],
+                                                 triw[:, [0, 2]]], axis=0), axis=1)
+                    g = csr_matrix((np.ones(len(ew)), (ew[:, 0], ew[:, 1])),
+                                   shape=(nv, nv))
+                    _ncomp, lab = connected_components(g, directed=False)
+                    comp_of_tri = lab[triw[:, 0]]
+                    real, counts = np.unique(comp_of_tri, return_counts=True)
+                    print(f"[SurfProbe:{label}]  surface pieces={len(real)}",
+                          flush=True)
+                    for i in np.argsort(-counts):
+                        if counts[i] < 10:
+                            continue
+                        c = int(real[i])
+                        _, hbc, hnmc = _stats(triw[comp_of_tri == c])
+                        print(f"[SurfProbe:{label}]    piece{c}: {int(counts[i]):,} "
+                              f"tris holes={hbc:,} non-manifold={hnmc:,}", flush=True)
+                except Exception as _e2:
+                    print(f"[SurfProbe:{label}]  per-piece skipped ({_e2})", flush=True)
+        except Exception as _e:
+            print(f"[SurfProbe:{label}] skipped ({_e})", flush=True)
+
     def _bake_current_state(self) -> None:
         """
         Freeze the current live mesh as a fresh pristine mesh for the next
@@ -950,6 +1074,8 @@ class FEMMethod(SimulationMethod):
             print(f"[WeldProbe] skipped ({_e})", flush=True)
         # ---- end [WeldProbe] --------------------------------------------------
 
+        self._surface_manifold_probe("cut2-bake-start")
+
         # Which tets survive the bake into the new pristine mesh?
         #   - Active tets (W > 0) always: they are the live solid.
         #   - Resident-sliver path ALSO keeps sliver rows. Deleting slivers
@@ -1008,11 +1134,18 @@ class FEMMethod(SimulationMethod):
         # indices. This set becomes the next cut's orig_surf_set.
         cache = self._precomp_render_cache
         carried = set()
-        if _resident:
-            # Resident-sliver path: baked mesh is watertight, so the next cut's
-            # orig_surf_set is recomputed exactly. No carried snapshot; leave
-            # carried empty (-> _carried_surf_set = None below).
-            pass
+        # Fix (2026-08-13): on the resident path, carry cut-1's KNOWN-CLEAN drawn
+        # surface as the next cut's orig_surf_set, instead of recomputing it from
+        # the baked topology (which re-admits sliver faces and doubles cut-1's old
+        # wound -> the ~4,300 non-manifold overlaps). Resident deletes nothing
+        # (0 orphaned verts), so every drawn face remaps cleanly (no holes) and
+        # sliver faces are absent from the drawn set (no overlaps). A/B toggle:
+        # resident_carry_clean_surface (default True).
+        _carry_clean = (getattr(self, '_resident_carry_clean_surface', True)
+                        if _resident else True)
+        if _resident and not _carry_clean:
+            print("[ResidentBake] legacy mode: recompute orig_surf_set from "
+                  "baked topology (no carried snapshot)", flush=True)
         elif cache is not None and self._split_mask is not None:
             face_verts   = cache['face_verts'].astype(np.int64)
             face_key_idx = cache['face_key_idx']
@@ -1054,8 +1187,14 @@ class FEMMethod(SimulationMethod):
             # class: they are shared with nothing, sliver or otherwise. That
             # ownership information exists only at bake time; after the bake
             # both kinds are identical all-ORIG count==1 faces.
+            # Replacement-face patch is only for the CARRIED (non-resident) path,
+            # which deletes slivers and loses their verts. Resident keeps all
+            # verts, so the drawn surface is already complete -- adding these
+            # would re-introduce the wound overlaps.
             _sslots = getattr(self, '_sliver_slots', None)
-            if _sslots is not None and len(_sslots) > 0:
+            if (getattr(self, '_bake_add_replacement_faces', True)
+                    and not _resident
+                    and _sslots is not None and len(_sslots) > 0):
                 _COMBOS = np.array([[0, 1, 2], [0, 1, 3],
                                     [0, 2, 3], [1, 2, 3]], dtype=np.int64)
                 def _face_keys_of(tet_arr):
@@ -1181,6 +1320,8 @@ class FEMMethod(SimulationMethod):
         return tuple(r)
 
     def setup_cut(self, cut_normal, cut_origin, blade_travel_dir) -> bool:
+        # Sequential cut counter (used only to label the surface probe).
+        self._cut_index = getattr(self, '_cut_index', 0) + 1
         # If a previous progressive cut set up the superset layout, bake
         # the current live mesh as a fresh pristine mesh before running the
         # new cut. Without this, _cut_topology_physics would run on the
@@ -2043,6 +2184,98 @@ class FEMMethod(SimulationMethod):
         n_orig = self._full_n_orig
         has_new_vert = (super_tets >= n_orig).any(axis=1)
         is_sliver = has_new_vert & (vols < _thresh) if _thresh > 0.0 else np.zeros(len(super_tets), dtype=bool)
+
+        # ---- [SnapProbe] diagnostic (MEASUREMENT ONLY -- no behavior change) ---
+        # Option-1 groundwork. Slivers are born when the cut plane passes very
+        # close to an existing vertex: the edge intersections land almost on top
+        # of that vertex, so a split sub-tet collapses to ~0 volume. Measure, per
+        # crossing tet, the closest plane->vertex approach (min |signed_dist|,
+        # as a fraction of mesh size), split by whether that tet actually spawned
+        # a sliver. If slivers pile up at tiny approaches and clean tets sit
+        # higher, a snap threshold lives in the gap, and snapping the plane onto
+        # those near vertices would kill the slivers at the source. Also report
+        # how many vertices each candidate threshold would snap (the cost).
+        try:
+            if _thresh > 0.0 and getattr(self, '_cut_normal', None) is not None:
+                _pos_o = v[:int(n_orig)].astype(np.float64)
+                _nrm   = np.asarray(self._cut_normal, dtype=np.float64)
+                _nrm   = _nrm / (np.linalg.norm(_nrm) or 1.0)
+                _sd    = (_pos_o - np.asarray(self._cut_origin, dtype=np.float64)) @ _nrm
+                _bb    = float(np.linalg.norm(_pos_o.max(0) - _pos_o.min(0))) or 1.0
+                _cmask = np.asarray(self._crossing_mask, dtype=bool)
+                _cpids = np.where(_cmask)[0].astype(np.int64)
+                _ctets = self._pristine_tets[_cmask].astype(np.int64)
+                _minabs = np.abs(_sd[_ctets]).min(axis=1) / _bb   # per crossing tet
+                # crossing pristine tets that produced a fresh sliver sub-tet
+                _fb_sliver = has_new_vert[:n_full_tets] & (vols[:n_full_tets] < _thresh)
+                _fb_parent = np.asarray(self._full_all_tets_parent, dtype=np.int64)
+                _sliver_pids = np.unique(_fb_parent[_fb_sliver])
+                _prod = np.isin(_cpids, _sliver_pids)
+                _edges = np.array([0, 1e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e9])
+                _lbl = ['0', '1e-5', '1e-4', '3e-4', '1e-3', '3e-3', '1e-2', '3e-2', 'inf']
+                def _sh(mask, name):
+                    g = _minabs[mask]
+                    if len(g) == 0:
+                        print(f"[SnapProbe] {name:9s} n=0", flush=True)
+                        return
+                    h = np.histogram(g, bins=_edges)[0]
+                    cells = "  ".join(f"[{_lbl[k]},{_lbl[k+1]}):{int(h[k])}"
+                                      for k in range(len(h)))
+                    print(f"[SnapProbe] {name:9s} n={len(g):<6d} {cells}", flush=True)
+                print(f"[SnapProbe] closest plane->vertex approach per crossing tet "
+                      f"(fraction of bbox diag={_bb:.4f}); vol_threshold={_thresh:.1e}",
+                      flush=True)
+                print(f"[SnapProbe] crossing tets={len(_cpids):,}  "
+                      f"produced-sliver={int(_prod.sum()):,}  "
+                      f"clean={int((~_prod).sum()):,}", flush=True)
+                _sh(_prod,  "SLIVER")
+                _sh(~_prod, "clean")
+                for _thr in (1e-4, 3e-4, 1e-3, 3e-3):
+                    _nsnap = int(((np.abs(_sd) / _bb) < _thr).sum())
+                    _cov = (float((_minabs[_prod] < _thr).mean()) * 100.0
+                            if _prod.any() else 0.0)
+                    print(f"[SnapProbe]   thr={_thr:.0e}*scale: verts_to_snap={_nsnap:,}"
+                          f"  sliver-tets_with_a_vert_that_close={_cov:.1f}%", flush=True)
+
+                # Local-size normalization: whether a split makes a sliver depends
+                # on the plane's approach RELATIVE TO THAT TET's own size, not the
+                # whole mesh. Divide the per-tet approach by the tet's characteristic
+                # length (cbrt of its volume). If slivers now separate from clean
+                # tets, a local snap threshold works; if clean tets get disturbed
+                # just as much, snapping alone cannot separate them.
+                _ct = _ctets
+                _e1 = _pos_o[_ct[:, 1]] - _pos_o[_ct[:, 0]]
+                _e2 = _pos_o[_ct[:, 2]] - _pos_o[_ct[:, 0]]
+                _e3 = _pos_o[_ct[:, 3]] - _pos_o[_ct[:, 0]]
+                _Vp = np.abs(np.einsum('ij,ij->i', _e1, np.cross(_e2, _e3))) / 6.0
+                _Lp = np.cbrt(np.maximum(_Vp, 1e-30))
+                _locapp = np.abs(_sd[_ct]).min(axis=1) / np.maximum(_Lp, 1e-30)
+                _ledges = np.array([0, 0.01, 0.03, 0.1, 0.2, 0.3, 0.5, 1.0, 1e9])
+                _llbl = ['0', '.01', '.03', '.1', '.2', '.3', '.5', '1', 'inf']
+                def _lsh(mask, name):
+                    g = _locapp[mask]
+                    if len(g) == 0:
+                        print(f"[SnapProbe-L] {name:9s} n=0", flush=True)
+                        return
+                    h = np.histogram(g, bins=_ledges)[0]
+                    cells = "  ".join(f"[{_llbl[k]},{_llbl[k+1]}):{int(h[k])}"
+                                      for k in range(len(h)))
+                    print(f"[SnapProbe-L] {name:9s} n={len(g):<6d} {cells}", flush=True)
+                print(f"[SnapProbe-L] plane->vertex approach RELATIVE TO each tet's "
+                      f"own size (units = fraction of cbrt(tet volume))", flush=True)
+                _lsh(_prod,  "SLIVER")
+                _lsh(~_prod, "clean")
+                for _t in (0.05, 0.10, 0.20, 0.30):
+                    _cov = (float((_locapp[_prod] < _t).mean()) * 100.0
+                            if _prod.any() else 0.0)
+                    _dist = (float((_locapp[~_prod] < _t).mean()) * 100.0
+                             if (~_prod).any() else 0.0)
+                    print(f"[SnapProbe-L]   local thr={_t:.2f}*tetsize: "
+                          f"slivers_caught={_cov:.1f}%  clean_tets_disturbed={_dist:.1f}%",
+                          flush=True)
+        except Exception as _e:
+            print(f"[SnapProbe] skipped ({_e})", flush=True)
+        # ---- end [SnapProbe] --------------------------------------------------
 
         # Resident-sliver path: slivers carried across a previous bake are
         # degenerate but now all-ORIG in this cut's pristine mesh, so the

@@ -1401,6 +1401,14 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
         print(f"[Blade] Cut complete — {n_broken:,} seam springs broken. "
               f"Press B (with a new cut plane) to start another cut.")
 
+        # Sanity-check the surface on the KNOWN-GOOD state, the instant cut 1
+        # finishes (measurement only). If this reports NOT clean here, the probe
+        # itself is suspect; if CLEAN here but dirty at bake, the bake is where
+        # the holes appear.
+        _probe = getattr(comp.method, '_surface_manifold_probe', None)
+        if callable(_probe):
+            _probe(f"cut{getattr(comp.method, '_cut_index', 1)}-complete")
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers

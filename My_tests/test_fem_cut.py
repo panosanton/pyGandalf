@@ -107,6 +107,14 @@ def main():
                              'bake so the baked surface stays watertight, instead of the '
                              'legacy carried-surface snapshot. A/B toggle for the missing-'
                              'faces fix.')
+    parser.add_argument('--no-bake-replacement', action='store_true', default=False,
+                        help='Diagnostic: skip the sliver replacement-face patch in the '
+                             'carried-surface bake, to test whether it is the source of '
+                             'the post-cut-2 overlapping (non-manifold) faces.')
+    parser.add_argument('--resident-legacy-surf', action='store_true', default=False,
+                        help='A/B: on the resident path, recompute orig_surf_set from '
+                             'baked topology (old behavior, doubles the old wound) instead '
+                             'of carrying cut-1 clean surface (the fix).')
     args = parser.parse_args()
 
     mesh_name    = args.mesh
@@ -208,6 +216,8 @@ def main():
                                           # resident across a bake (watertight
                                           # surface) vs. legacy carried-surface.
                                           resident_sliver_bake=args.resident_sliver_bake,
+                                          bake_add_replacement_faces=not args.no_bake_replacement,
+                                          resident_carry_clean_surface=not args.resident_legacy_surf,
                                           # Set True to render dropped faces in
                                           # classification colors for pick-based
                                           # inspection (magenta = pure-orig,
