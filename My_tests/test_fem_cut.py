@@ -115,6 +115,14 @@ def main():
                         help='A/B: on the resident path, recompute orig_surf_set from '
                              'baked topology (old behavior, doubles the old wound) instead '
                              'of carrying cut-1 clean surface (the fix).')
+    parser.add_argument('--debug-show-dropped', action='store_true', default=False,
+                        help='Render dropped faces in classification colors (magenta='
+                             'pure-orig, cyan=collar-recon, orange=phantom-collar) so the '
+                             'holes fill with pickable, color-coded faces. Ctrl+click a '
+                             'face to dump its provenance + bake history.')
+    parser.add_argument('--trace-orphan', type=int, default=-1, metavar='VERT_ID',
+                        help='Print the full master-picking decision trail for this orphan '
+                             'vertex id (from the pick tool) during cut setup.')
     args = parser.parse_args()
 
     mesh_name    = args.mesh
@@ -222,7 +230,8 @@ def main():
                                           # classification colors for pick-based
                                           # inspection (magenta = pure-orig,
                                           # cyan = collar-recon, orange = phantom-collar).
-                                          debug_show_dropped=False),
+                                          debug_show_dropped=args.debug_show_dropped,
+                                          trace_orphan_id=args.trace_orphan),
     )
     # FEM material params — passed through to FEMMethod.initialize() via _sim_params
     taichi_comp.stiffness = 200.0   # reused as cutting spring k

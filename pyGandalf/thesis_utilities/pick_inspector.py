@@ -365,7 +365,22 @@ def _dump_vertex_states(comp, vert_indices, n_orig=None, n_split=None):
     sr = getattr(sim, '_sr', None)
     sk = getattr(sim, '_sk', None)
 
-    orphan_map = getattr(comp.method, '_orphan_constraints', {}) or {}
+    # Orphan slaving: the OLD (spring-mass) path stores a dict in
+    # _orphan_constraints; the PROGRESSIVE FEM path stores parallel arrays
+    # (_orphan_ids / _orphan_masters / _orphan_offsets). Merge both so the
+    # half-check below fires regardless of path.
+    orphan_map = dict(getattr(comp.method, '_orphan_constraints', {}) or {})
+    _oids = getattr(comp.method, '_orphan_ids', None)
+    _omas = getattr(comp.method, '_orphan_masters', None)
+    _offs = getattr(comp.method, '_orphan_offsets', None)
+    if _oids is not None and len(_oids) > 0 and _omas is not None:
+        for i in range(len(_oids)):
+            oid = int(_oids[i])
+            if oid in orphan_map:
+                continue
+            off = (_offs[i] if _offs is not None and i < len(_offs)
+                   else np.zeros(3, dtype=np.float32))
+            orphan_map[oid] = (int(_omas[i]), off)
 
     print(f"[Pick] Per-vertex state:")
     for v in sorted(vert_indices):

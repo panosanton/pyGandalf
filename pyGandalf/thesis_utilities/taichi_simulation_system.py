@@ -892,6 +892,26 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
         if inward.any():
             outer_faces[inward] = outer_faces[inward][:, [0, 2, 1]]
 
+    # -- Winding correction on wound faces (same rule as outer) --
+    # Without this the wound keeps its raw split winding, which points INWARD
+    # (toward the parent tet's interior vertex), so the cut surface renders dark.
+    # Orient each wound face away from its 4th vertex: the above-half wound then
+    # faces down into the gap and the below-half wound faces up -- both outward,
+    # away from their own material. This matches what the baked/standard surface
+    # path already does (why a previous cut's wound lights up after a bake).
+    if len(wound_faces) > 0:
+        wound_faces = wound_faces.copy()
+        w_fourth = face_fourth[wound_rows]
+        wv0 = final_pos[wound_faces[:, 0]]
+        wv1 = final_pos[wound_faces[:, 1]]
+        wv2 = final_pos[wound_faces[:, 2]]
+        wfp = final_pos[w_fourth]
+        w_face_n    = np.cross(wv1 - wv0, wv2 - wv0)
+        w_to_fourth = wfp - (wv0 + wv1 + wv2) / 3.0
+        w_inward    = np.einsum('ij,ij->i', w_face_n, w_to_fourth) > 0
+        if w_inward.any():
+            wound_faces[w_inward] = wound_faces[w_inward][:, [0, 2, 1]]
+
     _rr_t_wind = time.perf_counter() - _rr_t1
     _rr_t2 = time.perf_counter()
 

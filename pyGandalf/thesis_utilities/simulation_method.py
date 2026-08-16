@@ -589,6 +589,11 @@ class FEMMethod(SimulationMethod):
         # (recompute from baked topology). A/B via --resident-legacy-surf.
         self._resident_carry_clean_surface = bool(
             overrides.get('resident_carry_clean_surface', True))
+        # Render dropped faces in classification colors (for pick inspection).
+        # Read from the constructor override OR _params (component params).
+        self._debug_show_dropped = bool(overrides.get('debug_show_dropped', False))
+        # Print the master-picking decision trail for one orphan vertex id.
+        self._trace_orphan_id = int(overrides.get('trace_orphan_id', -1))
         self._pristine_tets       = None   # (n_tets, 4) pre-cut tet array; input to per-frame split
         self._pristine_n_orig     = None   # pristine vertex count (never changes after initialize)
         self._carried_surf_set    = None   # visible-surface triples snapshotted at bake; overrides orig_surf_set for the next cut (carried-surface path only)
@@ -665,7 +670,11 @@ class FEMMethod(SimulationMethod):
         (default 10x). Prints the top 5 offenders each frame the threshold
         is exceeded, with vertex classification (PRISTINE / INTER / DUP)
         and connected seam info when relevant.
+
+        Disabled -- kept for on-demand re-enable; the [VelDebug] spam was
+        drowning out the pick/probe output.
         """
+        return
         if not self._progressive_cut:
             return
         opening_speed = float(self._params.get('opening_speed', 1.0))
@@ -907,7 +916,15 @@ class FEMMethod(SimulationMethod):
             ractive = (~fpc) | (psplit == faws)
             kc = np.bincount(fki[ractive], minlength=cache['n_unique_keys'])
             boundary_rows = ractive & (kc == 1)[fki]
-            drawn = boundary_rows & (fver != 2)        # OUTER or WOUND only
+            freason = cache.get('face_dropped_reason')
+            # KEPT surface = what NORMAL mode actually draws. Exclude dropped
+            # faces via face_dropped_reason so the result is identical whether or
+            # not --debug-show-dropped is on (that flag keeps dropped faces'
+            # OUTER/WOUND verdict, which would otherwise inflate this set).
+            if freason is not None:
+                drawn = boundary_rows & (fver != 2) & (freason == 0)
+            else:
+                drawn = boundary_rows & (fver != 2)   # OUTER or WOUND only
             tri = fv[drawn]
             nO = int((fver[drawn] == 0).sum())
             nW = int((fver[drawn] == 1).sum())
@@ -929,6 +946,18 @@ class FEMMethod(SimulationMethod):
             print(f"[SurfProbe:{label}]  BY VERTEX-NUMBER: edges={ne:,} "
                   f"holes={nb:,} non-manifold={nnm:,} => "
                   f"{'CLEAN' if (nb == 0 and nnm == 0) else 'NOT clean'}", flush=True)
+
+            # Decisive: would the surface close up if the DROPPED faces were kept?
+            # If holes ~0 here, the kept-surface holes are simply wrongly-dropped
+            # faces (fix = stop dropping / include them in the carried surface).
+            # If holes remain, some geometry is genuinely missing.
+            if freason is not None:
+                _shown = boundary_rows & ((fver != 2) | (freason != 0))
+                _se, _sb, _snm = _stats(fv[_shown])
+                print(f"[SurfProbe:{label}]  KEPT+DROPPED: tris={int(_shown.sum()):,} "
+                      f"holes={_sb:,} non-manifold={_snm:,}  "
+                      f"(holes~0 => the {nb:,} kept-holes are wrongly-dropped faces)",
+                      flush=True)
 
             # Localize overlaps: old = both endpoints < n_orig (geometry baked in
             # from a previous cut), new = both >= n_orig (created by THIS cut),
@@ -1224,7 +1253,9 @@ class FEMMethod(SimulationMethod):
         # make the carried set (cut-N face rows + verdicts, owner tets,
         # sliver flags). Guarded by the flag -- this holds the whole cut-N
         # face table alive across the bake.
-        if bool(self._params.get('debug_show_dropped', False)) and cache is not None:
+        if (bool(self._params.get('debug_show_dropped', False)
+                 or getattr(self, '_debug_show_dropped', False))
+                and cache is not None):
             _ss_dbg = getattr(self, '_sliver_slots', None)
             self._bake_debug = {
                 'used_verts':     used_verts.copy(),   # baked idx -> cut-N superset idx
@@ -2392,13 +2423,13 @@ class FEMMethod(SimulationMethod):
             vi_match    = (vi_side == orphan_side)
             vj_match    = (vj_side == orphan_side)
 
-            # geom_side is still needed for the kd-tree fallback pool, so
-            # keep computing it. Pool membership is "physically above/below
-            # pristine plane" which is the natural geometric definition.
-            n_p = int(self._pristine_n_orig)
-            pristine_pos = self._full_final_pos[:n_p]
-            geom_dot = (pristine_pos - self._cut_origin) @ self._cut_normal
-            geom_side = np.sign(geom_dot).astype(np.int8)
+            # FIX (stuck-flake bug): the fallback pool below uses side_label (the
+            # side each vert is physically moved with), NOT the raw geometric sign
+            # of pristine distance. For a near-plane ORIG the geometric sign is
+            # float noise -- a vert with side_label=+1 but pristine dist ~-1e-5
+            # lands in the BELOW pool and gets slaved to a below orphan, dragging
+            # it across the cut. (Confirmed via --trace-orphan: orphan 45969
+            # [side -1] was mastered to 35707 [side_label +1, pristine ~-0.0].)
 
             # Orphan-vert set for exclusion from master pools. Prevents
             # orphan-to-orphan slaving chains where an orphan A masters to
@@ -2421,15 +2452,14 @@ class FEMMethod(SimulationMethod):
 
             neither_matches = ~vi_match & ~vj_match
             if neither_matches.any():
-                # Master pool: same-side ORIGs (by pristine geometry) PLUS
-                # non-orphan DUPs (side_label = -1 by construction).
-                #   Above pool: ORIGs with geom_side > 0, NOT orphans.
-                #   Below pool: ORIGs with geom_side < 0 + non-orphan DUPs.
-                # Matches one-shot's `_is_dup | (_is_orig & side<0)` selection.
+                # Master pool: same-side ORIGs by SIDE_LABEL (the physics side)
+                # PLUS non-orphan DUPs (side_label = -1 by construction).
+                #   Above pool: ORIGs with side_label > 0, NOT orphans.
+                #   Below pool: ORIGs with side_label < 0 + non-orphan DUPs.
                 above_pool_mask = np.zeros(n_full_v, dtype=bool)
-                above_pool_mask[:n_orig] = (geom_side > 0) & (~orphan_bool[:n_orig])
+                above_pool_mask[:n_orig] = (side_label[:n_orig] > 0) & (~orphan_bool[:n_orig])
                 below_pool_mask = np.zeros(n_full_v, dtype=bool)
-                below_pool_mask[:n_orig] = (geom_side < 0) & (~orphan_bool[:n_orig])
+                below_pool_mask[:n_orig] = (side_label[:n_orig] < 0) & (~orphan_bool[:n_orig])
                 # DUPs are side_label = -1 by construction (below half).
                 dup_start = self._full_n_split
                 dup_end   = dup_start + len(self._full_shared_arr)
@@ -2471,6 +2501,8 @@ class FEMMethod(SimulationMethod):
             # just that orphan. Off by default (-1). Left in place instead
             # of removed so it can be re-enabled without patching.
             _TRACE_ORPHAN_ID = int(self._params.get('trace_orphan_id', -1))
+            if _TRACE_ORPHAN_ID < 0:
+                _TRACE_ORPHAN_ID = int(getattr(self, '_trace_orphan_id', -1))
             if _TRACE_ORPHAN_ID >= 0:
                 _pos = np.where(orphan_ids == _TRACE_ORPHAN_ID)[0]
                 if len(_pos) == 1:
@@ -2708,7 +2740,8 @@ class FEMMethod(SimulationMethod):
         #   magenta = pure_orig_drop (not in orig_surf / carried set)
         #   cyan    = collar_recon_drop (reconstruction not in surf set)
         #   orange  = phantom_collar_drop (off-plane vert not on surface)
-        _dbg_show_dropped = bool(self._params.get('debug_show_dropped', False))
+        _dbg_show_dropped = bool(self._params.get('debug_show_dropped', False)
+                                 or getattr(self, '_debug_show_dropped', False))
         if not _dbg_show_dropped:
             face_verdict[face_dropped_reason != REASON_NONE] = VERDICT_DROP
 
