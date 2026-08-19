@@ -465,6 +465,19 @@ class TaichiSimulationSystem(System):
             ti.profiler.print_kernel_profiler_info()
         self._l_prev = l_now
 
+        # --- J key: on-demand INTER off-plane scan (fly-off diagnosis) ---
+        # The stretched tet keeps moving for ~2s after the cut, so the auto scan at
+        # cut-complete is too early. Press J once the motion settles to catch the
+        # diverged state. MEASUREMENT ONLY.
+        j_now = InputManager().get_key_down(glfw.KEY_J)
+        if j_now and not getattr(self, '_j_prev', False):
+            _ip = getattr(comp.method, '_inter_offplane_probe', None)
+            if callable(_ip):
+                _ip(f"cut{getattr(comp.method, '_cut_index', 1)}-settled(J)")
+            else:
+                print("[InterProbe] not available (no cut yet?)")
+        self._j_prev = j_now
+
         # --- Ctrl + Left click : pick face + parent tet, dump info ---
         # --- Ctrl + Right click: clear highlight ---
         ctrl_held  = InputManager().get_key_down(glfw.KEY_LEFT_CONTROL)
@@ -498,7 +511,9 @@ class TaichiSimulationSystem(System):
                 comp.method.step(comp.time_step)
                 ti.sync()
                 _dt = time.perf_counter() - _t
-                print(f"[STEP] post-cut step #{6 - _n}: {_dt*1000:.1f} ms", flush=True)
+                # [STEP] post-cut step timing (commented out to reduce noise;
+                # uncomment to profile the first post-cut steps).
+                # print(f"[STEP] post-cut step #{6 - _n}: {_dt*1000:.1f} ms", flush=True)
                 comp._step_timing_left = _n - 1
             else:
                 comp.method.step(comp.time_step)
@@ -580,17 +595,19 @@ class TaichiSimulationSystem(System):
             ti.sync()  # ensure all GPU work up to here is done, for honest timings
             t_end = time.perf_counter()
             blade_ms = (t_blade1 - t_blade0) * 1000
-            print(
-                f"[Frame {self._fc:4d}] "
-                f"blade {blade_ms:5.1f}ms | "
-                f"sim {(t1-t0)*1000:5.1f}ms | "
-                f"readback {(t2-t1)*1000:4.1f}ms | "
-                f"normals {(t3-t2)*1000:4.1f}ms | "
-                f"vbo_upload {(t4-t3)*1000:4.1f}ms | "
-                f"gpu_sync {(t_end-t4)*1000:4.1f}ms | "
-                f"frame_total {(t_end-t_blade0)*1000:5.1f}ms",
-                flush=True,
-            )
+            # [Frame N] per-10-frames timing (commented out to reduce noise;
+            # uncomment to profile the interactive frame breakdown).
+            # print(
+            #     f"[Frame {self._fc:4d}] "
+            #     f"blade {blade_ms:5.1f}ms | "
+            #     f"sim {(t1-t0)*1000:5.1f}ms | "
+            #     f"readback {(t2-t1)*1000:4.1f}ms | "
+            #     f"normals {(t3-t2)*1000:4.1f}ms | "
+            #     f"vbo_upload {(t4-t3)*1000:4.1f}ms | "
+            #     f"gpu_sync {(t_end-t4)*1000:4.1f}ms | "
+            #     f"frame_total {(t_end-t_blade0)*1000:5.1f}ms",
+            #     flush=True,
+            # )
 
 
 # ---------------------------------------------------------------------------
@@ -876,6 +893,26 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
     outer_faces = face_verts[outer_rows].copy()  # (n_outer, 3) uint32
     wound_faces = face_verts[wound_rows]         # (n_wound, 3) uint32
 
+    # Old-wound flat-shade (keep the rim crease across a bake). Faces that were a
+    # previous cut's wound arrive here classified OUTER (all-orig now). When the
+    # flag is on we (a) exclude them from the outer smooth-normal pass so the
+    # collar rim regains clean surface normals, and (b) stamp flat per-face
+    # normals on their slots below. old_wound_in_outer is a bool over outer_faces.
+    _face_is_old_wound = cache.get('face_is_old_wound')
+    _flat_old = bool(getattr(method, '_flat_old_wound', False)
+                     and _face_is_old_wound is not None
+                     and _face_is_old_wound[outer_rows].any())
+    old_wound_in_outer = _face_is_old_wound[outer_rows] if _flat_old else None
+    if getattr(method, '_flat_old_wound', False):
+        _fdc = getattr(comp, '_flatdbg_frame', 0)
+        if _fdc % 120 == 0:
+            print(f"[FlatOldWound] render: _flat_old={_flat_old}  "
+                  f"has_mask={_face_is_old_wound is not None}  "
+                  f"n_outer={len(outer_rows)}  "
+                  f"old_in_outer={0 if old_wound_in_outer is None else int(old_wound_in_outer.sum())}",
+                  flush=True)
+        comp._flatdbg_frame = _fdc + 1
+
     _rr_t_boundary = time.perf_counter() - _rr_t0
     _rr_t1 = time.perf_counter()
 
@@ -994,8 +1031,13 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
     _rr_t_class = time.perf_counter() - _rr_t2
     _rr_t3 = time.perf_counter()
 
-    # Normals + expanded buffers.
-    new_normals = _compute_normals_post_cut(render_pos, comp.surface_indices,
+    # Normals + expanded buffers. When flat-shading old wound, exclude those
+    # faces from the smooth-normal pass so the surrounding collar rim is not
+    # averaged toward the flat disc (that averaging is what smooths the crease).
+    _normals_faces = comp.surface_indices
+    if _flat_old:
+        _normals_faces = outer_faces[~old_wound_in_outer]
+    new_normals = _compute_normals_post_cut(render_pos, _normals_faces,
                                             n_orig, n_split, inter_data, shared_list, normal)
 
     flat_all   = all_render_faces.flatten()
@@ -1008,6 +1050,30 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
         n_orig=n_orig, n_split=n_split, n_phys=len(final_pos),
         disc_split_phys_idx=comp._disc_split_phys_idx,
         cut_normal=normal)
+
+    # Flat-shade old-wound faces: stamp each face's own geometric normal onto its
+    # three (outer-section) slots. outer_faces were already winding-corrected
+    # outward, so the flat normal points into the old gap, matching the live cut.
+    if _flat_old:
+        _ow  = np.where(old_wound_in_outer)[0]           # indices within outer_faces
+        _owf = outer_faces[_ow]
+        _v0 = render_pos[_owf[:, 0]]
+        _v1 = render_pos[_owf[:, 1]]
+        _v2 = render_pos[_owf[:, 2]]
+        _fn = np.cross(_v1 - _v0, _v2 - _v0)
+        _fn = _fn / (np.linalg.norm(_fn, axis=1, keepdims=True) + 1e-12)
+        _slots = (_ow[:, None] * 3 + np.array([0, 1, 2])[None, :]).ravel()
+        _newn = np.repeat(_fn.astype(exp_norm.dtype), 3, axis=0)
+        if getattr(comp, '_flatdbg_frame', 0) % 120 == 1:
+            _oldn = exp_norm[_slots]
+            _zero = int((np.linalg.norm(_oldn, axis=1) < 1e-6).sum())
+            _dot  = float(np.abs(np.einsum('ij,ij->i', _oldn, _newn)).mean())
+            print(f"[FlatOldWound] overwrote {len(_slots)} old-wound slots  "
+                  f"zero_before={_zero}  mean|dot(old,new)|={_dot:.3f} "
+                  f"(1.0 => flat normal already equals smooth => no visible change)",
+                  flush=True)
+        exp_norm[_slots] = _newn
+
     exp_tex    = np.zeros((len(all_render_faces) * 3, 2), dtype=np.float32)
     exp_colors = np.repeat(face_colors, 3, axis=0)
 
@@ -1023,15 +1089,17 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
     _rr_t_gl = time.perf_counter() - _rr_t4
     _rr_total = time.perf_counter() - _rr_t0
 
-    print(f"[RenderTiming/fast] total={_rr_total*1000:.1f}ms  "
-          f"boundary={_rr_t_boundary*1000:.1f}  "
-          f"wind={_rr_t_wind*1000:.1f}  "
-          f"class={_rr_t_class*1000:.1f}  "
-          f"norm={_rr_t_norm*1000:.1f}  "
-          f"gl_upload={_rr_t_gl*1000:.1f}  "
-          f"n_active_rows={int(row_active_all.sum()):,}  "
-          f"n_faces={n_all_faces:,}",
-          flush=True)
+    # [RenderTiming/fast] per-frame render timing (commented out to reduce noise;
+    # uncomment to profile the fast render rebuild).
+    # print(f"[RenderTiming/fast] total={_rr_total*1000:.1f}ms  "
+    #       f"boundary={_rr_t_boundary*1000:.1f}  "
+    #       f"wind={_rr_t_wind*1000:.1f}  "
+    #       f"class={_rr_t_class*1000:.1f}  "
+    #       f"norm={_rr_t_norm*1000:.1f}  "
+    #       f"gl_upload={_rr_t_gl*1000:.1f}  "
+    #       f"n_active_rows={int(row_active_all.sum()):,}  "
+    #       f"n_faces={n_all_faces:,}",
+    #       flush=True)
 
     comp._rendered_topology_version = int(method._topology_version)
 
@@ -1357,10 +1425,12 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
         finally:
             taichi_cut_utils._QUIET_CUT_LOGS = False
         _render_dt = time.perf_counter() - _render_t0
-        print(f"[AdvTiming] advance_blade={_adv_dt*1000:.1f}ms  "
-              f"render_rebuild={_render_dt*1000:.1f}ms  "
-              f"total={( _adv_dt + _render_dt)*1000:.1f}ms",
-              flush=True)
+        # [AdvTiming] per-frame timing print (commented out to reduce noise;
+        # uncomment to profile the blade advance / render rebuild).
+        # print(f"[AdvTiming] advance_blade={_adv_dt*1000:.1f}ms  "
+        #       f"render_rebuild={_render_dt*1000:.1f}ms  "
+        #       f"total={( _adv_dt + _render_dt)*1000:.1f}ms",
+        #       flush=True)
 
     # --- Reveal wound faces behind the cursor ---
     ptr = comp._wound_face_ptr
@@ -1428,6 +1498,12 @@ def _advance_progressive_blade(comp: TaichiSimulationComponent,
         _probe = getattr(comp.method, '_surface_manifold_probe', None)
         if callable(_probe):
             _probe(f"cut{getattr(comp.method, '_cut_index', 1)}-complete")
+        # Off-plane INTER-vertex scan (stretched/flown-tet diagnosis). MEASUREMENT
+        # ONLY. Every INTER vert must sit on the cut plane; any offender is the
+        # cause of a stretched/flown sliver.
+        _iprobe = getattr(comp.method, '_inter_offplane_probe', None)
+        if callable(_iprobe):
+            _iprobe(f"cut{getattr(comp.method, '_cut_index', 1)}-complete")
 
 
 # ---------------------------------------------------------------------------

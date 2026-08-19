@@ -594,9 +594,13 @@ class FEMMethod(SimulationMethod):
         self._debug_show_dropped = bool(overrides.get('debug_show_dropped', False))
         # Print the master-picking decision trail for one orphan vertex id.
         self._trace_orphan_id = int(overrides.get('trace_orphan_id', -1))
+        # Flat-shade a previous cut's wound after a bake, keeping the rim crease
+        # that would otherwise smooth out. Render-only. Off by default.
+        self._flat_old_wound = bool(overrides.get('flat_old_wound', False))
         self._pristine_tets       = None   # (n_tets, 4) pre-cut tet array; input to per-frame split
         self._pristine_n_orig     = None   # pristine vertex count (never changes after initialize)
         self._carried_surf_set    = None   # visible-surface triples snapshotted at bake; overrides orig_surf_set for the next cut (carried-surface path only)
+        self._carried_wound_set   = None   # wound(disc) triples snapshotted at bake; the next cut's render flat-shades these to keep the rim crease
         # bool mask over pristine tets: True = a resident sliver carried across a
         # bake, permanently physics-inert on every subsequent cut (resident path).
         self._persistent_inert_pristine = None
@@ -1020,6 +1024,160 @@ class FEMMethod(SimulationMethod):
         except Exception as _e:
             print(f"[SurfProbe:{label}] skipped ({_e})", flush=True)
 
+    def _inter_offplane_probe(self, label: str) -> None:
+        """
+        MEASUREMENT ONLY. Every INTER vertex is an edge/plane crossing, so it MUST
+        lie on the current cut plane (signed dist ~ 0). This scans all INTER verts
+        (self._full_inter_data) and reports any sitting off the plane -- the
+        stretched/flown-tet symptom. For each offender it distinguishes:
+          - CREATION-side pos  = self._full_final_pos[nid] (numpy split output)
+          - LIVE  pos          = simulator.positions[nid] (current GPU state)
+        If CREATION is already off-plane  -> the split lerp used dists inconsistent
+          with the positions (creation bug). If CREATION on-plane but LIVE off ->
+          the value was overwritten / not uploaded / moved after creation.
+        Wrapped so it can never affect the run.
+        """
+        try:
+            inter = getattr(self, '_full_inter_data', None)
+            if not inter or self._cut_normal is None:
+                return
+            nrm = np.asarray(self._cut_normal, dtype=np.float64)
+            org = np.asarray(self._cut_origin, dtype=np.float64)
+            cpos = np.asarray(self._full_final_pos, dtype=np.float64)  # creation
+            n_active = int(self._simulator.n_verts)
+            live = self._simulator.positions.to_numpy()[:n_active].astype(np.float64)
+            try:
+                vlive = self._simulator.velocities.to_numpy()[:n_active].astype(np.float64)
+            except Exception:
+                vlive = None
+            nids = np.array([int(d[0]) for d in inter], dtype=np.int64)
+            in_rng = nids < n_active
+            nids = nids[in_rng]
+            ad = np.abs((live[nids] - org) @ nrm)
+            # The bulk of off-plane INTER verts is just the cut OPENING (a coherent
+            # block ~opening distance). The stretched/flown-tet bug is an INTER vert
+            # flung FAR beyond that block. Report the distribution, then flag only
+            # extreme outliers (> max(1.5, 6x median)), which skip the opening noise.
+            med = float(np.median(ad)) if len(ad) else 0.0
+            p95 = float(np.percentile(ad, 95)) if len(ad) else 0.0
+            thr = max(1.5, 6.0 * med)
+            extreme = np.where(ad > thr)[0]
+            print(f"[InterProbe:{label}] {len(nids):,} INTER verts | "
+                  f"|d| median={med:.3f} p95={p95:.3f} max={float(ad.max()) if len(ad) else 0:.3f} "
+                  f"| outliers(>{thr:.2f})={len(extreme):,}", flush=True)
+            if len(extreme) == 0:
+                print(f"[InterProbe:{label}]   no extreme outliers -- only normal "
+                      f"opening this run (no fly-off captured)", flush=True)
+                return
+            imap = {int(d[0]): (int(d[1]), int(d[2]), float(d[3])) for d in inter}
+            tets = np.asarray(getattr(self, '_full_all_tets', np.empty((0, 4))),
+                              dtype=np.int64)
+            # Per-tet activity: W>0 active (contributes FEM force), else inert.
+            W = None
+            try:
+                W = self._simulator._W.to_numpy()[:int(self._simulator.n_tets)]
+            except Exception:
+                W = None
+            # Orphan map (kinematic slaving): if the shared endpoint is orphan-
+            # slaved to a far master, THAT is the flake-fix mechanism, not a tet
+            # force spike. Merge both storage forms like pick_inspector does.
+            omap = dict(getattr(self, '_orphan_constraints', {}) or {})
+            _oids = getattr(self, '_orphan_ids', None)
+            _omas = getattr(self, '_orphan_masters', None)
+            if _oids is not None and _omas is not None and len(_oids) > 0:
+                for i in range(len(_oids)):
+                    omap.setdefault(int(_oids[i]), (int(_omas[i]), None))
+            def _orph(v):
+                if v in omap:
+                    m = omap[v][0]
+                    dm = (float((live[m] - org) @ nrm) if m < n_active else float('nan'))
+                    return f"ORPHAN(master={m}, d_master={dm:+.3f})"
+                return "not-orphan"
+            order = extreme[np.argsort(-ad[extreme])][:12]
+            for k in order:
+                nid = int(nids[k])
+                vi, vj, t = imap[nid]
+                dc = float((cpos[nid] - org) @ nrm) if nid < len(cpos) else float('nan')
+                # Parent tets of this INTER vert: min REST volume (from creation
+                # positions) + is the tiny one ACTIVE? An active near-degenerate tet
+                # is the FEM-spike driver; if the tiny tet is inert, look at the
+                # endpoint orphan status instead.
+                minvol = float('nan'); ntet = 0; n_active_tets = 0; tiny_active = False
+                if tets.size:
+                    rows = np.where((tets == nid).any(axis=1))[0]
+                    ntet = int(len(rows))
+                    if ntet and cpos.shape[0] > int(tets[rows].max()):
+                        T = cpos[tets[rows]]
+                        vol = np.abs(np.einsum('ij,ij->i',
+                              np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]),
+                              T[:, 3] - T[:, 0])) / 6.0
+                        minvol = float(vol.min())
+                        if W is not None:
+                            act = np.array([W[r] > 0 if r < len(W) else False
+                                            for r in rows])
+                            n_active_tets = int(act.sum())
+                            tiny_active = bool(act[np.argmin(vol)])
+                print(f"[InterProbe:{label}]   nid={nid} vi={vi} vj={vj} t={t:+.4f}"
+                      f"  |d_live|={float(ad[k]):.4f} d_creation={dc:+.4f}"
+                      f"  parent_tets={ntet}(active={n_active_tets}) "
+                      f"min_rest_vol={minvol:.3e} tiny_active={tiny_active}", flush=True)
+                # Velocity of the flying vert + endpoints. Constant speed => free
+                # drift / gravity fall (severed island). Growing/oscillating =>
+                # explicit-spring energy injection.
+                sp = "n/a"
+                if vlive is not None:
+                    sn = float(np.linalg.norm(vlive[nid])) if nid < n_active else float('nan')
+                    si = float(np.linalg.norm(vlive[vi])) if vi < n_active else float('nan')
+                    sj = float(np.linalg.norm(vlive[vj])) if vj < n_active else float('nan')
+                    sp = f"|v|nid={sn:.4f} vi={si:.4f} vj={sj:.4f}"
+                print(f"[InterProbe:{label}]       vi={vi} {_orph(vi)} | "
+                      f"vj={vj} {_orph(vj)}  {sp}", flush=True)
+
+            # --- Severed-island test: connected components over ACTIVE tets only.
+            # A flying vertex whose active-tet component contains NO fixed/anchored
+            # vertex (and no stationary vertex) is a mechanically SEVERED island --
+            # nothing stiff tethers it to the body, so it drifts. If instead its
+            # component DOES reach an anchor, it is merely WEAKLY held (tiny active
+            # tets) and the fix is stiffness/damping, not re-tethering.
+            try:
+                from scipy.sparse import csr_matrix
+                from scipy.sparse.csgraph import connected_components
+                fixed = None
+                try:
+                    fixed = self._simulator._fixed.to_numpy()[:n_active].astype(bool)
+                except Exception:
+                    fixed = None
+                if W is not None and tets.size:
+                    at = tets[np.where(W[:len(tets)] > 0)[0]] if len(W) >= len(tets) \
+                         else tets[np.where(W > 0)[0]]
+                    if len(at):
+                        e0 = np.concatenate([at[:, 0], at[:, 0], at[:, 0],
+                                             at[:, 1], at[:, 1], at[:, 2]])
+                        e1 = np.concatenate([at[:, 1], at[:, 2], at[:, 3],
+                                             at[:, 2], at[:, 3], at[:, 3]])
+                        nn = int(max(at.max(), n_active)) + 1
+                        g = csr_matrix((np.ones(len(e0)), (e0, e1)), shape=(nn, nn))
+                        ncomp, lab = connected_components(g, directed=False)
+                        # off-plane (flying) verts under the active graph
+                        alld = np.abs((live - org) @ nrm)
+                        # report the component of the top flying INTER vert
+                        top = int(nids[extreme[np.argmax(ad[extreme])]])
+                        cl = lab[top]
+                        members = np.where(lab == cl)[0]
+                        members = members[members < n_active]
+                        has_fixed = bool(fixed[members].any()) if fixed is not None else None
+                        stationary = int((alld[members] < 0.3).sum())
+                        print(f"[InterProbe:{label}]   >> ACTIVE-graph component of "
+                              f"vert {top}: size={len(members):,}  contains_fixed="
+                              f"{has_fixed}  stationary_members(<0.3)={stationary:,} "
+                              f"=> {'SEVERED ISLAND' if (stationary == 0 and not has_fixed) else 'weakly-held (reaches body)'}",
+                              flush=True)
+            except Exception as _e2:
+                print(f"[InterProbe:{label}]   severed-island test skipped ({_e2})",
+                      flush=True)
+        except Exception as _e:
+            print(f"[InterProbe:{label}] skipped ({_e})", flush=True)
+
     def _bake_current_state(self) -> None:
         """
         Freeze the current live mesh as a fresh pristine mesh for the next
@@ -1205,6 +1363,22 @@ class FEMMethod(SimulationMethod):
             print(f"[Bake] carried surface: {int(drawable_rows.sum()):,} "
                   f"drawable faces -> {len(carried):,} baked triples "
                   f"({int((~ok).sum()):,} referenced dropped verts)", flush=True)
+
+            # Carry the WOUND (disc) faces specifically, remapped to baked
+            # indices, so the next cut's render can flat-shade them and keep the
+            # rim crease that would otherwise smooth out at the bake. (Only the
+            # current cut's wound; multi-bake accumulation is a follow-up.)
+            _wtri = face_verts[drawable_rows & (face_verdict == 1)]
+            if len(_wtri) > 0:
+                _wnew = remap[_wtri]
+                _wok  = (_wnew >= 0).all(axis=1)
+                _wnew = np.sort(_wnew[_wok], axis=1)
+                self._carried_wound_set = set(map(tuple, _wnew.tolist()))
+            else:
+                self._carried_wound_set = None
+            print(f"[Bake] carried wound (flat-shade) faces: "
+                  f"{0 if self._carried_wound_set is None else len(self._carried_wound_set):,}",
+                  flush=True)
 
             # Sliver replacement faces: every face a kept (active) tet shares
             # with a sliver. Slivers form only along the cut plane, so when
@@ -1990,10 +2164,12 @@ class FEMMethod(SimulationMethod):
 
         n_new_split = int(new_mask.sum() - (self._split_mask.sum()
                                              if self._split_mask is not None else 0))
-        print(f"[Progressive] blade_travel={blade_travel:.4f}  "
-              f"newly-splitting {n_new_split} tets  "
-              f"(cumulative {int(new_mask.sum())}/{int(self._crossing_mask.sum())} crossing tets split)",
-              flush=True)
+        # [Progressive] per-grow log (commented out to reduce noise; uncomment
+        # to trace blade-travel / per-frame tet splitting).
+        # print(f"[Progressive] blade_travel={blade_travel:.4f}  "
+        #       f"newly-splitting {n_new_split} tets  "
+        #       f"(cumulative {int(new_mask.sum())}/{int(self._crossing_mask.sum())} crossing tets split)",
+        #       flush=True)
 
         self._ensure_full_precompute()
         _t_precomp = _t.perf_counter() - _t0
@@ -2088,14 +2264,16 @@ class FEMMethod(SimulationMethod):
         self._seam_pairs = seam_pairs
         _t_seams = _t.perf_counter() - _t3
         _t_total = _t.perf_counter() - _t0
-        print(f"[GrowTiming] total={_t_total*1000:.1f}ms  "
-              f"precomp={_t_precomp*1000:.1f}  "
-              f"apply={_t_apply*1000:.1f}  "
-              f"snap={_t_snap*1000:.1f}  "
-              f"seams={_t_seams*1000:.1f}  "
-              f"newly_split={n_new_split}  "
-              f"n_full_verts={n_full:,}",
-              flush=True)
+        # [GrowTiming] per-grow timing (commented out to reduce noise; uncomment
+        # to profile the per-frame grow step).
+        # print(f"[GrowTiming] total={_t_total*1000:.1f}ms  "
+        #       f"precomp={_t_precomp*1000:.1f}  "
+        #       f"apply={_t_apply*1000:.1f}  "
+        #       f"snap={_t_snap*1000:.1f}  "
+        #       f"seams={_t_seams*1000:.1f}  "
+        #       f"newly_split={n_new_split}  "
+        #       f"n_full_verts={n_full:,}",
+        #       flush=True)
 
     def _ensure_full_precompute(self) -> None:
         """
@@ -2366,6 +2544,60 @@ class FEMMethod(SimulationMethod):
         else:
             _floor = 0.0
         orphan_mask = touched_by_any_end & (vol_by_vert < _floor)
+
+        # --- Severed-island reattachment -------------------------------------
+        # The volume test above only orphans verts touched EXCLUSIVELY by
+        # slivers. A small cluster at the cut-1/cut-2 junction can instead keep
+        # ONE internal non-sliver (active) tet -- enough good volume to clear
+        # the floor -- while ALL its bridges back to the body were slivers, now
+        # inert. That leaves it internally supported but globally DISCONNECTED:
+        # a mechanically severed island. With no active path to the body,
+        # residual opening velocity / internal strain drives it off with nothing
+        # to arrest it (observed even at zero gravity), dragging its inert
+        # slivers into "flying tets". The volume test cannot see this (it is a
+        # connectivity fact, not
+        # a per-vertex volume fact). Detect it with connected components over
+        # the good (active, non-sliver) end-state tet graph and add any SMALL
+        # ungrounded component to the orphan set, so the master-picking +
+        # kinematic slaving below re-tether it to the nearest body vertex.
+        # Large components -- the two legitimate cut halves -- are never
+        # touched (they sit far above island_max_verts).
+        if bool(self._params.get('island_reattach', True)) and len(good_end_slots) > 0:
+            try:
+                from scipy.sparse import csr_matrix
+                from scipy.sparse.csgraph import connected_components
+                _isl_max = int(self._params.get('island_max_verts', 64))
+                gt = super_tets[good_end_slots]
+                _a = np.concatenate([gt[:, 0], gt[:, 0], gt[:, 0],
+                                     gt[:, 1], gt[:, 1], gt[:, 2]])
+                _b = np.concatenate([gt[:, 1], gt[:, 2], gt[:, 3],
+                                     gt[:, 2], gt[:, 3], gt[:, 3]])
+                g = csr_matrix((np.ones(len(_a)), (_a, _b)),
+                               shape=(n_full_v, n_full_v))
+                _ncomp, comp_lab = connected_components(g, directed=False)
+                good_verts = np.unique(gt.ravel())
+                comp_size = np.bincount(comp_lab[good_verts], minlength=_ncomp)
+                # Grounded = component contains a fixed/anchored vertex.
+                grounded = np.zeros(_ncomp, dtype=bool)
+                _ff = getattr(self, '_full_final_fixed', None)
+                if _ff is not None:
+                    _ffb = np.asarray(_ff).astype(bool)[:n_full_v]
+                    _fv = np.where(_ffb)[0]
+                    if len(_fv) > 0:
+                        grounded[comp_lab[_fv]] = True
+                island_comp = (comp_size > 0) & (comp_size <= _isl_max) & (~grounded)
+                island_vmask = np.zeros(n_full_v, dtype=bool)
+                island_vmask[good_verts] = island_comp[comp_lab[good_verts]]
+                n_island = int(island_vmask.sum())
+                if n_island > 0:
+                    orphan_mask = orphan_mask | island_vmask
+                    print(f"[IslandReattach] {int(island_comp.sum())} severed "
+                          f"island(s), {n_island} verts re-tethered "
+                          f"(<= {_isl_max} verts each)", flush=True)
+            except Exception as _e:
+                print(f"[IslandReattach] skipped ({_e})", flush=True)
+        # --- end severed-island reattachment ---------------------------------
+
         orphan_ids = np.where(orphan_mask)[0].astype(np.int32)
 
         # Master finding: for each orphan, look at its geometric neighborhood.
@@ -2773,6 +3005,21 @@ class FEMMethod(SimulationMethod):
         _unique_keys, face_key_idx = np.unique(face_keys, return_inverse=True)
         n_unique_keys = int(len(_unique_keys))
 
+        # Old-wound (flat-shade) mask: faces whose sorted triple was a wound
+        # (disc) face carried across the last bake. The render flat-shades these
+        # to keep the rim crease that the bake would otherwise smooth out.
+        _cws = getattr(self, '_carried_wound_set', None)
+        if _cws:
+            _cw = np.array(sorted(_cws), dtype=np.int64)
+            _cw_keys = (_cw[:, 0] << 42) | (_cw[:, 1] << 21) | _cw[:, 2]
+            face_is_old_wound = np.isin(face_keys, _cw_keys)
+            if getattr(self, '_flat_old_wound', False):
+                print(f"[FlatOldWound] carried_wound={len(_cws):,}  "
+                      f"matched_in_cut_table={int(face_is_old_wound.sum()):,}  "
+                      f"flag=True", flush=True)
+        else:
+            face_is_old_wound = np.zeros(len(face_verts), dtype=bool)
+
         self._precomp_render_cache = {
             'face_verts':               face_verts.astype(np.uint32),
             'face_fourth':              face_fourth.astype(np.int32),
@@ -2784,6 +3031,7 @@ class FEMMethod(SimulationMethod):
             'face_active_when_split':   face_active_when_split,
             'face_verdict':             face_verdict,
             'face_dropped_reason':      face_dropped_reason,
+            'face_is_old_wound':        face_is_old_wound,
             'face_category':            face_category,
             'face_debug_color':         face_debug_color,
             'n_super_tets':             n_super,

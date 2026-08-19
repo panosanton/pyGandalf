@@ -102,11 +102,15 @@ def main():
                         help='Enable GL backface culling (default: off)')
     parser.add_argument('--profile-kernels', action='store_true', default=False,
                         help='Enable Taichi kernel_profiler (~halves fps; sniffed at import time)')
-    parser.add_argument('--resident-sliver-bake', action='store_true', default=False,
-                        help='Multi-cut: keep slivers resident (physics-inert) across a '
-                             'bake so the baked surface stays watertight, instead of the '
-                             'legacy carried-surface snapshot. A/B toggle for the missing-'
-                             'faces fix.')
+    # Resident-sliver bake is the verified-correct multi-cut path and is now the
+    # DEFAULT. Keep slivers resident (physics-inert) across a bake so the baked
+    # surface stays watertight. --carried-sliver-bake reverts to the abandoned
+    # carried-surface snapshot (lose-lose: holes or overlaps) only for A/B repro.
+    parser.add_argument('--carried-sliver-bake', dest='resident_sliver_bake',
+                        action='store_false', default=True,
+                        help='A/B repro only: revert to the abandoned carried-surface '
+                             'bake (deletes slivers -> holes/overlaps on multi-cut). '
+                             'Default is the resident-sliver bake, which is correct.')
     parser.add_argument('--no-bake-replacement', action='store_true', default=False,
                         help='Diagnostic: skip the sliver replacement-face patch in the '
                              'carried-surface bake, to test whether it is the source of '
@@ -115,6 +119,11 @@ def main():
                         help='A/B: on the resident path, recompute orig_surf_set from '
                              'baked topology (old behavior, doubles the old wound) instead '
                              'of carrying cut-1 clean surface (the fix).')
+    parser.add_argument('--no-island-reattach', action='store_true', default=False,
+                        help='A/B: disable severed-island reattachment. When on (default), '
+                             'small mesh clusters whose only bridges to the body were '
+                             'inerted slivers are kinematically slaved to the nearest body '
+                             'vertex instead of drifting off as "flying tets".')
     parser.add_argument('--debug-show-dropped', action='store_true', default=False,
                         help='Render dropped faces in classification colors (magenta='
                              'pure-orig, cyan=collar-recon, orange=phantom-collar) so the '
@@ -123,6 +132,9 @@ def main():
     parser.add_argument('--trace-orphan', type=int, default=-1, metavar='VERT_ID',
                         help='Print the full master-picking decision trail for this orphan '
                              'vertex id (from the pick tool) during cut setup.')
+    parser.add_argument('--flat-old-wound', action='store_true', default=False,
+                        help='Keep the flat-shaded rim crease on a previous wound after a '
+                             'bake (instead of it smoothing out). Render-only.')
     args = parser.parse_args()
 
     mesh_name    = args.mesh
@@ -231,7 +243,9 @@ def main():
                                           # inspection (magenta = pure-orig,
                                           # cyan = collar-recon, orange = phantom-collar).
                                           debug_show_dropped=args.debug_show_dropped,
-                                          trace_orphan_id=args.trace_orphan),
+                                          trace_orphan_id=args.trace_orphan,
+                                          flat_old_wound=args.flat_old_wound,
+                                          island_reattach=not args.no_island_reattach),
     )
     # FEM material params — passed through to FEMMethod.initialize() via _sim_params
     taichi_comp.stiffness = 200.0   # reused as cutting spring k
