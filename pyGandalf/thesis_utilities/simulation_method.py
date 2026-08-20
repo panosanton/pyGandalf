@@ -1258,7 +1258,25 @@ class FEMMethod(SimulationMethod):
         n_t_old = int(self._simulator.n_tets)
         pos_old   = self._simulator.positions.to_numpy()[:n_v_old]
         vel_old   = self._simulator.velocities.to_numpy()[:n_v_old]
-        fixed_old = self._simulator._fixed.to_numpy()[:n_v_old]
+        fixed_old = self._simulator._fixed.to_numpy()[:n_v_old].copy()
+
+        # Un-pin the previous cut's orphan verts before carrying `fixed` into the
+        # baked mesh. Orphans are pinned (fixed=1) in _init_superset_layout ONLY so
+        # FEM does not fight the per-step orphan-kinematics slaving -- a TRANSIENT,
+        # per-cut pin. Carrying it across the bake freezes ex-orphans forever: the
+        # next cut recomputes orphans, and any vert no longer an orphan stays
+        # pinned at a stale position while its tet-mates deform around it (stretched
+        # inert slivers, accumulating over multiple cuts). Reset them to their TRUE
+        # anchor status (the bottom-band rule) so a genuine anchor survives but the
+        # transient pin clears. The next cut re-pins any that are still orphans.
+        _oid = getattr(self, '_orphan_ids', None)
+        if _oid is not None and len(_oid) > 0:
+            _oid = np.asarray(_oid, dtype=np.int64)
+            _oid = _oid[(_oid >= 0) & (_oid < n_v_old)]
+            if len(_oid) > 0:
+                _y = pos_old[:, 1]
+                _thr = float(_y.min() + (_y.max() - _y.min()) * 0.05)
+                fixed_old[_oid] = (pos_old[_oid, 1] < _thr).astype(fixed_old.dtype)
         W_old     = self._simulator._W.to_numpy()[:n_t_old]
         tets_old  = self._super_tets_ref  # (n_t_old, 4) numpy
 

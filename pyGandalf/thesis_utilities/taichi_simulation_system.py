@@ -621,6 +621,18 @@ class TaichiSimulationSystem(System):
                         _e2 = render_positions[_owf[:, 2]] - render_positions[_owf[:, 0]]
                         _fn = np.cross(_e1, _e2)
                         _fn /= (np.linalg.norm(_fn, axis=1, keepdims=True) + 1e-12)
+                        # Orient each flat normal to AGREE with the surrounding
+                        # smooth normal (winding-independent). A sliver-parented
+                        # old-wound face has an unstable "away-from-4th-vertex"
+                        # winding correction (the sliver's 4th vertex is ~coincident
+                        # with a face vertex), so its raw geometric normal can be
+                        # flipped -> it renders dark. The smooth normal (still in
+                        # upload_norm here, averaged over many faces) points the
+                        # right way; flip _fn where it disagrees.
+                        _sm = (upload_norm[_ow * 3] + upload_norm[_ow * 3 + 1]
+                               + upload_norm[_ow * 3 + 2])
+                        _flip = np.einsum('ij,ij->i', _fn, _sm) < 0.0
+                        _fn[_flip] = -_fn[_flip]
                         _slots = (_ow[:, None] * 3
                                   + np.array([0, 1, 2])[None, :]).ravel()
                         upload_norm[_slots] = np.repeat(
