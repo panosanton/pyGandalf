@@ -425,9 +425,23 @@ class _FEMSimulator:
         """
         Zero the stashed pristine W for the given slots so
         _activate_tets_kernel treats them as permanently disabled.
+
+        If a slot is still ACTIVE (_W[c] > 0) when disabled, deactivate it first
+        (remove its mass contribution, set _W[c] = 0). Otherwise it keeps
+        contributing an elastic force through a now rest-degenerate reference
+        (_W_rest = 0 -> singular rest inverse _B), which produces a huge garbage
+        force that flings its verts to infinity. Mirrors _deactivate_tets_kernel.
         """
         for i in range(slots.shape[0]):
-            self._W_rest[slots[i]] = 0.0
+            c = slots[i]
+            w = self._W[c]
+            if w > 0.0:
+                verts = self._tets[c]
+                contrib = w * self._density / 4.0
+                for k in ti.static(range(4)):
+                    self._masses[verts[k]] -= contrib
+                self._W[c] = 0.0
+            self._W_rest[c] = 0.0
 
     @ti.kernel
     def _pin_verts_kernel(self,

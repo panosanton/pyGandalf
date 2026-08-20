@@ -478,6 +478,19 @@ class TaichiSimulationSystem(System):
                 print("[InterProbe] not available (no cut yet?)")
         self._j_prev = j_now
 
+        # --- G key: on-demand FORCE scan (locate a stretched-tet source) ---
+        # Reports the highest-force verts + whether they sit on degenerate tets,
+        # to tell FORCE-DRIVEN from FREE-DRIFT without guessing where to click.
+        # MEASUREMENT ONLY.
+        g_now = InputManager().get_key_down(glfw.KEY_G)
+        if g_now and not getattr(self, '_g_prev', False):
+            _fs = getattr(comp.method, '_force_scan', None)
+            if callable(_fs):
+                _fs(f"cut{getattr(comp.method, '_cut_index', 1)}")
+            else:
+                print("[ForceScan] not available (spring-mass backend?)")
+        self._g_prev = g_now
+
         # --- Ctrl + Left click : pick face + parent tet, dump info ---
         # --- Ctrl + Right click: clear highlight ---
         ctrl_held  = InputManager().get_key_down(glfw.KEY_LEFT_CONTROL)

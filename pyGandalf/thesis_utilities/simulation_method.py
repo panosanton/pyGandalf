@@ -1178,6 +1178,55 @@ class FEMMethod(SimulationMethod):
         except Exception as _e:
             print(f"[InterProbe:{label}] skipped ({_e})", flush=True)
 
+    def _force_scan(self, label: str, top: int = 15) -> None:
+        """
+        MEASUREMENT ONLY. Locate the SOURCE of a stretched/drifting tet without
+        needing to know where to click. Reads the FEM per-vertex force field
+        (`_forces`, elastic + gravity + springs, populated each step) and reports
+        the highest-force verts, plus whether each sits on a degenerate tet
+        (W_rest ~ 0). Distinguishes:
+          - high |F|, growing |v|  -> FORCE-DRIVEN (find the driving tet;
+            degenerate W_rest=0 tets have an ill-conditioned rest inverse _B).
+          - low  |F|, steady  |v|  -> FREE DRIFT (no restoring force; a vert held
+            only by zero-stiffness tets / a severed island).
+        Also lists high-velocity verts in case the drift is a pure coast.
+        """
+        try:
+            sim = self._simulator
+            nv  = int(sim.n_verts)
+            F = sim._forces.to_numpy()[:nv]
+            V = sim.velocities.to_numpy()[:nv]
+            P = sim.positions.to_numpy()[:nv]
+            fmag = np.linalg.norm(F, axis=1)
+            vmag = np.linalg.norm(V, axis=1)
+            nt = int(sim.n_tets)
+            tets = sim._tets.to_numpy()[:nt].astype(np.int64)
+            Wr = sim._W_rest.to_numpy()[:nt]
+            Wc = sim._W.to_numpy()[:nt]
+            print(f"[ForceScan:{label}] nv={nv:,} nt={nt:,}  "
+                  f"max|F|={fmag.max():.4g} median|F|={np.median(fmag):.4g}  "
+                  f"max|v|={vmag.max():.4g} median|v|={np.median(vmag):.4g}",
+                  flush=True)
+            for tag, order in (("force", np.argsort(-fmag)[:top]),
+                               ("veloc", np.argsort(-vmag)[:max(5, top // 3)])):
+                for v in order:
+                    v = int(v)
+                    rows = np.where((tets == v).any(axis=1))[0]
+                    if len(rows):
+                        _wr = Wr[rows]; _wc = Wc[rows]
+                        n_degen = int((_wr <= 1e-9).sum())
+                        n_act = int((_wc > 0).sum())
+                        wr_min = float(_wr.min())
+                    else:
+                        n_degen = n_act = 0; wr_min = float('nan')
+                    print(f"[ForceScan:{label}]  ({tag}) vert {v} |F|={fmag[v]:.4g} "
+                          f"|v|={vmag[v]:.4g} pos=({P[v,0]:+.2f},{P[v,1]:+.2f},"
+                          f"{P[v,2]:+.2f}) tets={len(rows)}(active={n_act}) "
+                          f"degen_Wrest~0={n_degen} minWrest={wr_min:.2e}",
+                          flush=True)
+        except Exception as _e:
+            print(f"[ForceScan:{label}] skipped ({_e})", flush=True)
+
     def _bake_current_state(self) -> None:
         """
         Freeze the current live mesh as a fresh pristine mesh for the next
