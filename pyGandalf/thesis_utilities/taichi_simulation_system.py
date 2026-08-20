@@ -580,6 +580,38 @@ class TaichiSimulationSystem(System):
                     n_phys=new_positions.shape[0],
                     disc_split_phys_idx=comp._disc_split_phys_idx,
                     cut_normal=comp._cut_normal)
+
+            # Old-wound flat-shade: a PREVIOUS cut's wound (baked into the outer
+            # surface) is recomputed smooth by _compute_normals_post_cut above,
+            # rounding its rim crease. Stamp each such face's own geometric normal
+            # onto its 3 (outer-section) slots so the crease is kept, the same way
+            # the current wound is stamped. This runs in the authoritative
+            # per-frame upload -- the fast-rebuild stamp alone is clobbered here.
+            # Mask (old-wound outer faces) is cached per all_render_faces identity.
+            if (getattr(comp.method, '_flat_old_wound', False)
+                    and comp._n_outer_faces and comp._all_render_faces is not None):
+                _cws = getattr(comp.method, '_carried_wound_set', None)
+                if _cws:
+                    _arf = comp._all_render_faces
+                    if getattr(comp, '_ow_mask_id', None) != id(_arf):
+                        _of = np.sort(_arf[:int(comp._n_outer_faces)].astype(np.int64),
+                                      axis=1)
+                        _keys = (_of[:, 0] << 42) | (_of[:, 1] << 21) | _of[:, 2]
+                        _cw = np.array(sorted(_cws), dtype=np.int64)
+                        _cwk = (_cw[:, 0] << 42) | (_cw[:, 1] << 21) | _cw[:, 2]
+                        comp._ow_mask = np.isin(_keys, _cwk)
+                        comp._ow_mask_id = id(_arf)
+                    _ow = np.where(comp._ow_mask)[0]
+                    if len(_ow) > 0:
+                        _owf = _arf[_ow]
+                        _e1 = render_positions[_owf[:, 1]] - render_positions[_owf[:, 0]]
+                        _e2 = render_positions[_owf[:, 2]] - render_positions[_owf[:, 0]]
+                        _fn = np.cross(_e1, _e2)
+                        _fn /= (np.linalg.norm(_fn, axis=1, keepdims=True) + 1e-12)
+                        _slots = (_ow[:, None] * 3
+                                  + np.array([0, 1, 2])[None, :]).ravel()
+                        upload_norm[_slots] = np.repeat(
+                            _fn.astype(upload_norm.dtype), 3, axis=0)
         else:
             upload_pos  = render_positions
             upload_norm = new_normals
@@ -903,15 +935,17 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
                      and _face_is_old_wound is not None
                      and _face_is_old_wound[outer_rows].any())
     old_wound_in_outer = _face_is_old_wound[outer_rows] if _flat_old else None
-    if getattr(method, '_flat_old_wound', False):
-        _fdc = getattr(comp, '_flatdbg_frame', 0)
-        if _fdc % 120 == 0:
-            print(f"[FlatOldWound] render: _flat_old={_flat_old}  "
-                  f"has_mask={_face_is_old_wound is not None}  "
-                  f"n_outer={len(outer_rows)}  "
-                  f"old_in_outer={0 if old_wound_in_outer is None else int(old_wound_in_outer.sum())}",
-                  flush=True)
-        comp._flatdbg_frame = _fdc + 1
+    # [FlatOldWound] render diagnostic (commented out; flat-old-wound is default
+    # ON now so this would spam every run). Uncomment to trace the flag/mask.
+    # if getattr(method, '_flat_old_wound', False):
+    #     _fdc = getattr(comp, '_flatdbg_frame', 0)
+    #     if _fdc % 120 == 0:
+    #         print(f"[FlatOldWound] render: _flat_old={_flat_old}  "
+    #               f"has_mask={_face_is_old_wound is not None}  "
+    #               f"n_outer={len(outer_rows)}  "
+    #               f"old_in_outer={0 if old_wound_in_outer is None else int(old_wound_in_outer.sum())}",
+    #               flush=True)
+    #     comp._flatdbg_frame = _fdc + 1
 
     _rr_t_boundary = time.perf_counter() - _rr_t0
     _rr_t1 = time.perf_counter()
@@ -1064,14 +1098,6 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
         _fn = _fn / (np.linalg.norm(_fn, axis=1, keepdims=True) + 1e-12)
         _slots = (_ow[:, None] * 3 + np.array([0, 1, 2])[None, :]).ravel()
         _newn = np.repeat(_fn.astype(exp_norm.dtype), 3, axis=0)
-        if getattr(comp, '_flatdbg_frame', 0) % 120 == 1:
-            _oldn = exp_norm[_slots]
-            _zero = int((np.linalg.norm(_oldn, axis=1) < 1e-6).sum())
-            _dot  = float(np.abs(np.einsum('ij,ij->i', _oldn, _newn)).mean())
-            print(f"[FlatOldWound] overwrote {len(_slots)} old-wound slots  "
-                  f"zero_before={_zero}  mean|dot(old,new)|={_dot:.3f} "
-                  f"(1.0 => flat normal already equals smooth => no visible change)",
-                  flush=True)
         exp_norm[_slots] = _newn
 
     exp_tex    = np.zeros((len(all_render_faces) * 3, 2), dtype=np.float32)

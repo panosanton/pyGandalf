@@ -132,9 +132,12 @@ def main():
     parser.add_argument('--trace-orphan', type=int, default=-1, metavar='VERT_ID',
                         help='Print the full master-picking decision trail for this orphan '
                              'vertex id (from the pick tool) during cut setup.')
-    parser.add_argument('--flat-old-wound', action='store_true', default=False,
-                        help='Keep the flat-shaded rim crease on a previous wound after a '
-                             'bake (instead of it smoothing out). Render-only.')
+    # Default ON: keep a previous cut's wound flat-shaded across a bake so its rim
+    # crease does not smooth out. --no-flat-old-wound reverts (render-only).
+    parser.add_argument('--no-flat-old-wound', dest='flat_old_wound',
+                        action='store_false', default=True,
+                        help='Let a previous wound smooth out after a bake (revert the '
+                             'flat-shaded rim crease). Render-only.')
     args = parser.parse_args()
 
     mesh_name    = args.mesh

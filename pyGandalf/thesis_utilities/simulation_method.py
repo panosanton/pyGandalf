@@ -1364,12 +1364,21 @@ class FEMMethod(SimulationMethod):
                   f"drawable faces -> {len(carried):,} baked triples "
                   f"({int((~ok).sum()):,} referenced dropped verts)", flush=True)
 
-            # Carry the WOUND (disc) faces specifically, remapped to baked
-            # indices, so the next cut's render can flat-shade them and keep the
-            # rim crease that would otherwise smooth out at the bake. (Only the
-            # current cut's wound; multi-bake accumulation is a follow-up.)
-            _wtri = face_verts[drawable_rows & (face_verdict == 1)]
-            if len(_wtri) > 0:
+            # Carry the WOUND REGION (disc + rim/collar ring), remapped to baked
+            # indices, so the next cut's render can flat-shade it and keep the
+            # rim crease that would otherwise smooth out at the bake. Pure-disc
+            # faces (verdict==1, all 3 verts on-plane) alone MISS the crease: the
+            # rim faces are mixed (some disc verts, some body verts) so they are
+            # verdict==0 and were dropped by the old disc-only carry, leaving the
+            # crease to smooth. Widen to any drawable face sharing a vertex with a
+            # disc face -- that captures the rim ring where the crease lives.
+            # (Only the current cut's wound; multi-bake accumulation is a follow-up.)
+            _disc_mask = drawable_rows & (face_verdict == 1)
+            _wverts = (np.unique(face_verts[_disc_mask])
+                       if _disc_mask.any() else np.empty(0, dtype=face_verts.dtype))
+            if len(_wverts) > 0:
+                _region_mask = drawable_rows & np.isin(face_verts, _wverts).any(axis=1)
+                _wtri = face_verts[_region_mask]
                 _wnew = remap[_wtri]
                 _wok  = (_wnew >= 0).all(axis=1)
                 _wnew = np.sort(_wnew[_wok], axis=1)
@@ -3013,10 +3022,11 @@ class FEMMethod(SimulationMethod):
             _cw = np.array(sorted(_cws), dtype=np.int64)
             _cw_keys = (_cw[:, 0] << 42) | (_cw[:, 1] << 21) | _cw[:, 2]
             face_is_old_wound = np.isin(face_keys, _cw_keys)
-            if getattr(self, '_flat_old_wound', False):
-                print(f"[FlatOldWound] carried_wound={len(_cws):,}  "
-                      f"matched_in_cut_table={int(face_is_old_wound.sum()):,}  "
-                      f"flag=True", flush=True)
+            # [FlatOldWound] cache-side diagnostic (commented out; default ON now).
+            # if getattr(self, '_flat_old_wound', False):
+            #     print(f"[FlatOldWound] carried_wound={len(_cws):,}  "
+            #           f"matched_in_cut_table={int(face_is_old_wound.sum()):,}  "
+            #           f"flag=True", flush=True)
         else:
             face_is_old_wound = np.zeros(len(face_verts), dtype=bool)
 

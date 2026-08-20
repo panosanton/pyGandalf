@@ -253,6 +253,33 @@ def pick_and_dump(comp, mesh_comp, camera_comp, camera_transform,
     # ---- Bake history (why is this face in/out of the carried set?) --------
     _dump_bake_history(method, face_verts, n_orig)
 
+    # ---- Old-wound flat-shade flag (why is this face still smooth?) ---------
+    # Direct readout: is THIS face flagged as previous-cut wound (so the render
+    # would flat-shade it under --flat-old-wound)? Checks both the carried set
+    # (baked-index triples) and the render cache's face_is_old_wound mask.
+    try:
+        _tri = tuple(sorted(int(v) for v in face_verts))
+        _cws = getattr(method, '_carried_wound_set', None)
+        _in_carried = (_cws is not None) and (_tri in _cws)
+        _flag_on = bool(getattr(method, '_flat_old_wound', False))
+        _cache = getattr(method, '_precomp_render_cache', None)
+        _in_cache_mask = None
+        if _cache is not None and _cache.get('face_is_old_wound') is not None:
+            _fv_cache = _cache['face_verts']
+            _fkeys = np.sort(_fv_cache, axis=1)
+            _hit = np.where((_fkeys[:, 0] == _tri[0]) & (_fkeys[:, 1] == _tri[1])
+                            & (_fkeys[:, 2] == _tri[2]))[0]
+            if len(_hit) > 0:
+                _in_cache_mask = bool(_cache['face_is_old_wound'][_hit].any())
+            else:
+                _in_cache_mask = "face-not-in-cache-table"
+        print(f"[OldWound] flat_old_wound_flag={_flag_on}  "
+              f"in_carried_wound_set={_in_carried}  "
+              f"face_is_old_wound(cache)={_in_cache_mask}  "
+              f"carried_set_size={0 if _cws is None else len(_cws):,}")
+    except Exception as _e:
+        print(f"[OldWound] check skipped ({_e})")
+
     # ---- Per-vertex live state ---------------------------------------------
     _dump_vertex_states(comp, list(set(int(v) for v in face_verts)
                                     | {int(v) for ti in parent_tets
