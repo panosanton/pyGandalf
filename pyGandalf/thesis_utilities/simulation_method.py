@@ -1431,29 +1431,38 @@ class FEMMethod(SimulationMethod):
                   f"drawable faces -> {len(carried):,} baked triples "
                   f"({int((~ok).sum()):,} referenced dropped verts)", flush=True)
 
-            # Carry the WOUND REGION (disc + rim/collar ring), remapped to baked
-            # indices, so the next cut's render can flat-shade it and keep the
-            # rim crease that would otherwise smooth out at the bake. Pure-disc
-            # faces (verdict==1, all 3 verts on-plane) alone MISS the crease: the
-            # rim faces are mixed (some disc verts, some body verts) so they are
-            # verdict==0 and were dropped by the old disc-only carry, leaving the
-            # crease to smooth. Widen to any drawable face sharing a vertex with a
-            # disc face -- that captures the rim ring where the crease lives.
-            # (Only the current cut's wound; multi-bake accumulation is a follow-up.)
-            _disc_mask = drawable_rows & (face_verdict == 1)
-            _wverts = (np.unique(face_verts[_disc_mask])
-                       if _disc_mask.any() else np.empty(0, dtype=face_verts.dtype))
-            if len(_wverts) > 0:
-                _region_mask = drawable_rows & np.isin(face_verts, _wverts).any(axis=1)
-                _wtri = face_verts[_region_mask]
+            # Carry the WOUND (disc) faces -- verdict==1, all 3 verts on-plane --
+            # remapped to baked indices. The next cut's render uses this set to
+            # collar-vertex-split the old wound (smooth wound + sharp rim crease).
+            # ACCUMULATE across bakes: also carry FORWARD the previous cuts' wound
+            # set, remapped through THIS bake. Without this, each bake overwrites
+            # the set with only the immediately-previous wound, so by cut 3 the
+            # cut-1 wound is no longer flagged old-wound and its collar reverts to
+            # the unfixed shading. Previous-set triples are current-mesh (n_v_old)
+            # ORIG indices, so `remap` maps them to the new baked indices.
+            _new_set = set()
+            _wtri = face_verts[drawable_rows & (face_verdict == 1)]
+            if len(_wtri) > 0:
                 _wnew = remap[_wtri]
                 _wok  = (_wnew >= 0).all(axis=1)
                 _wnew = np.sort(_wnew[_wok], axis=1)
-                self._carried_wound_set = set(map(tuple, _wnew.tolist()))
-            else:
-                self._carried_wound_set = None
-            print(f"[Bake] carried wound (flat-shade) faces: "
-                  f"{0 if self._carried_wound_set is None else len(self._carried_wound_set):,}",
+                _new_set = set(map(tuple, _wnew.tolist()))
+            _prev = self._carried_wound_set
+            _n_prev_kept = 0
+            if _prev:
+                _pa = np.asarray(sorted(_prev), dtype=np.int64)
+                _pin = (_pa < n_v_old).all(axis=1)
+                _pa = _pa[_pin]
+                if len(_pa) > 0:
+                    _pr  = remap[_pa]
+                    _pok = (_pr >= 0).all(axis=1)
+                    _pr  = np.sort(_pr[_pok], axis=1)
+                    _n_prev_kept = len(_pr)
+                    _new_set |= set(map(tuple, _pr.tolist()))
+            self._carried_wound_set = _new_set if _new_set else None
+            print(f"[Bake] carried wound faces: "
+                  f"{0 if self._carried_wound_set is None else len(self._carried_wound_set):,}"
+                  f" (this cut + {_n_prev_kept:,} carried from prior cuts)",
                   flush=True)
 
             # Sliver replacement faces: every face a kept (active) tet shares
@@ -2929,6 +2938,20 @@ class FEMMethod(SimulationMethod):
         # set (see _bake_current_state) handles their disappearance for the
         # next cut.
 
+        # Per-face sliver flag. `_sliver_slots` indexes the SAME super_tets built
+        # above, and face row r belongs to superset tet r // 4, so the sliver
+        # status per face is a direct lookup. Used by the old-wound flat-shade to
+        # SKIP sliver-parented faces: a degenerate (near-flat) sliver tet has an
+        # ill-defined face normal, so flat-shading it with that normal makes it
+        # facet/cave/render-dark; leaving it on the smooth normal blends it in.
+        _sliv = getattr(self, '_sliver_slots', None)
+        if _sliv is not None and len(_sliv) > 0:
+            face_super_slot = np.repeat(np.arange(n_super, dtype=np.int64), 4)
+            face_is_sliver = np.isin(face_super_slot,
+                                     np.asarray(_sliv, dtype=np.int64))
+        else:
+            face_is_sliver = np.zeros(len(face_verts), dtype=bool)
+
         # Sorted verts + packed int64 keys
         face_sorted = np.sort(face_verts, axis=1)
         assert int(face_sorted.max()) < (1 << 21), "vertex index too large to pack"
@@ -3109,6 +3132,7 @@ class FEMMethod(SimulationMethod):
             'face_verdict':             face_verdict,
             'face_dropped_reason':      face_dropped_reason,
             'face_is_old_wound':        face_is_old_wound,
+            'face_is_sliver':           face_is_sliver,
             'face_category':            face_category,
             'face_debug_color':         face_debug_color,
             'n_super_tets':             n_super,

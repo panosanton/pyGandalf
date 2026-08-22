@@ -64,6 +64,7 @@ from .taichi_cut_utils import (
     _cut_topology_physics,
     _filter_surface_faces,
     _split_disc_verts_for_rendering,
+    _split_old_wound_collar,
     _build_springs,
     _print_spring_audit,
     _print_force_audit,
@@ -561,14 +562,59 @@ class TaichiSimulationSystem(System):
         else:
             render_positions = new_positions
 
+        # Exclude sliver faces from the normal accumulation: a degenerate sliver
+        # tet's face has an ill-defined (often flipped) winding that the
+        # away-from-4th-vertex correction can't fix, and its flipped normal
+        # poisons the per-vertex smooth normal (a sliver-dominated vert can flip,
+        # rendering dark). Accumulating over reliably-wound active faces only
+        # gives clean vertex normals that the sliver faces then inherit. Verts
+        # that live ONLY on slivers fall back to the full set so they are not left
+        # normal-less (black).
+        _norm_faces = comp.surface_indices
+        _ows = getattr(comp, '_ow_sliver', None)
+        if (_ows is not None
+                and getattr(comp, '_ow_sliver_id', None) == id(comp._all_render_faces)
+                and len(_ows) == len(comp.surface_indices) and _ows.any()):
+            _norm_faces = comp.surface_indices[~_ows]
+
         if comp._n_orig is not None:
+            # Base normals from reliably-wound NON-sliver faces. Verts with an
+            # active face get a good normal here; sliver-only verts stay zero.
             new_normals = _compute_normals_post_cut(
-                render_positions, comp.surface_indices,
+                render_positions, _norm_faces,
                 comp._n_orig, comp._n_split,
                 comp._inter_data, comp._shared_list,
                 comp._cut_normal)
+            if (_norm_faces is not comp.surface_indices and comp._ow_sliver is not None
+                    and len(comp._ow_sliver) == len(comp.surface_indices)):
+                _zero = np.linalg.norm(new_normals, axis=1) < 1e-6
+                if _zero.any():
+                    # Sliver-only verts (orphans etc.) have no non-sliver face, so
+                    # the plain full-set fallback hands them a randomly-wound sliver
+                    # normal (often flipped -> dark). Instead accumulate the sliver
+                    # faces with each face ORIENTED to agree with the base normals
+                    # of its verts (the good +Y neighbours fix the sliver's random
+                    # winding), then assign to the zero verts.
+                    _sf = np.asarray(comp.surface_indices[comp._ow_sliver],
+                                     dtype=np.int64)
+                    if len(_sf) > 0:
+                        _p0 = render_positions[_sf[:, 0]]
+                        _p1 = render_positions[_sf[:, 1]]
+                        _p2 = render_positions[_sf[:, 2]]
+                        _fn = np.cross(_p1 - _p0, _p2 - _p0)
+                        _fn /= (np.linalg.norm(_fn, axis=1, keepdims=True) + 1e-12)
+                        _ref = (new_normals[_sf[:, 0]] + new_normals[_sf[:, 1]]
+                                + new_normals[_sf[:, 2]])
+                        _flip = np.einsum('ij,ij->i', _fn, _ref) < 0.0
+                        _fn[_flip] = -_fn[_flip]
+                        _acc = np.zeros_like(new_normals)
+                        for _k in range(3):
+                            np.add.at(_acc, _sf[:, _k], _fn)
+                        _an = np.linalg.norm(_acc, axis=1)
+                        _use = _zero & (_an > 1e-6)
+                        new_normals[_use] = _acc[_use] / _an[_use, None]
         else:
-            new_normals = _compute_normals(render_positions, comp.surface_indices)
+            new_normals = _compute_normals(render_positions, _norm_faces)
         t3 = time.perf_counter()
 
         # In unindexed mode every face owns its 3 vertices — expand before upload.
@@ -594,49 +640,11 @@ class TaichiSimulationSystem(System):
                     disc_split_phys_idx=comp._disc_split_phys_idx,
                     cut_normal=comp._cut_normal)
 
-            # Old-wound flat-shade: a PREVIOUS cut's wound (baked into the outer
-            # surface) is recomputed smooth by _compute_normals_post_cut above,
-            # rounding its rim crease. Stamp each such face's own geometric normal
-            # onto its 3 (outer-section) slots so the crease is kept, the same way
-            # the current wound is stamped. This runs in the authoritative
-            # per-frame upload -- the fast-rebuild stamp alone is clobbered here.
-            # Mask (old-wound outer faces) is cached per all_render_faces identity.
-            if (getattr(comp.method, '_flat_old_wound', False)
-                    and comp._n_outer_faces and comp._all_render_faces is not None):
-                _cws = getattr(comp.method, '_carried_wound_set', None)
-                if _cws:
-                    _arf = comp._all_render_faces
-                    if getattr(comp, '_ow_mask_id', None) != id(_arf):
-                        _of = np.sort(_arf[:int(comp._n_outer_faces)].astype(np.int64),
-                                      axis=1)
-                        _keys = (_of[:, 0] << 42) | (_of[:, 1] << 21) | _of[:, 2]
-                        _cw = np.array(sorted(_cws), dtype=np.int64)
-                        _cwk = (_cw[:, 0] << 42) | (_cw[:, 1] << 21) | _cw[:, 2]
-                        comp._ow_mask = np.isin(_keys, _cwk)
-                        comp._ow_mask_id = id(_arf)
-                    _ow = np.where(comp._ow_mask)[0]
-                    if len(_ow) > 0:
-                        _owf = _arf[_ow]
-                        _e1 = render_positions[_owf[:, 1]] - render_positions[_owf[:, 0]]
-                        _e2 = render_positions[_owf[:, 2]] - render_positions[_owf[:, 0]]
-                        _fn = np.cross(_e1, _e2)
-                        _fn /= (np.linalg.norm(_fn, axis=1, keepdims=True) + 1e-12)
-                        # Orient each flat normal to AGREE with the surrounding
-                        # smooth normal (winding-independent). A sliver-parented
-                        # old-wound face has an unstable "away-from-4th-vertex"
-                        # winding correction (the sliver's 4th vertex is ~coincident
-                        # with a face vertex), so its raw geometric normal can be
-                        # flipped -> it renders dark. The smooth normal (still in
-                        # upload_norm here, averaged over many faces) points the
-                        # right way; flip _fn where it disagrees.
-                        _sm = (upload_norm[_ow * 3] + upload_norm[_ow * 3 + 1]
-                               + upload_norm[_ow * 3 + 2])
-                        _flip = np.einsum('ij,ij->i', _fn, _sm) < 0.0
-                        _fn[_flip] = -_fn[_flip]
-                        _slots = (_ow[:, None] * 3
-                                  + np.array([0, 1, 2])[None, :]).ravel()
-                        upload_norm[_slots] = np.repeat(
-                            _fn.astype(upload_norm.dtype), 3, axis=0)
+            # (Old-wound rim crease is now handled by the collar vertex-split in
+            # the rebuild -- the wound side and body side reference different
+            # vertex indices, so the per-vertex normal pass above already gives
+            # each its own smooth normal with a sharp crease between. No per-face
+            # flat-stamp needed.)
         else:
             upload_pos  = render_positions
             upload_norm = new_normals
@@ -950,27 +958,15 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
     outer_faces = face_verts[outer_rows].copy()  # (n_outer, 3) uint32
     wound_faces = face_verts[wound_rows]         # (n_wound, 3) uint32
 
-    # Old-wound flat-shade (keep the rim crease across a bake). Faces that were a
-    # previous cut's wound arrive here classified OUTER (all-orig now). When the
-    # flag is on we (a) exclude them from the outer smooth-normal pass so the
-    # collar rim regains clean surface normals, and (b) stamp flat per-face
-    # normals on their slots below. old_wound_in_outer is a bool over outer_faces.
+    # Old-wound faces: a previous cut's wound, baked into the mesh, arrives here
+    # classified OUTER (all-orig now). We VERTEX-SPLIT the collar verts they share
+    # with body faces (below) so each side gets its own smooth normal -- a sharp
+    # rim crease with no dark/bright spots -- and record which are sliver-parented
+    # so the per-frame normal pass can drop their unreliable winding.
     _face_is_old_wound = cache.get('face_is_old_wound')
-    _flat_old = bool(getattr(method, '_flat_old_wound', False)
-                     and _face_is_old_wound is not None
-                     and _face_is_old_wound[outer_rows].any())
-    old_wound_in_outer = _face_is_old_wound[outer_rows] if _flat_old else None
-    # [FlatOldWound] render diagnostic (commented out; flat-old-wound is default
-    # ON now so this would spam every run). Uncomment to trace the flag/mask.
-    # if getattr(method, '_flat_old_wound', False):
-    #     _fdc = getattr(comp, '_flatdbg_frame', 0)
-    #     if _fdc % 120 == 0:
-    #         print(f"[FlatOldWound] render: _flat_old={_flat_old}  "
-    #               f"has_mask={_face_is_old_wound is not None}  "
-    #               f"n_outer={len(outer_rows)}  "
-    #               f"old_in_outer={0 if old_wound_in_outer is None else int(old_wound_in_outer.sum())}",
-    #               flush=True)
-    #     comp._flatdbg_frame = _fdc + 1
+    _face_is_sliver    = cache.get('face_is_sliver')
+    old_wound_in_outer = (_face_is_old_wound[outer_rows]
+                          if _face_is_old_wound is not None else None)
 
     _rr_t_boundary = time.perf_counter() - _rr_t0
     _rr_t1 = time.perf_counter()
@@ -1029,13 +1025,27 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
     comp._cut_normal  = normal
     comp._seam_pairs  = method._seam_pairs
 
-    # Disc/collar split (vectorized).
+    # Disc/collar split (vectorized). Splits the CURRENT cut's disc verts, then
+    # ALSO the OLD wound's collar verts so the previous wound shades smooth with a
+    # sharp rim crease (no averaged-normal dark/bright spots). Both feed the same
+    # render-dup list.
     if comp.split_disc_verts:
         remapped_wound, split_phys = _split_disc_verts_for_rendering(
             outer_faces, wound_faces, len(final_pos), n_orig)
-        comp._disc_split_phys_idx = (split_phys if len(split_phys) > 0 else None)
-        render_pos = (np.vstack([final_pos, final_pos[split_phys]])
-                      if len(split_phys) > 0 else final_pos)
+        n_phys = len(final_pos)
+        _dups = [np.asarray(split_phys, dtype=np.int32)] if len(split_phys) > 0 else []
+        _next = n_phys + int(len(split_phys))
+        outer_faces, _ow_collar = _split_old_wound_collar(
+            outer_faces, old_wound_in_outer, _next)
+        if len(_ow_collar) > 0:
+            _dups.append(_ow_collar)
+        if _dups:
+            _all_dups = np.concatenate(_dups)
+            comp._disc_split_phys_idx = _all_dups
+            render_pos = np.vstack([final_pos, final_pos[_all_dups]])
+        else:
+            comp._disc_split_phys_idx = None
+            render_pos = final_pos
         wound_for_render = remapped_wound
     else:
         comp._disc_split_phys_idx = None
@@ -1072,6 +1082,14 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
     comp._n_outer_faces     = len(outer_faces)
     comp._face_expanded     = True
 
+    # Per-outer-face sliver flag (aligned with outer_faces order), so the
+    # per-frame normal pass can drop sliver-parented faces (ill-defined winding)
+    # from the accumulation. Keyed by all_render_faces identity to detect a stale
+    # slow-path rebuild.
+    _fis = cache.get('face_is_sliver')
+    comp._ow_sliver    = _fis[outer_rows] if _fis is not None else None
+    comp._ow_sliver_id = id(all_render_faces)
+
     # Debug colors: index the precomputed per-row colors so the shader sees
     # the same blue/green/red material as the pre-progressive path. Wound
     # rows have to be picked up in the sorted order set above.
@@ -1090,13 +1108,12 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
     _rr_t_class = time.perf_counter() - _rr_t2
     _rr_t3 = time.perf_counter()
 
-    # Normals + expanded buffers. When flat-shading old wound, exclude those
-    # faces from the smooth-normal pass so the surrounding collar rim is not
-    # averaged toward the flat disc (that averaging is what smooths the crease).
-    _normals_faces = comp.surface_indices
-    if _flat_old:
-        _normals_faces = outer_faces[~old_wound_in_outer]
-    new_normals = _compute_normals_post_cut(render_pos, _normals_faces,
+    # Normals + expanded buffers. The old wound's collar was vertex-split above so
+    # its wound side and body side get separate normals (smooth faces, sharp rim
+    # crease). The per-frame path (on_update_entity) recomputes these each frame
+    # with slivers excluded from the accumulation; this rebuild-frame pass is just
+    # for buffer sizing and is overwritten next frame.
+    new_normals = _compute_normals_post_cut(render_pos, comp.surface_indices,
                                             n_orig, n_split, inter_data, shared_list, normal)
 
     flat_all   = all_render_faces.flatten()
@@ -1109,21 +1126,6 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
         n_orig=n_orig, n_split=n_split, n_phys=len(final_pos),
         disc_split_phys_idx=comp._disc_split_phys_idx,
         cut_normal=normal)
-
-    # Flat-shade old-wound faces: stamp each face's own geometric normal onto its
-    # three (outer-section) slots. outer_faces were already winding-corrected
-    # outward, so the flat normal points into the old gap, matching the live cut.
-    if _flat_old:
-        _ow  = np.where(old_wound_in_outer)[0]           # indices within outer_faces
-        _owf = outer_faces[_ow]
-        _v0 = render_pos[_owf[:, 0]]
-        _v1 = render_pos[_owf[:, 1]]
-        _v2 = render_pos[_owf[:, 2]]
-        _fn = np.cross(_v1 - _v0, _v2 - _v0)
-        _fn = _fn / (np.linalg.norm(_fn, axis=1, keepdims=True) + 1e-12)
-        _slots = (_ow[:, None] * 3 + np.array([0, 1, 2])[None, :]).ravel()
-        _newn = np.repeat(_fn.astype(exp_norm.dtype), 3, axis=0)
-        exp_norm[_slots] = _newn
 
     exp_tex    = np.zeros((len(all_render_faces) * 3, 2), dtype=np.float32)
     exp_colors = np.repeat(face_colors, 3, axis=0)

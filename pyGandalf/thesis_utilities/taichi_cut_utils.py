@@ -760,6 +760,45 @@ def _split_disc_verts_for_rendering(outer_faces, wound_faces, n_phys, n_orig):
     return remapped, split_verts.astype(np.int32)
 
 
+def _split_old_wound_collar(outer_faces, old_wound_mask, next_dup_idx):
+    """
+    Vertex-split the collar of a PREVIOUS cut's wound (baked into the outer
+    surface, so it arrives classified OUTER) for rendering.
+
+    Verts shared between old-wound faces and body faces get a duplicate index
+    used ONLY by the old-wound faces; body faces keep the originals. The
+    per-vertex normal pass then accumulates each side separately, so the wound
+    side and the body side get their own smooth normals -- eliminating the
+    dark/bright spots that a single averaged normal produces at the rim, and
+    yielding a sharp crease. This mirrors _split_disc_verts_for_rendering but for
+    an all-ORIG old wound identified by a mask rather than by index range.
+
+    outer_faces    : (N, 3) int array.
+    old_wound_mask : (N,) bool, which outer faces are old-wound. May be None.
+    next_dup_idx   : first free rendering-dup index (n_phys + any prior dups).
+    Returns (remapped_outer_faces uint32, collar_phys_idx int32).
+    """
+    if old_wound_mask is None:
+        return np.asarray(outer_faces, dtype=np.uint32), np.array([], dtype=np.int32)
+    of = np.asarray(outer_faces, dtype=np.int64)
+    owm = np.asarray(old_wound_mask, dtype=bool)
+    if of.size == 0 or not owm.any() or owm.all():
+        return of.astype(np.uint32), np.array([], dtype=np.int32)
+    owf  = of[owm]
+    body = of[~owm]
+    ow_verts   = np.unique(owf)
+    body_verts = np.unique(body)
+    collar = np.intersect1d(ow_verts, body_verts)
+    if len(collar) == 0:
+        return of.astype(np.uint32), np.array([], dtype=np.int32)
+    max_v = int(of.max()) + 1
+    lut = np.arange(max_v, dtype=np.int64)
+    lut[collar] = next_dup_idx + np.arange(len(collar), dtype=np.int64)
+    out = of.copy()
+    out[owm] = lut[owf]
+    return out.astype(np.uint32), collar.astype(np.int32)
+
+
 # ---------------------------------------------------------------------------
 # Diagnostic helpers (Analysis 1 + 2)
 # ---------------------------------------------------------------------------
