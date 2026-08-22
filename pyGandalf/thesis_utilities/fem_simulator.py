@@ -37,8 +37,16 @@ slots are never touched. rebuild_topology() re-uploads new mesh data into the
 SAME field objects, keeping SNode IDs stable so Taichi's offline cache hits on
 subsequent step() calls -- avoiding the ~4s JIT recompile per cut.
 """
+import sys
 import taichi as ti
 import numpy as np
+
+# Force-site trace (debugging the degenerate-tet explosion). Sniffed from argv at
+# import time -- like --profile-kernels -- so it is available before argparse and
+# without plumbing. When on, step() health-checks forces/velocities/positions
+# after every force-manipulation op and reports the FIRST site each frame where a
+# field goes bad (NaN/Inf or huge), isolating which op injects the explosion.
+_FORCE_TRACE = ('--force-trace' in sys.argv)
 
 
 @ti.data_oriented
@@ -687,17 +695,65 @@ class _FEMSimulator:
     # Public step
     # ------------------------------------------------------------------
 
+    def _fcheck(self, tag: str):
+        """MEASUREMENT ONLY (gated by --force-trace). After a force-manip op,
+        check forces/velocities/positions for the FIRST bad value this frame and
+        report which op (tag) introduced it. `step-start` firing means the badness
+        arrived from OUTSIDE simulator.step (the method-level opening/orphan ops)."""
+        if not _FORCE_TRACE:
+            return
+        # Report only the FIRST bad site across the whole run, then stop -- once
+        # the explosion appears it persists every frame, so this keeps the output
+        # to the single culprit line (op + frame + worst vert).
+        if self._dbg_reported or getattr(self, '_dbg_explosion_found', False):
+            return
+        nv = self._n_verts
+        F = self._forces.to_numpy()[:nv]
+        V = self.velocities.to_numpy()[:nv]
+        P = self.positions.to_numpy()[:nv]
+        fnan = int((~np.isfinite(F)).sum())
+        vnan = int((~np.isfinite(V)).sum())
+        pnan = int((~np.isfinite(P)).sum())
+        fmx = float(np.abs(np.nan_to_num(F)).max()) if F.size else 0.0
+        vmx = float(np.abs(np.nan_to_num(V)).max()) if V.size else 0.0
+        pmx = float(np.abs(np.nan_to_num(P)).max()) if P.size else 0.0
+        bad = (fnan or vnan or pnan or fmx > 1e3 or vmx > 1e2 or pmx > 5e1)
+        if bad:
+            self._dbg_reported = True
+            self._dbg_explosion_found = True
+            if fnan or fmx > 1e3:
+                _fld, _arr = 'F', F
+            elif vnan or vmx > 1e2:
+                _fld, _arr = 'V', V
+            else:
+                _fld, _arr = 'P', P
+            _mag = np.linalg.norm(np.nan_to_num(_arr, nan=1e30, posinf=1e30,
+                                                neginf=1e30), axis=1)
+            _wi = int(np.argmax(_mag))
+            print(f"[ForceTrace] frame {self._dbg_frame}: FIRST-BAD after "
+                  f"'{tag}' | F(max={fmx:.3e} nan={fnan}) V(max={vmx:.3e} "
+                  f"nan={vnan}) P(max={pmx:.3e} nan={pnan}) | worst {_fld} "
+                  f"vert {_wi}", flush=True)
+
     def step(self, dt: float, damping: float, v_max: float = 10.0,
              cg_iters: int = 20):
         nv = self._n_verts
         nt = self._n_tets
+        # Per-frame reset happens in FEMMethod.step (the outer entry) so the
+        # first-bad tracking spans opening -> step -> orphans.
         self._clear_forces(nv)
+        self._fcheck('_clear_forces')
         self._get_force(self._gravity, nv, nt)
+        self._fcheck('_get_force (elastic + gravity)')
         if len(self._sa) > 0:
             self._apply_spring_forces(self._sa, self._sb, self._sr, self._sk)
+            self._fcheck('_apply_spring_forces (cutting springs)')
         self._cg(dt, cg_iters)
+        self._fcheck('_cg (implicit solve -> velocities)')
         self._apply_fixed(nv)
+        self._fcheck('_apply_fixed')
         self._integrate(dt, damping, v_max, nv)
+        self._fcheck('_integrate (v damping/clamp -> positions)')
 
     # ------------------------------------------------------------------
     # Cutting spring interface (mirrors _SpringMassSimulator)

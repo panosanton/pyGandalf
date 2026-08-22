@@ -642,7 +642,18 @@ class FEMMethod(SimulationMethod):
         self._pristine_positions = tet_mesh.vertices.astype(np.float32).copy()
 
     def step(self, dt: float) -> None:
+        # --force-trace: reset the per-frame first-bad tracker here (outer entry)
+        # so the trace spans opening -> simulator.step -> orphan kinematics, then
+        # check each method-level force-manip site (fem_simulator._FORCE_TRACE).
+        _sim = self._simulator
+        from pyGandalf.thesis_utilities import fem_simulator as _femmod
+        if _femmod._FORCE_TRACE:
+            _sim._dbg_reported = False
+            _sim._dbg_frame = getattr(_sim, '_dbg_frame', 0) + 1
+            _sim._fcheck('frame-start (pre-opening)')
         self._process_opening_ramp()
+        if _femmod._FORCE_TRACE:
+            _sim._fcheck('_process_opening_ramp (opening impulse)')
         self._simulator.step(
             dt,
             damping  = float(self._params.get('damping',  1.0)),
@@ -657,6 +668,8 @@ class FEMMethod(SimulationMethod):
                 self._orphan_masters,
                 self._orphan_offsets,
             )
+            if _femmod._FORCE_TRACE:
+                _sim._fcheck('apply_orphan_kinematics (orphan slaving)')
         # Legacy one-shot path uses _apply_orphan_constraints (numpy). It's a
         # no-op when _orphan_constraints is empty (progressive doesn't populate it).
         self._apply_orphan_constraints()

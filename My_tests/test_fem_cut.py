@@ -99,6 +99,10 @@ def main():
     parser.add_argument('--timing-seed', type=int, default=0,
                         help='Seed for the auto-cut TIMING rng (delay before each '
                              'cut, [0,40] frames). Bump until a run explodes.')
+    parser.add_argument('--force-trace', action='store_true', default=False,
+                        help='Debug: trace every force-manip site and report the '
+                             'FIRST one each frame that makes forces/velocities/'
+                             'positions go bad (sniffed from argv at import).')
     parser.add_argument('--cg_iters', type=int, default=20,
                         help='CG solver iterations (default: 20; increase for larger/stiffer meshes)')
     parser.add_argument('--tet_scale', type=float, default=1.0,
