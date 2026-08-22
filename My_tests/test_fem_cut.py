@@ -91,7 +91,14 @@ def main():
                         choices=list(MESH_CONFIG.keys()),
                         help='Mesh to simulate (default: sphere)')
     parser.add_argument('--seed', type=int, default=5,
-                        help='RNG seed for cut plane (default: 5)')
+                        help='RNG seed for cut plane ANGLES (default: 5)')
+    parser.add_argument('--auto-cut', action='store_true', default=False,
+                        help='Explosion repro harness: fire NUM_CUTS cuts '
+                             'automatically. Angles from --seed (unchanged); the '
+                             'per-cut frame delay from a SEPARATE --timing-seed.')
+    parser.add_argument('--timing-seed', type=int, default=0,
+                        help='Seed for the auto-cut TIMING rng (delay before each '
+                             'cut, [0,40] frames). Bump until a run explodes.')
     parser.add_argument('--cg_iters', type=int, default=20,
                         help='CG solver iterations (default: 20; increase for larger/stiffer meshes)')
     parser.add_argument('--tet_scale', type=float, default=1.0,
@@ -272,6 +279,20 @@ def main():
         taichi_comp.cut_plane_normal = _n.tolist()
         taichi_comp.blade_travel_dir = _bd.tolist()
     taichi_comp.randomize_cut_plane_cb = _regen_plane
+
+    # Automatic cut driver (explosion repro harness). Angles use `rng` (--seed,
+    # unchanged) via _regen_plane; timing uses a SEPARATE seeded rng so bumping
+    # --timing-seed explores different pre-cut physics states. NUM_CUTS and the
+    # max delay are constants for now.
+    NUM_CUTS = 3
+    DELAY_MAX_FRAMES = 40
+    taichi_comp.auto_cut_enabled   = args.auto_cut
+    taichi_comp.auto_cut_rng       = np.random.default_rng(args.timing_seed)
+    taichi_comp.auto_cut_num       = NUM_CUTS
+    taichi_comp.auto_cut_max_delay = DELAY_MAX_FRAMES
+    if args.auto_cut:
+        print(f"[AutoCut] enabled: {NUM_CUTS} cuts, angle-seed={args.seed}, "
+              f"timing-seed={args.timing_seed}, max-delay={DELAY_MAX_FRAMES} frames")
 
     scene.add_component(sphere, taichi_comp)
 

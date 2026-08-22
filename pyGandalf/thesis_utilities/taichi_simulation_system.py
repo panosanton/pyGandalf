@@ -292,6 +292,49 @@ class TaichiSimulationSystem(System):
             comp.should_cut = False
             _perform_cut(comp, mesh_comp)
 
+        # --- Automatic cut driver (explosion repro harness) ---
+        # When the test sets comp.auto_cut_enabled, fire comp.auto_cut_num cuts
+        # automatically. Cut ANGLES come from the existing plane RNG via
+        # randomize_cut_plane_cb (unchanged, deterministic per --seed). Cut TIMING
+        # comes from a SEPARATE seeded RNG (comp.auto_cut_rng): a fresh delay in
+        # [0, comp.auto_cut_max_delay] frames is drawn before EACH cut. The whole
+        # run is deterministic per (plane-seed, timing-seed), so bumping the timing
+        # seed until a run explodes gives a repeatable repro to instrument against.
+        if getattr(comp, 'auto_cut_enabled', False):
+            if not hasattr(comp, '_auto_phase'):
+                comp._auto_phase = 'wait'
+                comp._auto_index = 0
+                comp._auto_wait = int(comp.auto_cut_rng.integers(
+                    0, int(comp.auto_cut_max_delay) + 1))
+                print(f"[AutoCut] cut 1/{comp.auto_cut_num} in {comp._auto_wait} "
+                      f"frames", flush=True)
+            if comp._auto_phase == 'wait':
+                if comp._auto_wait > 0:
+                    comp._auto_wait -= 1
+                else:
+                    if comp._auto_index > 0:   # cuts 2+ regenerate the plane
+                        _cb = getattr(comp, 'randomize_cut_plane_cb', None)
+                        if callable(_cb):
+                            _cb()
+                    _setup_progressive_cut(comp, mesh_comp)
+                    comp._auto_index += 1
+                    comp._auto_phase = 'cutting'
+                    print(f"[AutoCut] started cut {comp._auto_index}/"
+                          f"{comp.auto_cut_num}", flush=True)
+            elif comp._auto_phase == 'cutting':
+                if getattr(comp, 'blade_cut_completed', False):
+                    if comp._auto_index >= int(comp.auto_cut_num):
+                        comp._auto_phase = 'done'
+                        print(f"[AutoCut] all {comp.auto_cut_num} cuts done",
+                              flush=True)
+                    else:
+                        comp._auto_wait = int(comp.auto_cut_rng.integers(
+                            0, int(comp.auto_cut_max_delay) + 1))
+                        comp._auto_phase = 'wait'
+                        print(f"[AutoCut] cut {comp._auto_index + 1}/"
+                              f"{comp.auto_cut_num} in {comp._auto_wait} frames",
+                              flush=True)
+
         # --- B key: progressive blade cut ---
         b_now = InputManager().get_key_down(glfw.KEY_B)
         if b_now and not getattr(self, '_b_prev', False):
