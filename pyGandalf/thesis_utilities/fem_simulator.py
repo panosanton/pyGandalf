@@ -471,10 +471,22 @@ class _FEMSimulator:
                 self.positions[verts[i]] - self.positions[verts[3]]
                 for i in range(3)
             ])
-            self._B[c] = Dm.inverse()
-            self._W[c] = ti.abs(Dm.determinant()) / 6.0
+            _det = Dm.determinant()
+            _w   = ti.abs(_det) / 6.0
+            self._W[c] = _w
+            # A truly singular rest tet (coincident/coplanar verts) makes
+            # Dm.inverse() overflow to inf/nan, which then poisons _compute_diag_K
+            # and _matmul via scale*BBt = 0*inf = NaN even when the tet is
+            # deactivated (W=0). Zero B for singular tets so their contribution is
+            # a clean 0 everywhere. Threshold is far below any valid tet
+            # (valid W >= ~1e-6); only near-exactly-degenerate tets are affected,
+            # and those carry no physical stiffness anyway.
+            if _w > 1e-11:
+                self._B[c] = Dm.inverse()
+            else:
+                self._B[c] = ti.Matrix.zero(ti.f32, 3, 3)
             for i in ti.static(range(4)):
-                self._masses[verts[i]] += self._W[c] * self._density / 4.0
+                self._masses[verts[i]] += _w * self._density / 4.0
 
     @ti.kernel
     def _compute_diag_K(self, n_v: ti.i32, n_t: ti.i32):
@@ -526,6 +538,10 @@ class _FEMSimulator:
         """Corotational elastic forces + gravity."""
         grav = ti.Vector([gravity[0], gravity[1], gravity[2]])
         for c in range(n_t):
+            # Deactivated / degenerate tets carry no elastic force. Skipping them
+            # also avoids a singular-rest-tet's stress feeding the force sum.
+            if self._W[c] <= 0.0:
+                continue
             verts = self._tets[c]
             Ds = ti.Matrix.cols([
                 self.positions[verts[i]] - self.positions[verts[3]]

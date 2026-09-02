@@ -654,14 +654,12 @@ class FEMMethod(SimulationMethod):
         self._process_opening_ramp()
         if _femmod._FORCE_TRACE:
             _sim._fcheck('_process_opening_ramp (opening impulse)')
-        self._simulator.step(
-            dt,
-            damping  = float(self._params.get('damping',  1.0)),
-            v_max    = float(self._params.get('v_max',    10.0)),
-            cg_iters = int(self._params.get('cg_iters',  20)),
-        )
-        # Progressive path: kinematically slave sliver-orphaned INTER/DUPs to
-        # their master ORIG each step, on-GPU (no numpy round-trip).
+        # Progressive path: kinematically slave sliver-orphaned INTER/DUPs to their
+        # master ORIG BEFORE the solve, so the imposed orphan position is seen by
+        # _get_force and the body responds inside the stable implicit step. Applying
+        # it AFTER the integrate injected an explicit, un-damped force on the
+        # sliver's body verts every frame -> exponential ring-up. The 1-frame lag of
+        # the pre-solve order acts as damping instead.
         if getattr(self, '_orphan_ids', None) is not None and len(self._orphan_ids) > 0:
             self._simulator.apply_orphan_kinematics(
                 self._orphan_ids,
@@ -670,6 +668,12 @@ class FEMMethod(SimulationMethod):
             )
             if _femmod._FORCE_TRACE:
                 _sim._fcheck('apply_orphan_kinematics (orphan slaving)')
+        self._simulator.step(
+            dt,
+            damping  = float(self._params.get('damping',  1.0)),
+            v_max    = float(self._params.get('v_max',    10.0)),
+            cg_iters = int(self._params.get('cg_iters',  20)),
+        )
         # Legacy one-shot path uses _apply_orphan_constraints (numpy). It's a
         # no-op when _orphan_constraints is empty (progressive doesn't populate it).
         self._apply_orphan_constraints()
@@ -2491,6 +2495,25 @@ class FEMMethod(SimulationMethod):
         n_orig = self._full_n_orig
         has_new_vert = (super_tets >= n_orig).any(axis=1)
         is_sliver = has_new_vert & (vols < _thresh) if _thresh > 0.0 else np.zeros(len(super_tets), dtype=bool)
+
+        # Also flag ANY numerically-degenerate tet, regardless of vertex origin.
+        # The has_new_vert gate above only sees tets containing an INTER/DUP vert,
+        # so it misses all-pristine degenerate tets: baked coincident-cluster verts
+        # form zero-volume tets (rest vol ~1e-10). Left active, such a tet's force
+        # W*Dm^-1 is numerical garbage that flings the free vertex among the cluster
+        # to v_max, dragging its coincident slaved orphans out as a spike. A
+        # zero-volume element has no physical force, so deactivating it is correct.
+        # Threshold is relative to the median tet volume so it auto-scales: valid
+        # tets sit near the median, degenerate ones are orders of magnitude below.
+        # Once a cluster vert is flagged its tets go inert AND it becomes an orphan,
+        # which excludes it from being a master (so the cluster slaves to a real
+        # body vert instead of to a free coincident vertex).
+        _degen_frac = float(self._params.get('degenerate_vol_frac', 1e-4))
+        if _degen_frac > 0.0:
+            _pos_vols = vols[vols > 0.0]
+            if len(_pos_vols) > 0:
+                _degen_floor = _degen_frac * float(np.median(_pos_vols))
+                is_sliver = is_sliver | (vols < _degen_floor)
 
         # ---- [SnapProbe] diagnostic (MEASUREMENT ONLY -- no behavior change) ---
         # Option-1 groundwork. Slivers are born when the cut plane passes very
