@@ -627,3 +627,185 @@ def clear_highlight(comp, mesh_comp):
     gl.glBindVertexArray(0)
     comp._pick_highlight_active = False
     print("[Pick] highlight cleared")
+
+
+# ---------------------------------------------------------------------------
+# Island drag tool (plain left-click + drag). Grabs the tet under the cursor
+# and moves it to follow the cursor on a camera-facing plane; the connected
+# island comes along -- ELASTIC via the FEM solve (pin the tet, physics pulls
+# the rest) or RIGID (translate the whole connected tet-component). Because it
+# follows tet CONNECTIVITY, it separates islands that overlap in space but are
+# topologically distinct -- which position-welding could not do.
+# ---------------------------------------------------------------------------
+
+def _phys_vert(comp, v, n_active):
+    """Map a render-space vertex (which may be a disc-split render dup) back to
+    its physical simulator vertex."""
+    if v < n_active:
+        return int(v)
+    dsi = comp._disc_split_phys_idx
+    return int(dsi[v - n_active])
+
+
+def _project_cursor_to_plane(camera_comp, cam_pos, cursor_x, cursor_y,
+                             win_w, win_h, plane_pt, plane_n):
+    """Intersect the cursor ray with the drag plane (plane_pt, plane_n)."""
+    _, d = _build_ray(camera_comp.view, camera_comp.projection, cam_pos,
+                      cursor_x, cursor_y, win_w, win_h)
+    o = cam_pos.astype(np.float32)
+    denom = float(np.dot(d, plane_n))
+    if abs(denom) < 1e-8:
+        return None
+    t = float(np.dot(plane_pt - o, plane_n)) / denom
+    if t <= 0:
+        return None
+    return (o + t * d).astype(np.float32)
+
+
+def _connected_component_verts(tets_np, W, seed_verts):
+    """All vertices in the connected component(s) (over ACTIVE tets, W>0) that
+    contain seed_verts. Two verts are connected if an active tet shares them."""
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+    active = tets_np[W > 0.0]
+    if len(active) == 0:
+        return np.unique(seed_verts).astype(np.int64)
+    nv = int(tets_np.max()) + 1
+    a = np.concatenate([active[:, 0], active[:, 0], active[:, 0],
+                        active[:, 1], active[:, 1], active[:, 2]])
+    b = np.concatenate([active[:, 1], active[:, 2], active[:, 3],
+                        active[:, 2], active[:, 3], active[:, 3]])
+    g = csr_matrix((np.ones(len(a)), (a, b)), shape=(nv, nv))
+    _, lab = connected_components(g, directed=False)
+    seed_labels = np.unique(lab[np.asarray(seed_verts, dtype=np.int64)])
+    return np.where(np.isin(lab, seed_labels))[0].astype(np.int64)
+
+
+def drag_begin(comp, mesh_comp, camera_comp, camera_transform,
+               cursor_x, cursor_y, win_w, win_h):
+    """Grab the tet under the cursor. Returns True if a drag started."""
+    if comp.method is None or comp.simulator is None:
+        return False
+    cam_pos = np.array([camera_transform.translation.x,
+                        camera_transform.translation.y,
+                        camera_transform.translation.z], dtype=np.float32)
+    origin, direction = _build_ray(camera_comp.view, camera_comp.projection,
+                                   cam_pos, cursor_x, cursor_y, win_w, win_h)
+    pos_active = comp.method.get_positions()
+    n_active   = pos_active.shape[0]
+    if (comp._disc_split_phys_idx is not None
+            and len(comp._disc_split_phys_idx) > 0):
+        render_pos = np.vstack([pos_active, pos_active[comp._disc_split_phys_idx]])
+    else:
+        render_pos = pos_active
+    faces = _current_rendered_faces(comp)
+    if faces is None or len(faces) == 0:
+        return False
+    face_row, t_hit = _ray_intersect_all(origin, direction, render_pos, faces)
+    if face_row is None:
+        return False
+    hit_world  = origin + direction * t_hit
+    face_verts = faces[face_row]
+    phys = np.array([_phys_vert(comp, int(v), n_active) for v in face_verts],
+                    dtype=np.int64)
+
+    sim     = comp.simulator
+    n_tets  = sim.n_tets
+    tets_np = sim._tets.to_numpy()[:n_tets]
+    parents = _find_tets_containing_vectorised(phys, tets_np)
+    if not parents:
+        print("[Drag] no parent tet under cursor")
+        return False
+    tet0      = int(parents[0])
+    tet_verts = tets_np[tet0].astype(np.int64)
+
+    mode = getattr(comp, '_drag_mode', 'elastic')
+    W = sim._W.to_numpy()[:n_tets]
+    if mode == 'rigid':
+        ctrl_verts = _connected_component_verts(tets_np, W, tet_verts)
+    else:
+        # elastic: grab the clicked tet PLUS its immediate (1-ring) neighbours --
+        # any ACTIVE tet sharing a vertex with it -- so the grabbed patch is
+        # stiffer and translates a local chunk instead of stretching one tet.
+        nbr = np.isin(tets_np, tet_verts).any(axis=1) & (W > 0.0)
+        ctrl_verts = np.unique(tets_np[nbr].ravel())
+
+    # Pin the controlled verts so the solve treats them as kinematic and our
+    # per-frame position write is respected.
+    fixed = sim._fixed.to_numpy()
+    saved_fixed = fixed[ctrl_verts].copy()
+    fixed[ctrl_verts] = 1
+    sim._fixed.from_numpy(fixed)
+
+    # Suspend orphan slaving for the controlled verts (else the per-step orphan
+    # kinematics overrides our drag each frame). Saved + restored on release.
+    saved_orphans = None
+    oid = getattr(comp.method, '_orphan_ids', None)
+    if oid is not None and len(oid) > 0:
+        oid = np.asarray(oid)
+        keep = ~np.isin(oid, ctrl_verts)
+        if not keep.all():
+            saved_orphans = (comp.method._orphan_ids,
+                             comp.method._orphan_masters,
+                             comp.method._orphan_offsets)
+            comp.method._orphan_ids     = oid[keep].astype(np.int32)
+            comp.method._orphan_masters = np.asarray(comp.method._orphan_masters)[keep]
+            comp.method._orphan_offsets = np.asarray(comp.method._orphan_offsets)[keep]
+
+    start_pos = sim.positions.to_numpy()
+    comp._drag_state = {
+        'mode':          mode,
+        'verts':         ctrl_verts,
+        'start_pos':     start_pos[ctrl_verts].copy(),
+        'plane_pt':      hit_world.astype(np.float32),
+        'plane_n':       (direction / (np.linalg.norm(direction) or 1.0)).astype(np.float32),
+        'grab_world':    hit_world.astype(np.float32),
+        'saved_fixed':   saved_fixed,
+        'saved_orphans': saved_orphans,
+    }
+    print(f"[Drag] begin ({mode}): tet {tet0}, controlling "
+          f"{len(ctrl_verts)} verts. Drag to move, release to drop.")
+    return True
+
+
+def drag_update(comp, camera_comp, camera_transform,
+                cursor_x, cursor_y, win_w, win_h):
+    """Move the controlled verts to follow the cursor on the drag plane."""
+    st = getattr(comp, '_drag_state', None)
+    if st is None:
+        return
+    cam_pos = np.array([camera_transform.translation.x,
+                        camera_transform.translation.y,
+                        camera_transform.translation.z], dtype=np.float32)
+    target = _project_cursor_to_plane(camera_comp, cam_pos, cursor_x, cursor_y,
+                                      win_w, win_h, st['plane_pt'], st['plane_n'])
+    if target is None:
+        return
+    offset = (target - st['grab_world']).astype(np.float32)
+    sim = comp.simulator
+    pos = sim.positions.to_numpy()
+    pos[st['verts']] = st['start_pos'] + offset
+    sim.positions.from_numpy(pos)
+    vel = sim.velocities.to_numpy()
+    vel[st['verts']] = 0.0
+    sim.velocities.from_numpy(vel)
+
+
+def drag_end(comp):
+    """Restore pinned/orphan state; leave the island where it was dragged."""
+    st = getattr(comp, '_drag_state', None)
+    if st is None:
+        return
+    sim = comp.simulator
+    fixed = sim._fixed.to_numpy()
+    fixed[st['verts']] = st['saved_fixed']
+    sim._fixed.from_numpy(fixed)
+    vel = sim.velocities.to_numpy()
+    vel[st['verts']] = 0.0
+    sim.velocities.from_numpy(vel)
+    if st['saved_orphans'] is not None:
+        (comp.method._orphan_ids,
+         comp.method._orphan_masters,
+         comp.method._orphan_offsets) = st['saved_orphans']
+    comp._drag_state = None
+    print(f"[Drag] released ({st['mode']}): {len(st['verts'])} verts dropped.")

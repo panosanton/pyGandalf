@@ -540,14 +540,35 @@ class TaichiSimulationSystem(System):
         ctrl_held  = InputManager().get_key_down(glfw.KEY_LEFT_CONTROL)
         lmb_now    = InputManager().get_key_down(glfw.MOUSE_BUTTON_1)
         rmb_now    = InputManager().get_key_down(glfw.MOUSE_BUTTON_2)
-        lmb_press  = ctrl_held and lmb_now and not getattr(self, '_pick_lmb_prev', False)
+        lmb_prev   = getattr(self, '_pick_lmb_prev', False)
+        lmb_press  = ctrl_held and lmb_now and not lmb_prev
         rmb_press  = ctrl_held and rmb_now and not getattr(self, '_pick_rmb_prev', False)
+        # Plain left-click (no ctrl) drives the island DRAG tool. Camera uses
+        # RMB/MMB, so plain LMB is free. Ctrl+LMB stays the pick tool.
+        drag_active  = getattr(comp, '_drag_state', None) is not None
+        drag_press   = lmb_now and not ctrl_held and not lmb_prev
+        drag_release = (not lmb_now) and lmb_prev and drag_active
         if lmb_press:
             _run_pick(comp, mesh_comp)
+        elif drag_press:
+            _run_drag_begin(comp, mesh_comp)
+        if lmb_now and not ctrl_held and getattr(comp, '_drag_state', None) is not None:
+            _run_drag_update(comp, mesh_comp)
+        if drag_release:
+            pick_inspector.drag_end(comp)
         if rmb_press:
             pick_inspector.clear_highlight(comp, mesh_comp)
         self._pick_lmb_prev = lmb_now
         self._pick_rmb_prev = rmb_now
+
+        # --- M key: toggle island-drag mode (elastic <-> rigid) ---
+        m_now = InputManager().get_key_down(glfw.KEY_M)
+        if m_now and not getattr(self, '_m_prev', False):
+            cur = getattr(comp, '_drag_mode', 'elastic')
+            comp._drag_mode = 'rigid' if cur == 'elastic' else 'elastic'
+            print(f"[Drag] mode = {comp._drag_mode}  "
+                  f"({'translate whole connected component' if comp._drag_mode == 'rigid' else 'pin tet, FEM pulls the island'})")
+        self._m_prev = m_now
         gl.glPolygonMode(gl.GL_FRONT_AND_BACK,
                          gl.GL_LINE if getattr(comp, '_wireframe', False) else gl.GL_FILL)
         if comp.use_culling:
@@ -751,6 +772,47 @@ def _run_pick(comp: TaichiSimulationComponent, mesh_comp: StaticMeshComponent):
     cursor = InputManager().get_mouse_cursor_pos()
     pick_inspector.pick_and_dump(
         comp, mesh_comp, camera_comp, camera_xf,
+        cursor.x, cursor.y, int(win.width), int(win.height))
+
+
+def _primary_camera_cursor_window():
+    """(camera_comp, camera_transform, window, cursor) for the primary camera,
+    or None. Shared by the pick/drag runners."""
+    scene = SceneManager().active_scene
+    if scene is None:
+        return None
+    arrays     = scene.get_components_array()
+    cameras    = arrays.get(CameraComponent,    []) or []
+    transforms = arrays.get(TransformComponent, []) or []
+    for entity in scene.get_entities():
+        refs = scene.get_entity_component_references(entity)
+        if CameraComponent in refs and TransformComponent in refs:
+            cc = cameras[refs[CameraComponent]]
+            if getattr(cc, 'primary', False):
+                win    = Application().get_window()
+                cursor = InputManager().get_mouse_cursor_pos()
+                return cc, transforms[refs[TransformComponent]], win, cursor
+    return None
+
+
+def _run_drag_begin(comp: TaichiSimulationComponent, mesh_comp: StaticMeshComponent):
+    ctx = _primary_camera_cursor_window()
+    if ctx is None:
+        print("[Drag] no primary camera/scene")
+        return
+    camera_comp, camera_xf, win, cursor = ctx
+    pick_inspector.drag_begin(
+        comp, mesh_comp, camera_comp, camera_xf,
+        cursor.x, cursor.y, int(win.width), int(win.height))
+
+
+def _run_drag_update(comp: TaichiSimulationComponent, mesh_comp: StaticMeshComponent):
+    ctx = _primary_camera_cursor_window()
+    if ctx is None:
+        return
+    camera_comp, camera_xf, win, cursor = ctx
+    pick_inspector.drag_update(
+        comp, camera_comp, camera_xf,
         cursor.x, cursor.y, int(win.width), int(win.height))
 
 
