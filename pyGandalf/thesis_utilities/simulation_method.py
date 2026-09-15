@@ -1363,7 +1363,22 @@ class FEMMethod(SimulationMethod):
                  else np.zeros(0, dtype=np.int64))
         keep_mask = W_old > 0.0
         if _resident and len(_sliv) > 0:
-            keep_mask[_sliv] = True
+            # Never keep an UNSPLIT-BLOCK row (superset rows >= n_full_tets):
+            # it is the whole pre-split parent of a crossing tet, so it spans
+            # the cut plane with vertices on BOTH pieces. Its split sub-tets
+            # already represent it. The resident threading flags a carried
+            # inert parent's unsplit row as sliver too, which used to keep it:
+            # measured at cut 3 as 13 inert tets bridging two large pieces, all
+            # verts born in cut 1, none split by cut 2 -> stretched "fused"
+            # tets across the cut-2 wound and lumped piece labels.
+            _n_full_old = len(self._full_all_tets) if getattr(self, '_full_all_tets', None) is not None else n_t_old
+            _unsplit_kept = _sliv[_sliv >= _n_full_old]
+            _sliv_keep = _sliv[_sliv < _n_full_old]
+            if len(_unsplit_kept) > 0:
+                print(f"[Bake] dropping {len(_unsplit_kept)} sliver-flagged UNSPLIT-block rows "
+                      f"(whole crossing parents spanning the cut plane); "
+                      f"{len(_sliv_keep)} split-block sliver rows kept resident", flush=True)
+            keep_mask[_sliv_keep] = True
         kept_slot_ids = np.where(keep_mask)[0]     # superset row -> baked row j
         kept_tets = tets_old[keep_mask]
 
@@ -2721,6 +2736,28 @@ class FEMMethod(SimulationMethod):
 
         orphan_ids = np.where(orphan_mask)[0].astype(np.int32)
 
+        # Piece labels: connected components of the END-STATE superset tets
+        # (full-block rows, slivers included). Vertex duplication at every cut
+        # plane keeps separate pieces disconnected, so the label is the piece a
+        # vertex physically belongs to. Masters must be picked on the orphan's
+        # own piece: with several pieces on the same side of the current cut,
+        # nearest-by-distance alone lands on a neighbouring piece (measured:
+        # 894/2437 at cut 2, 1494/3606 at cut 3 with opening_speed=0), which
+        # stretches the orphan's tets between pieces and, when the orphan owns
+        # an active tet, welds the pieces together.
+        _piece_lab = None
+        try:
+            from scipy.sparse import csr_matrix as _csr
+            from scipy.sparse.csgraph import connected_components as _cc
+            _et = super_tets[:n_full_tets]
+            _a = np.concatenate([_et[:, 0], _et[:, 0], _et[:, 0], _et[:, 1], _et[:, 1], _et[:, 2]])
+            _b = np.concatenate([_et[:, 1], _et[:, 2], _et[:, 3], _et[:, 2], _et[:, 3], _et[:, 3]])
+            _g = _csr((np.ones(len(_a)), (_a, _b)), shape=(n_full_v, n_full_v))
+            _, _piece_lab = _cc(_g, directed=False)
+        except Exception as _e:
+            print(f"[Orphan] piece labels unavailable ({_e}); masters by distance only",
+                  flush=True)
+
         # Master finding: for each orphan, look at its geometric neighborhood.
         # For an INTER vert nid, we know its pristine edge (vi, vj) -- those two
         # ORIG endpoints are its natural masters. Pick the closer one by
@@ -2831,16 +2868,43 @@ class FEMMethod(SimulationMethod):
                     stray_idx = np.where(neither_matches)[0]
                     stray_orphans = orphan_ids[stray_idx]
                     stray_side    = orphan_side[stray_idx]
+                    _n_nopiece = 0
+
+                    def _pick(tree, pool_idx, o_pos, o_lab):
+                        """Nearest pool vertex ON THE ORPHAN'S PIECE. k nearest
+                        first (cheap), then a piece-masked brute force, then the
+                        plain nearest if the piece has no eligible master."""
+                        nonlocal _n_nopiece
+                        if _piece_lab is None:
+                            _, k = tree.query(o_pos)
+                            return int(pool_idx[k])
+                        kk = min(32, len(pool_idx))
+                        _, ks = tree.query(o_pos, k=kk)
+                        ks = np.atleast_1d(ks)
+                        for k in ks:
+                            cand = int(pool_idx[k])
+                            if _piece_lab[cand] == o_lab:
+                                return cand
+                        same = pool_idx[_piece_lab[pool_idx] == o_lab]
+                        if len(same) > 0:
+                            d2 = ((self._full_final_pos[same] - o_pos) ** 2).sum(axis=1)
+                            return int(same[int(np.argmin(d2))])
+                        _n_nopiece += 1
+                        return int(pool_idx[int(ks[0])])
+
                     for j, o_local in enumerate(stray_idx):
                         o_global = int(stray_orphans[j])
                         o_pos    = self._full_final_pos[o_global]
+                        o_lab    = _piece_lab[o_global] if _piece_lab is not None else None
                         if stray_side[j] > 0 and above_tree is not None:
-                            _, k = above_tree.query(o_pos)
-                            masters[o_local] = int(above_pool_idx[k])
+                            masters[o_local] = _pick(above_tree, above_pool_idx, o_pos, o_lab)
                         elif stray_side[j] < 0 and below_tree is not None:
-                            _, k = below_tree.query(o_pos)
-                            masters[o_local] = int(below_pool_idx[k])
+                            masters[o_local] = _pick(below_tree, below_pool_idx, o_pos, o_lab)
                         # else: no pool on this side -- keep vj fallback.
+                    if _n_nopiece > 0:
+                        print(f"[Orphan] {_n_nopiece} orphans have no eligible master on "
+                              f"their own piece (piece is all-orphan/inert); nearest used",
+                              flush=True)
                 except ImportError:
                     pass  # scipy not available; keep the vj fallback
 
