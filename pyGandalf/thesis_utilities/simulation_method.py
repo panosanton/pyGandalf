@@ -2734,6 +2734,32 @@ class FEMMethod(SimulationMethod):
                 print(f"[IslandReattach] skipped ({_e})", flush=True)
         # --- end severed-island reattachment ---------------------------------
 
+        # --- Under-determined (hinge) verts -----------------------------------
+        # Sliver deactivation can leave a free vertex with exactly ONE active
+        # tet. If that tet holds two such verts, the pair can rotate rigidly
+        # about the tet's anchored edge at zero elastic cost (corotational FEM
+        # has no stiffness against rigid rotation), so every opening nudges it
+        # further into the body and nothing pulls it back: a slowly forming
+        # dent in the wound (measured: two cut-1 INTERs sharing one active tet,
+        # 8 mm below the wound plane after cut-1's opening, their single tet
+        # exactly at rest). A vertex needs at least two active tets to be
+        # kinematically determined; slave the ones with fewer to a master like
+        # the sliver-only orphans. Masters are piece-restricted (above), so
+        # slaving a vertex that owns an active tet cannot weld pieces.
+        _min_act = int(self._params.get('min_active_tets', 2))
+        if _min_act > 1 and len(good_end_slots) > 0:
+            good_cnt = np.bincount(super_tets[good_end_slots].ravel(), minlength=n_full_v)
+            weak = touched_by_any_end & (good_cnt > 0) & (good_cnt < _min_act) & (~orphan_mask)
+            _ff = getattr(self, '_full_final_fixed', None)
+            if _ff is not None:
+                weak &= ~np.asarray(_ff).astype(bool)[:n_full_v]   # anchors are determined
+            n_weak = int(weak.sum())
+            if n_weak > 0:
+                orphan_mask = orphan_mask | weak
+                print(f"[WeakSupport] {n_weak} free verts with < {_min_act} active tets "
+                      f"slaved as orphans (hinge fix)", flush=True)
+        # --- end under-determined verts ---------------------------------------
+
         orphan_ids = np.where(orphan_mask)[0].astype(np.int32)
 
         # Piece labels: connected components of the END-STATE superset tets

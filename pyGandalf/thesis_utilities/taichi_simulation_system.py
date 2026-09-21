@@ -495,6 +495,15 @@ class TaichiSimulationSystem(System):
             print(f"[Wire] {'ON' if comp._wireframe else 'OFF'}")
         self._z_prev = z_now
 
+        # --- H key: flat shading (per-face geometric normals, oriented toward
+        # the camera). Shading then depends on positions only, so a "dent"
+        # that survives is geometry and one that vanishes was vertex normals.
+        h_now = InputManager().get_key_down(glfw.KEY_H)
+        if h_now and not getattr(self, '_h_prev', False):
+            comp._geo_normals = not getattr(comp, '_geo_normals', False)
+            print(f"[FlatShade] {'ON (per-face geometric normals)' if comp._geo_normals else 'OFF (smooth vertex normals)'}")
+        self._h_prev = h_now
+
         # --- K key: clear Taichi kernel_profiler stats (no-op if profiling off) ---
         k_now = InputManager().get_key_down(glfw.KEY_K)
         if k_now and not getattr(self, '_k_prev', False):
@@ -642,13 +651,23 @@ class TaichiSimulationSystem(System):
             _norm_faces = comp.surface_indices[~_ows]
 
         if comp._n_orig is not None:
+            # Disc-snap eligibility per render vertex: current-cut INTER/DUP
+            # verts, and render dups OF them. Dups of baked (< n_orig) verts
+            # come from the old-wound collar split and must not be snapped to
+            # this cut's plane normal.
+            _n_phys = new_positions.shape[0]
+            _elig = np.zeros(render_positions.shape[0], dtype=bool)
+            _elig[comp._n_orig:_n_phys] = True
+            if comp._disc_split_phys_idx is not None and len(comp._disc_split_phys_idx) > 0:
+                _dsi = np.asarray(comp._disc_split_phys_idx, dtype=np.int64)
+                _elig[_n_phys:_n_phys + len(_dsi)] = _dsi >= comp._n_orig
             # Base normals from reliably-wound NON-sliver faces. Verts with an
             # active face get a good normal here; sliver-only verts stay zero.
             new_normals = _compute_normals_post_cut(
                 render_positions, _norm_faces,
                 comp._n_orig, comp._n_split,
                 comp._inter_data, comp._shared_list,
-                comp._cut_normal)
+                comp._cut_normal, disc_eligible=_elig)
             if (_norm_faces is not comp.surface_indices and comp._ow_sliver is not None
                     and len(comp._ow_sliver) == len(comp.surface_indices)):
                 _zero = np.linalg.norm(new_normals, axis=1) < 1e-6
@@ -665,8 +684,18 @@ class TaichiSimulationSystem(System):
                         _p0 = render_positions[_sf[:, 0]]
                         _p1 = render_positions[_sf[:, 1]]
                         _p2 = render_positions[_sf[:, 2]]
+                        # Sliver faces include NEEDLES (a 1-4 mm edge against a
+                        # 10 cm one): their normal is set by the short edge and
+                        # swings tens of degrees with sub-mm vertex noise, which
+                        # read as a crater on the old wound. Keep the raw cross
+                        # product (area weight, so needles count ~nothing) and
+                        # drop faces with aspect ratio > 10 entirely.
                         _fn = np.cross(_p1 - _p0, _p2 - _p0)
-                        _fn /= (np.linalg.norm(_fn, axis=1, keepdims=True) + 1e-12)
+                        _e = np.stack([np.linalg.norm(_p1 - _p0, axis=1),
+                                       np.linalg.norm(_p2 - _p1, axis=1),
+                                       np.linalg.norm(_p0 - _p2, axis=1)], axis=1)
+                        _needle = _e.max(axis=1) > 10.0 * np.maximum(_e.min(axis=1), 1e-9)
+                        _fn[_needle] = 0.0
                         _ref = (new_normals[_sf[:, 0]] + new_normals[_sf[:, 1]]
                                 + new_normals[_sf[:, 2]])
                         _flip = np.einsum('ij,ij->i', _fn, _ref) < 0.0
@@ -675,8 +704,59 @@ class TaichiSimulationSystem(System):
                         for _k in range(3):
                             np.add.at(_acc, _sf[:, _k], _fn)
                         _an = np.linalg.norm(_acc, axis=1)
-                        _use = _zero & (_an > 1e-6)
+                        _use = _zero & (_an > 1e-9)
                         new_normals[_use] = _acc[_use] / _an[_use, None]
+                        # Orphans: orient against the MASTER's normal (an on-piece,
+                        # non-orphan vertex with a proper normal). A sliver face
+                        # whose 3 verts are all orphans has no base-normal
+                        # reference, keeps its random winding, and came out
+                        # inverted (measured: plane normal exactly negated).
+                        # Orphans with nothing accumulated (only needle faces)
+                        # inherit the master's normal outright.
+                        _oid = getattr(comp.method, '_orphan_ids', None)
+                        _oma = getattr(comp.method, '_orphan_masters', None)
+                        if _oid is not None and len(_oid) > 0:
+                            _oid = np.asarray(_oid, dtype=np.int64)
+                            _oma = np.asarray(_oma, dtype=np.int64)
+                            _ok = (_oid < len(new_normals)) & (_oma < len(new_normals))
+                            _oid, _oma = _oid[_ok], _oma[_ok]
+                            _zo = _zero[_oid]
+                            _mn = new_normals[_oma]
+                            _on = new_normals[_oid]
+                            _flipped = _zo & (np.einsum('ij,ij->i', _on, _mn) < 0.0)
+                            new_normals[_oid[_flipped]] = -_on[_flipped]
+                            _none = _zo & (np.linalg.norm(_on, axis=1) < 1e-6)
+                            new_normals[_oid[_none]] = _mn[_none]
+                        # Orientation propagation. A master can itself be a
+                        # sliver-only vertex with a random-signed fallback
+                        # normal (the sliver apex under the wound), and every
+                        # orphan aligned to it comes out inverted. Flip each
+                        # sliver-only vertex to agree with the mean normal of
+                        # its TRUSTED neighbours (real base normal first, then
+                        # vertices oriented in an earlier pass), a few passes
+                        # so chains resolve.
+                        # Untrusted = no base normal OR an orphan: a weak-support
+                        # orphan owns one active tet whose single non-sliver face
+                        # has a random winding, so its base normal can be
+                        # inverted too (measured on a vertex darkening its ring).
+                        _untrusted = _zero.copy()
+                        if _oid is not None and len(_oid) > 0:
+                            _untrusted[np.asarray(_oid, dtype=np.int64)] = True
+                        _trusted = ~_untrusted
+                        for _pass in range(3):
+                            _rf = np.zeros_like(new_normals)
+                            _rw = np.zeros(len(new_normals))
+                            for _a, _b in ((0, 1), (1, 2), (2, 0), (1, 0), (2, 1), (0, 2)):
+                                _src = _sf[:, _b]; _dst = _sf[:, _a]
+                                _m = _trusted[_src]
+                                np.add.at(_rf, _dst[_m], new_normals[_src[_m]])
+                                np.add.at(_rw, _dst[_m], 1.0)
+                            _cand = _untrusted & (_rw > 0.0) & ~_trusted
+                            _fl = _cand & (np.einsum('ij,ij->i', new_normals, _rf) < 0.0)
+                            new_normals[_fl] = -new_normals[_fl]
+                            if not _cand.any():
+                                break
+                            _trusted = _trusted | _cand
         else:
             new_normals = _compute_normals(render_positions, _norm_faces)
         t3 = time.perf_counter()
@@ -712,6 +792,23 @@ class TaichiSimulationSystem(System):
         else:
             upload_pos  = render_positions
             upload_norm = new_normals
+
+        # H key: replace every slot normal with its face's geometric normal,
+        # flipped to face the camera (so winding does not matter). Exploded
+        # layout only (each face owns its 3 slots).
+        if getattr(comp, '_geo_normals', False) and comp._face_expanded \
+                and comp._all_render_faces is not None:
+            P = upload_pos.reshape(-1, 3, 3)
+            fn = np.cross(P[:, 1] - P[:, 0], P[:, 2] - P[:, 0])
+            fn /= (np.linalg.norm(fn, axis=1, keepdims=True) + 1e-12)
+            ctx = _primary_camera_cursor_window()
+            if ctx is not None:
+                cx = ctx[1].translation
+                cam = np.array([cx.x, cx.y, cx.z], dtype=np.float32)
+                to_cam = cam - P.mean(axis=1)
+                flip = np.einsum('ij,ij->i', fn, to_cam) < 0.0
+                fn[flip] = -fn[flip]
+            upload_norm = np.repeat(fn, 3, axis=0).astype(np.float32)
 
         _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[0], upload_pos)
         _update_vbo(mesh_comp.render_pipeline, mesh_comp.buffers[1], upload_norm)

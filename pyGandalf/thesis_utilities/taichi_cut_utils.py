@@ -976,9 +976,16 @@ def _compute_normals_post_cut(vertices:    np.ndarray,
                                n_split:     int,
                                inter_data:  list,
                                shared_list: list,
-                               cut_normal:  np.ndarray) -> np.ndarray:
+                               cut_normal:  np.ndarray,
+                               disc_eligible: np.ndarray = None) -> np.ndarray:
     """
     Normal computation for a cut mesh.  Fully vectorized -- no Python loops.
+
+    disc_eligible: optional bool mask over render vertices. When given, a face
+    is a disc face only if all three verts are eligible. Render duplicates of
+    BAKED old-wound vertices (collar vertex-split, physical id < n_orig) are
+    not; without this they satisfy `idx >= n_orig` and get snapped to the
+    CURRENT cut's plane normal, shading an old-wound rim face inside-out.
     """
     normals = np.zeros_like(vertices, dtype=np.float32)
     idx_i32 = indices.astype(np.int32)
@@ -987,8 +994,12 @@ def _compute_normals_post_cut(vertices:    np.ndarray,
 
     cut_n = (cut_normal / np.linalg.norm(cut_normal)).astype(np.float32)
 
-    # Disc vertices: appear in any face where all three indices >= n_orig.
-    disc_mask = np.all(idx_i32 >= n_orig, axis=1)
+    # Disc vertices: appear in any face where all three indices >= n_orig
+    # (and, when known, are eligible: current-cut INTER/DUP or dups of them).
+    if disc_eligible is not None and len(disc_eligible) >= idx_i32.max() + 1:
+        disc_mask = np.all(disc_eligible[idx_i32], axis=1)
+    else:
+        disc_mask = np.all(idx_i32 >= n_orig, axis=1)
     if disc_mask.any():
         disc_arr = np.unique(idx_i32[disc_mask])
         # Near-plane intersection verts (t~0 or t~1) were reclassified from
