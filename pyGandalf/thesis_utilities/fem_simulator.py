@@ -48,6 +48,15 @@ import numpy as np
 # field goes bad (NaN/Inf or huge), isolating which op injects the explosion.
 _FORCE_TRACE = ('--force-trace' in sys.argv)
 
+# CG-breakdown trace (debugging the post-spike-fix CG-solve NaN blow-up). The
+# outer --force-trace localizes the blow-up to `_cg` (forces clean going in,
+# velocities all-NaN coming out). When --cg-trace is on, _cg reads the on-GPU
+# PCG scalars each iteration and reports the FIRST iteration where pAp <= 0
+# (A indefinite -> alpha = rz/pAp explodes) or a scalar goes non-finite, plus
+# the diag stats and the worst ACTIVE tet -- pinpointing the near-degenerate
+# element that breaks the solve. Sniffed from argv at import like --force-trace.
+_CG_TRACE = ('--cg-trace' in sys.argv)
+
 
 @ti.data_oriented
 class _FEMSimulator:
@@ -675,15 +684,55 @@ class _FEMSimulator:
         """Zero-sync PCG: rz, pAp scalars live in _cg_scalars on GPU throughout."""
         nv = self._n_verts
         nt = self._n_tets
+        if _CG_TRACE:
+            self._cg_frame = getattr(self, '_cg_frame', 0) + 1
         self._get_b(dt, nv)
         self._build_diag(dt, nv)
         self._matmul(self._mul_ans, self.velocities, dt, nv, nt)
         self._pcg_init(nv)
-        for _ in range(cg_iters):
+        for _it in range(cg_iters):
             self._matmul(self._mul_ans, self._p, dt, nv, nt)
             self._cg_dot_pAp(nv)
+            if _CG_TRACE and not getattr(self, '_cg_breakdown_found', False):
+                self._cg_trace_check(_it, dt)
             self._pcg_update_step(nv)
             self._pcg_update_p(nv)
+
+    def _cg_trace_check(self, it: int, dt: float):
+        """MEASUREMENT ONLY (gated by --cg-trace). Reads the on-GPU PCG scalars
+        after _cg_dot_pAp and reports the FIRST iteration where the solve breaks
+        down: pAp <= 0 (A not positive-definite -> alpha explodes) or a
+        non-finite scalar. Then dumps the diag health and the worst active tet
+        (the near-degenerate element that most likely makes A indefinite)."""
+        s = self._cg_scalars.to_numpy()          # [rz, pAp, rz_new]
+        rz, pAp = float(s[0]), float(s[1])
+        if np.isfinite(rz) and np.isfinite(pAp) and pAp > 0.0:
+            return
+        self._cg_breakdown_found = True
+        fr = getattr(self, '_cg_frame', -1)
+        alpha = rz / max(pAp, 1e-30)
+        why = 'pAp<=0 (A NOT SPD)' if pAp <= 0.0 else 'non-finite scalar'
+        print(f"[CGTrace] frame {fr} iter {it}: rz={rz:.3e} pAp={pAp:.3e} "
+              f"alpha={alpha:.3e} -> {why}", flush=True)
+        d = self._diag.to_numpy()[:self._n_verts]
+        print(f"[CGTrace]   diag(A): min={d.min():.3e} max={d.max():.3e} "
+              f"#<=0={int((d <= 0).sum())} #nonfinite={int((~np.isfinite(d)).sum())}",
+              flush=True)
+        W = self._W.to_numpy()[:self._n_tets]
+        act = np.where(W > 0.0)[0]
+        if len(act) > 0:
+            tets = self._tets.to_numpy()[:self._n_tets]
+            pos  = self.positions.to_numpy()
+            # worst = smallest active rest volume; also report its conditioning
+            order = act[np.argsort(W[act])[:3]]
+            for kw in order:
+                tv = tets[int(kw)]
+                Dm = np.stack([pos[tv[i]] - pos[tv[3]] for i in range(3)], axis=1)
+                sv = np.linalg.svd(Dm.astype(np.float64), compute_uv=False)
+                cond = float(sv[0] / max(sv[2], 1e-30))
+                print(f"[CGTrace]   active tet {int(kw)}: W={float(W[int(kw)]):.3e} "
+                      f"cond(Dm)={cond:.3e} sv(Dm)={np.array2string(sv, precision=3)} "
+                      f"verts={tv.tolist()}", flush=True)
 
     # ------------------------------------------------------------------
     # Boundary conditions and position update

@@ -45,6 +45,12 @@ import time
 # used by mesh_lib.py / taichi_cut_utils.py to enable Taichi's kernel_profiler.
 _PROFILE_KERNELS = "--profile-kernels" in sys.argv
 
+# --bruteforce: make each --auto-cut run self-terminate so a batch runner
+# (My_tests/bruteforce_nan.py) can loop it hunting the intermittent CG-solve NaN.
+# Keeps the window OPEN + drops a sentinel on a real NaN; else exits CLEAN after
+# the cuts finish + a settle window. Off by default. Sniffed from argv at import.
+_BRUTEFORCE = "--bruteforce" in sys.argv
+
 import glfw
 import taichi as ti
 import OpenGL.GL as gl
@@ -335,6 +341,61 @@ class TaichiSimulationSystem(System):
                               f"{comp.auto_cut_num} in {comp._auto_wait} frames",
                               flush=True)
 
+            # Bruteforce auto-exit (--bruteforce): self-terminate so a batch runner
+            # can loop this run hunting the intermittent CG-solve NaN.
+            if _BRUTEFORCE:
+                comp._bf_frame = getattr(comp, '_bf_frame', 0) + 1
+                _sim = getattr(comp, 'simulator', None)
+                _nan = False
+                if _sim is not None:
+                    # Detect the REAL explosion only: ACTUAL non-finite (NaN/Inf) in
+                    # forces / velocities / positions, or _cg_breakdown_found (pAp<=0,
+                    # the CG breakdown that produces the NaN). NOT _dbg_explosion_found
+                    # -- it also trips on high-but-finite force during ordinary cutting.
+                    _nan = bool(getattr(_sim, '_cg_breakdown_found', False))
+                    if not _nan:
+                        try:
+                            _n = _sim.n_verts
+                            _p = _sim.positions.to_numpy()[:_n]
+                            _v = _sim.velocities.to_numpy()[:_n]
+                            _f = _sim._forces.to_numpy()[:_n]
+                            _nan = not (bool(np.isfinite(_p).all())
+                                        and bool(np.isfinite(_v).all())
+                                        and bool(np.isfinite(_f).all()))
+                        except Exception:
+                            _nan = False
+                if _nan:
+                    if not getattr(comp, '_bf_nan_seen', False):
+                        comp._bf_nan_seen = True
+                        print(f"[Bruteforce] NAN-DETECTED frame={comp._bf_frame} "
+                              f"-- window kept OPEN so you can see the explosion; "
+                              f"close it to end the batch.", flush=True)
+                        import os as _os
+                        _sf = _os.environ.get('BRUTEFORCE_SENTINEL')
+                        if _sf:
+                            try:
+                                with open(_sf, 'w') as _f:
+                                    _f.write(f"frame={comp._bf_frame}\n")
+                            except Exception:
+                                pass
+                        comp.auto_cut_enabled = False
+                    # no exit -- keep the window open on the exploded state.
+                elif comp._bf_frame > int(getattr(comp, 'auto_cut_max_frames', 4500)):
+                    print(f"[Bruteforce] CLEAN frame={comp._bf_frame} "
+                          f"(hit absolute frame cap without NaN)", flush=True)
+                    sys.stdout.flush(); sys.stderr.flush()
+                    import os as _os
+                    _os._exit(0)
+                elif comp._auto_phase == 'done':
+                    comp._bf_settle = getattr(comp, '_bf_settle', 0) + 1
+                    if comp._bf_settle >= int(getattr(comp, 'auto_cut_settle', 300)):
+                        print(f"[Bruteforce] CLEAN frame={comp._bf_frame} "
+                              f"(no NaN through {comp._bf_settle} post-cut frames)",
+                              flush=True)
+                        sys.stdout.flush(); sys.stderr.flush()
+                        import os as _os
+                        _os._exit(0)
+
         # --- B key: progressive blade cut ---
         b_now = InputManager().get_key_down(glfw.KEY_B)
         if b_now and not getattr(self, '_b_prev', False):
@@ -495,13 +556,13 @@ class TaichiSimulationSystem(System):
             print(f"[Wire] {'ON' if comp._wireframe else 'OFF'}")
         self._z_prev = z_now
 
-        # --- H key: flat shading (per-face geometric normals, oriented toward
-        # the camera). Shading then depends on positions only, so a "dent"
-        # that survives is geometry and one that vanishes was vertex normals.
+        # --- H key: geometric (flat, per-face) normals, oriented toward the
+        # camera. Debug: shading then depends on positions only, so any "dent"
+        # that survives is geometry and any that vanishes was vertex normals.
         h_now = InputManager().get_key_down(glfw.KEY_H)
         if h_now and not getattr(self, '_h_prev', False):
             comp._geo_normals = not getattr(comp, '_geo_normals', False)
-            print(f"[FlatShade] {'ON (per-face geometric normals)' if comp._geo_normals else 'OFF (smooth vertex normals)'}")
+            print(f"[GeoNormals] {'ON (flat per-face normals from positions)' if comp._geo_normals else 'OFF (vertex normals)'}")
         self._h_prev = h_now
 
         # --- K key: clear Taichi kernel_profiler stats (no-op if profiling off) ---
@@ -658,9 +719,13 @@ class TaichiSimulationSystem(System):
             _n_phys = new_positions.shape[0]
             _elig = np.zeros(render_positions.shape[0], dtype=bool)
             _elig[comp._n_orig:_n_phys] = True
+            # Snapped originals sit on the plane like INTERs (and their dups).
+            _so = getattr(comp, '_seam_orig', None)
+            if _so is not None and len(_so) > 0:
+                _elig[np.asarray(_so, dtype=np.int64)] = True
             if comp._disc_split_phys_idx is not None and len(comp._disc_split_phys_idx) > 0:
                 _dsi = np.asarray(comp._disc_split_phys_idx, dtype=np.int64)
-                _elig[_n_phys:_n_phys + len(_dsi)] = _dsi >= comp._n_orig
+                _elig[_n_phys:_n_phys + len(_dsi)] = _elig[_dsi]
             # Base normals from reliably-wound NON-sliver faces. Verts with an
             # active face get a good normal here; sliver-only verts stay zero.
             new_normals = _compute_normals_post_cut(
@@ -782,7 +847,8 @@ class TaichiSimulationSystem(System):
                     n_orig=comp._n_orig, n_split=comp._n_split,
                     n_phys=new_positions.shape[0],
                     disc_split_phys_idx=comp._disc_split_phys_idx,
-                    cut_normal=comp._cut_normal)
+                    cut_normal=comp._cut_normal,
+                    seam_orig=getattr(comp, '_seam_orig', None))
 
             # (Old-wound rim crease is now handled by the collar vertex-split in
             # the rebuild -- the wound side and body side reference different
@@ -793,7 +859,7 @@ class TaichiSimulationSystem(System):
             upload_pos  = render_positions
             upload_norm = new_normals
 
-        # H key: replace every slot normal with its face's geometric normal,
+        # N key: replace every slot normal with its face's geometric normal,
         # flipped to face the camera (so winding does not matter). Exploded
         # layout only (each face owns its 3 slots).
         if getattr(comp, '_geo_normals', False) and comp._face_expanded \
@@ -870,6 +936,16 @@ def _run_pick(comp: TaichiSimulationComponent, mesh_comp: StaticMeshComponent):
     pick_inspector.pick_and_dump(
         comp, mesh_comp, camera_comp, camera_xf,
         cursor.x, cursor.y, int(win.width), int(win.height))
+
+
+def _seam_orig_of(shared_list, n_orig):
+    """Original vertices that were SNAPPED onto the cut plane (they appear in
+    shared_list below n_orig). They are on-plane like INTERs for rendering."""
+    if shared_list is None or len(shared_list) == 0:
+        return None
+    arr = np.asarray(shared_list, dtype=np.int64)
+    arr = arr[arr < int(n_orig)]
+    return arr if len(arr) > 0 else None
 
 
 def _primary_camera_cursor_window():
@@ -1036,9 +1112,10 @@ def _perform_cut(comp: TaichiSimulationComponent,
         raw_surface, final_pos, normal, n_orig, n_split, orig_surf_set, mesh_centroid,
         inter_data=inter_data, shared_list=shared_list)
 
+    comp._seam_orig = _seam_orig_of(shared_list, n_orig)
     if comp.split_disc_verts:
         remapped_wound, split_phys = _split_disc_verts_for_rendering(
-            outer_faces, wound_faces, len(final_pos), n_orig)
+            outer_faces, wound_faces, len(final_pos), n_orig, seam_orig=comp._seam_orig)
         comp._disc_split_phys_idx = (np.asarray(split_phys, dtype=np.int32)
                                      if len(split_phys) > 0 else None)
         render_pos = (np.vstack([final_pos, final_pos[split_phys]])
@@ -1071,7 +1148,7 @@ def _perform_cut(comp: TaichiSimulationComponent,
         n_outer_faces=len(outer_faces),
         n_orig=n_orig, n_split=n_split, n_phys=len(final_pos),
         disc_split_phys_idx=comp._disc_split_phys_idx,
-        cut_normal=normal)
+        cut_normal=normal, seam_orig=comp._seam_orig)
     exp_tex           = np.zeros((len(all_faces) * 3, 2), dtype=np.float32)
     exp_colors        = np.repeat(face_colors, 3, axis=0)
     trivial_idx       = np.arange(len(all_faces) * 3, dtype=np.uint32).reshape(-1, 3)
@@ -1226,6 +1303,7 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
     comp._shared_list = shared_list
     comp._cut_normal  = normal
     comp._seam_pairs  = method._seam_pairs
+    comp._seam_orig   = _seam_orig_of(shared_list, n_orig)
 
     # Disc/collar split (vectorized). Splits the CURRENT cut's disc verts, then
     # ALSO the OLD wound's collar verts so the previous wound shades smooth with a
@@ -1233,7 +1311,7 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
     # render-dup list.
     if comp.split_disc_verts:
         remapped_wound, split_phys = _split_disc_verts_for_rendering(
-            outer_faces, wound_faces, len(final_pos), n_orig)
+            outer_faces, wound_faces, len(final_pos), n_orig, seam_orig=comp._seam_orig)
         n_phys = len(final_pos)
         _dups = [np.asarray(split_phys, dtype=np.int32)] if len(split_phys) > 0 else []
         _next = n_phys + int(len(split_phys))
@@ -1327,7 +1405,7 @@ def _fast_rebuild_progressive_render(comp: TaichiSimulationComponent,
         n_outer_faces=len(outer_faces),
         n_orig=n_orig, n_split=n_split, n_phys=len(final_pos),
         disc_split_phys_idx=comp._disc_split_phys_idx,
-        cut_normal=normal)
+        cut_normal=normal, seam_orig=comp._seam_orig)
 
     exp_tex    = np.zeros((len(all_render_faces) * 3, 2), dtype=np.float32)
     exp_colors = np.repeat(face_colors, 3, axis=0)
@@ -1416,10 +1494,11 @@ def _rebuild_progressive_render(comp: TaichiSimulationComponent,
     _rr_t_filter = time.perf_counter() - _rr_t1
 
     comp._outer_faces = outer_faces
+    comp._seam_orig   = _seam_orig_of(shared_list, n_orig)
 
     if comp.split_disc_verts:
         remapped_wound, split_phys = _split_disc_verts_for_rendering(
-            outer_faces, wound_faces, len(final_pos), n_orig)
+            outer_faces, wound_faces, len(final_pos), n_orig, seam_orig=comp._seam_orig)
         comp._disc_split_phys_idx = (np.asarray(split_phys, dtype=np.int32)
                                      if len(split_phys) > 0 else None)
         render_pos = (np.vstack([final_pos, final_pos[split_phys]])
@@ -1523,7 +1602,7 @@ def _rebuild_progressive_render(comp: TaichiSimulationComponent,
         n_outer_faces=len(outer_faces),
         n_orig=n_orig, n_split=n_split, n_phys=len(final_pos),
         disc_split_phys_idx=comp._disc_split_phys_idx,
-        cut_normal=normal)
+        cut_normal=normal, seam_orig=comp._seam_orig)
     exp_tex    = np.zeros((len(all_render_faces) * 3, 2), dtype=np.float32)
     exp_colors = np.repeat(face_colors, 3, axis=0)
 

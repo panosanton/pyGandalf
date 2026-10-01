@@ -34,6 +34,31 @@ from .taichi_cut_utils import _SpringMassSimulator, _cut_topology_physics
 from . import taichi_cut_utils as _tcu  # for _QUIET_CUT_LOGS toggle in progressive mode
 
 
+# --watch-verts a,b,c : hardcoded vertex watch (debug). Ids are in the CUT-1
+# superset index space (the space the cut-2 bake renumbers FROM); take them
+# from the [Genealogy] lines of a Ctrl+click pick. Sniffed from argv at import
+# because ti.init runs before argparse. See FEMMethod._watch_report.
+def _sniff_id_list(flag):
+    import sys
+    argv = sys.argv
+    for i, a in enumerate(argv):
+        val = None
+        if a.startswith(flag + '='):
+            val = a.split('=', 1)[1]
+        elif a == flag and i + 1 < len(argv):
+            val = argv[i + 1]
+        if val is not None:
+            try:
+                return [int(x) for x in val.replace(';', ',').split(',') if x.strip()]
+            except ValueError:
+                print(f"[Watch] could not parse {flag} {val!r}", flush=True)
+                return None
+    return None
+
+_WATCH_VERTS = _sniff_id_list('--watch-verts')
+_WATCH_REF   = _sniff_id_list('--watch-ref')     # reference face on the live surface
+
+
 class SimulationMethod(ABC):
     """
     Abstract base class for soft-body simulation backends.
@@ -615,6 +640,21 @@ class FEMMethod(SimulationMethod):
         self._debug_pre_cut_force    = None   # max force on fixed verts last frame before cut
         self._debug_n_orig           = None   # n_orig at cut time (new-cut verts: >= n_orig)
         self._debug_cut_pos          = None   # positions of all verts at cut time
+        # [Watch] --watch-verts: cut-1 superset ids, remapped at every bake.
+        self._watch_ids   = (np.asarray(_WATCH_VERTS, dtype=np.int64)
+                             if _WATCH_VERTS else None)
+        self._watch_prev  = None   # positions at the previous report (for deltas)
+        self._watch_frame = None   # frames since the last setup_cut, None = idle
+        # [WatchRel] reference face ids (same space, same remap) + last metric.
+        self._watch_ref_ids     = (np.asarray(_WATCH_REF, dtype=np.int64)
+                                   if _WATCH_REF else None)
+        self._watch_last_metric = None
+        self._watch_step_count  = 0
+        if self._watch_ids is not None:
+            print(f"[Watch] watching cut-1 superset verts {self._watch_ids.tolist()}"
+                  + (f" relative to reference face {self._watch_ref_ids.tolist()}"
+                     if self._watch_ref_ids is not None else ""),
+                  flush=True)
 
     def initialize(self, tet_mesh, params: dict) -> None:
         from pyGandalf.thesis_utilities.fem_simulator import _FEMSimulator
@@ -640,6 +680,25 @@ class FEMMethod(SimulationMethod):
         )
         self._pristine_n_orig   = len(tet_mesh.vertices)
         self._pristine_positions = tet_mesh.vertices.astype(np.float32).copy()
+        # Uncut mesh, kept for diagnostics (pick tool: is a drawn face original
+        # skin or an interior face exposed by a missing tet?). Ids in this array
+        # are the cut-1 ORIG ids, reachable from any epoch via the bake chain.
+        self._orig_tets    = tet_mesh.tetrahedra.astype(np.int64).copy()
+        self._orig_n_verts = int(len(tet_mesh.vertices))
+        self._orig_surf_keys = None   # lazily built by orig_surface_keys()
+
+    def orig_surface_keys(self):
+        """Set of packed sorted-triple keys of the UNCUT mesh's boundary faces
+        (faces owned by exactly one original tet). Built once on demand."""
+        if self._orig_surf_keys is None:
+            t = self._orig_tets
+            f = np.concatenate([t[:, [1, 2, 3]], t[:, [0, 2, 3]],
+                                t[:, [0, 1, 3]], t[:, [0, 1, 2]]], axis=0)
+            f.sort(axis=1)
+            k = (f[:, 0] << 42) | (f[:, 1] << 21) | f[:, 2]
+            uk, cnt = np.unique(k, return_counts=True)
+            self._orig_surf_keys = set(uk[cnt == 1].tolist())
+        return self._orig_surf_keys
 
     def step(self, dt: float) -> None:
         # --force-trace: reset the per-frame first-bad tracker here (outer entry)
@@ -651,9 +710,12 @@ class FEMMethod(SimulationMethod):
             _sim._dbg_reported = False
             _sim._dbg_frame = getattr(_sim, '_dbg_frame', 0) + 1
             _sim._fcheck('frame-start (pre-opening)')
+        self._watch_step_count += 1
+        self._watch_check('step: frame start')
         self._process_opening_ramp()
         if _femmod._FORCE_TRACE:
             _sim._fcheck('_process_opening_ramp (opening impulse)')
+        self._watch_check('step: after opening ramp (velocities)')
         # Progressive path: kinematically slave sliver-orphaned INTER/DUPs to their
         # master ORIG BEFORE the solve, so the imposed orphan position is seen by
         # _get_force and the body responds inside the stable implicit step. Applying
@@ -668,16 +730,22 @@ class FEMMethod(SimulationMethod):
             )
             if _femmod._FORCE_TRACE:
                 _sim._fcheck('apply_orphan_kinematics (orphan slaving)')
+            self._watch_check('step: after orphan kinematics (positions)')
         self._simulator.step(
             dt,
             damping  = float(self._params.get('damping',  1.0)),
             v_max    = float(self._params.get('v_max',    10.0)),
             cg_iters = int(self._params.get('cg_iters',  20)),
         )
+        self._watch_check('step: after simulator.step (FEM solve)')
         # Legacy one-shot path uses _apply_orphan_constraints (numpy). It's a
         # no-op when _orphan_constraints is empty (progressive doesn't populate it).
         self._apply_orphan_constraints()
+        if self._orphan_constraints:
+            self._watch_check('step: after legacy orphan constraints')
         self._debug_step()
+        self._tw_frame()
+        self._watch_frame_tick()
         self._debug_scan_high_velocity()
         self._debug_scan_seam_separation()
 
@@ -1387,6 +1455,34 @@ class FEMMethod(SimulationMethod):
         n_baked = len(used_verts)
         remap = np.full(n_v_old, -1, dtype=np.int32)
         remap[used_verts] = np.arange(n_baked, dtype=np.int32)
+        self._bake_remap_old_to_new = remap.copy()   # [TransWatch]
+        # [Genealogy] baked idx -> pre-bake idx, one entry per bake, oldest first.
+        if not hasattr(self, '_bake_used_chain'):
+            self._bake_used_chain = []
+        self._bake_used_chain.append(used_verts.astype(np.int64).copy())
+        if not hasattr(self, '_bake_epoch_info'):
+            self._bake_epoch_info = []
+        self._bake_epoch_info.append({
+            'n_orig':  int(self._n_orig_val) if self._n_orig_val is not None else n_v_old,
+            'n_split': int(self._n_split) if self._n_split is not None else n_v_old,
+            'n_verts': n_v_old,
+        })
+        # [Watch] carry the hardcoded watch / reference ids through this renumbering.
+        for _attr, _label in (('_watch_ids', 'watch'), ('_watch_ref_ids', 'ref')):
+            _wid = getattr(self, _attr, None)
+            if _wid is None:
+                continue
+            _new = np.full(len(_wid), -1, dtype=np.int64)
+            for k, v in enumerate(_wid):
+                if 0 <= v < n_v_old:
+                    _new[k] = int(remap[v])
+            for k, (v, nv) in enumerate(zip(_wid, _new)):
+                if v >= 0 and nv < 0:
+                    print(f"[Watch] {_label} vert {int(v)} DROPPED by the bake (no kept "
+                          f"tet references it)", flush=True)
+            print(f"[Watch] bake remap ({_label}): {[int(v) for v in _wid]} -> "
+                  f"{[int(v) for v in _new]}", flush=True)
+            setattr(self, _attr, _new)
         baked_tets  = remap[kept_tets].astype(np.int32)
         baked_pos   = pos_old[used_verts].astype(np.float32)
         baked_vel   = vel_old[used_verts].astype(np.float32)
@@ -1539,14 +1635,14 @@ class FEMMethod(SimulationMethod):
                   "carried surface unavailable", flush=True)
         self._carried_surf_set = carried if carried else None
 
-        # debug_show_dropped: persist the bake-time evidence so the pick
-        # tool can explain, for any face dropped in cut N+1, why it did not
-        # make the carried set (cut-N face rows + verdicts, owner tets,
-        # sliver flags). Guarded by the flag -- this holds the whole cut-N
-        # face table alive across the bake.
-        if (bool(self._params.get('debug_show_dropped', False)
-                 or getattr(self, '_debug_show_dropped', False))
-                and cache is not None):
+        # Persist the bake-time evidence so the pick tool can explain, for any
+        # face in cut N+1, which cut-N tets owned it and whether they were kept
+        # or dropped (cut-N face rows + verdicts, owner tets, sliver flags).
+        # Always recorded: it is a few MB of numpy arrays, and the pick tool's
+        # [BakeHist] / [Walls] blocks need it without changing the rendering
+        # (debug_show_dropped also draws the dropped faces, which hides the
+        # very defects being inspected).
+        if cache is not None:
             _ss_dbg = getattr(self, '_sliver_slots', None)
             self._bake_debug = {
                 'used_verts':     used_verts.copy(),   # baked idx -> cut-N superset idx
@@ -1590,6 +1686,7 @@ class FEMMethod(SimulationMethod):
         self._split_mask         = None
         self._crossing_mask      = None
         self._split_schedule     = None
+        self._snap_verts         = None
         self._topology_result    = None
         self._n_orig_val         = None
         self._n_split            = None
@@ -1649,8 +1746,14 @@ class FEMMethod(SimulationMethod):
         # new cut. Without this, _cut_topology_physics would run on the
         # superset (W=0 placeholders + INTER/DUP verts from cut 1), which
         # it does not understand.
+        self._tw = None
         if getattr(self, '_superset_initialized', False):
+            self._watch_report(f"cut {self._cut_index}: BEFORE bake (end of cut {self._cut_index - 1})")
+            self._watch_check(f"cut {self._cut_index}: BEFORE bake", force=True)
+            self._tw_begin()
             self._bake_current_state()
+            self._watch_report(f"cut {self._cut_index}: AFTER bake (rebuild_topology, slivers re-inerted)")
+            self._watch_check(f"cut {self._cut_index}: AFTER bake rebuild_topology", force=True)
 
         normal    = np.array(cut_normal,       dtype=np.float32)
         origin    = np.array(cut_origin,       dtype=np.float32)
@@ -1681,6 +1784,23 @@ class FEMMethod(SimulationMethod):
         # here so it is available on self after setup_cut returns.
         self._pristine_tets = self._current_tets.copy()
         _signed_dist        = (cur_pos - origin) @ normal
+        # Vertex snapping (needle prevention, see _cut_topology_physics): decide
+        # the snap set ONCE here from the live positions and hand the same set
+        # to both split calls (this one and the rest-space full precompute).
+        # A snapped vertex has signed_dist 0, so tets touching it with all
+        # other verts on one side are NOT crossing: the crossing mask below
+        # must see the snapped distances or the schedule/superset disagree
+        # with the split.
+        from .taichi_cut_utils import snap_candidates as _snap_candidates
+        _snap_frac = float(self._params.get('snap_frac', 0.05))
+        _snap_mask = (_snap_candidates(self._current_tets, _signed_dist, _snap_frac)
+                      if _snap_frac > 0.0 else np.zeros(len(cur_pos), dtype=bool))
+        self._snap_verts = np.where(_snap_mask)[0].astype(np.int32)
+        if len(self._snap_verts) > 0:
+            _signed_dist = _signed_dist.copy()
+            _signed_dist[_snap_mask] = 0.0
+            print(f"[Snap] cut {self._cut_index}: {len(self._snap_verts)} vertices within "
+                  f"{_snap_frac:.0%} of an edge endpoint snapped onto the plane", flush=True)
         _tet_dists          = _signed_dist[self._current_tets]
         _crossing_mask      = ~(np.all(_tet_dists >= 0, axis=1)
                                 | np.all(_tet_dists <= 0, axis=1))
@@ -1706,6 +1826,7 @@ class FEMMethod(SimulationMethod):
             build_simulator=False,  # FEM discards new_sim; skip the build cost
             blade_dir=blade_dir,
             split_mask=_initial_mask,
+            snap_verts=self._snap_verts,
         )
         if result is None:
             return False
@@ -1783,6 +1904,7 @@ class FEMMethod(SimulationMethod):
             velocities = final_vel,
         )
         new_fem = self._simulator
+        self._watch_check(f"cut {self._cut_index}: AFTER setup rebuild_topology(final_pos)", force=True)
 
         # Detect any verts orphaned by the filter (zero mass) and build kinematic constraints.
         # With the cut-adjacent-only filter, orig-mesh verts should retain at least one tet.
@@ -1792,7 +1914,22 @@ class FEMMethod(SimulationMethod):
         _zero_mask  = _masses_np == 0.0
         _vert_remap  = {}
         _n_fallback  = 0
+        # PROGRESSIVE: at setup_cut nothing is split yet (split_mask all-False),
+        # so EVERY INTER/DUP is massless -- not because it is orphaned, but
+        # because its sub-tets do not exist yet. Adopting them here pins the
+        # whole future wound surface to setup-time masters via
+        # _apply_orphan_constraints (which runs every step), which freezes
+        # wound verts and stretches their tets across the cut. The progressive
+        # path builds its own orphan set from the END-STATE topology in
+        # _build_sliver_and_orphan_data; let it.
+        _legacy_orphans = not (self._progressive_cut
+                               and bool(self._params.get('skip_setup_orphans', True)))
         if _zero_mask.any():
+            print(f"[FEM] setup_cut: {int(_zero_mask.sum()):,} massless verts "
+                  f"({int((np.where(_zero_mask)[0] >= n_orig).sum()):,} INTER/DUP); "
+                  f"legacy orphan slaving "
+                  f"{'ON' if _legacy_orphans else 'SKIPPED (progressive)'}", flush=True)
+        if _zero_mask.any() and _legacy_orphans:
             _zero_idx    = np.where(_zero_mask)[0]
             _nonzero_idx = np.where(~_zero_mask)[0]
             _nz_pos      = final_pos[_nonzero_idx]
@@ -1859,6 +1996,16 @@ class FEMMethod(SimulationMethod):
             print(f"[FEM] {len(_zero_idx)} orphans: {_n_orig_orphans} orig-mesh  "
                   f"{len(_zero_idx) - _n_orig_orphans} new-cut  "
                   f"fixed_masters={_n_fixed_masters}  fallback={_n_fallback}", flush=True)
+        elif _zero_mask.any():
+            # Skipped the slaving (progressive): still give the massless verts a
+            # mass floor and PIN them, or the integrator divides by zero and
+            # they free-fall until the superset init takes over. Each one is
+            # unpinned by _apply_split_mask_delta when its sub-tets activate.
+            _masses_full = new_fem._masses.to_numpy()
+            _active_view = _masses_full[:n_active]
+            _active_view[_zero_mask] = float(_active_view[~_zero_mask].min()) * 1e-4
+            new_fem._masses.from_numpy(_masses_full.astype(np.float32))
+            new_fem._pin_verts_kernel(np.where(_zero_mask)[0].astype(np.int32))
 
         self._orphan_constraints = {
             orphan: (master, final_pos[orphan] - final_pos[master])
@@ -1951,7 +2098,302 @@ class FEMMethod(SimulationMethod):
         seam_pairs.sort(key=lambda p: p['travel_dist'])
         self._seam_pairs         = seam_pairs
         self._opening_ramp_queue = []
+        self._tw_after_setup()
+        self._watch_report(f"cut {self._cut_index}: AFTER setup_cut (new cut topology uploaded)")
+        self._watch_check(f"cut {self._cut_index}: END of setup_cut", force=True)
+        self._watch_frame = 0
         return True
+
+    # ---- [Watch] hardcoded vertex watch (--watch-verts, MEASUREMENT ONLY) -----
+    # Dumps the full state of a few chosen verts at every cut stage (before
+    # bake, after bake, after setup, superset init) and on selected frames
+    # after each cut. Ids are carried through bake renumbering in
+    # _bake_current_state. Valid from cut-1 superset init onward.
+    _WATCH_FRAMES = (1, 2, 3, 5, 10, 20, 40, 60, 100, 200)
+
+    def _watch_report(self, tag: str) -> None:
+        wid = getattr(self, '_watch_ids', None)
+        if wid is None or not getattr(self, '_watch_epoch_valid', False):
+            return
+        try:
+            sim = self._simulator
+            n_v = int(sim.n_verts)
+            n_t = int(sim.n_tets)
+            pos = sim.positions.to_numpy()[:n_v]
+            vel = sim.velocities.to_numpy()[:n_v]
+            mass = sim._masses.to_numpy()[:n_v]
+            fixed = sim._fixed.to_numpy()[:n_v]
+            W = sim._W.to_numpy()[:n_t]
+            tets = (self._super_tets_ref
+                    if getattr(self, '_superset_initialized', False)
+                    and getattr(self, '_super_tets_ref', None) is not None
+                    else self._current_tets)
+            tets = np.asarray(tets)[:n_t]
+            W = W[:len(tets)]
+            # Orphan bookkeeping (progressive arrays; legacy dict as fallback).
+            omap = {}
+            oid = getattr(self, '_orphan_ids', None)
+            if oid is not None and len(oid) > 0:
+                for i in range(len(oid)):
+                    omap[int(oid[i])] = (int(self._orphan_masters[i]),
+                                         np.asarray(self._orphan_offsets[i]))
+            for o, (m, off) in (getattr(self, '_orphan_constraints', {}) or {}).items():
+                omap.setdefault(int(o), (int(m), np.asarray(off)))
+            prev = getattr(self, '_watch_prev', None)
+            print(f"[Watch] ===== {tag}  (n_verts={n_v} n_tets={n_t}) =====", flush=True)
+            cur = {}
+            wset = set(int(v) for v in wid if v >= 0)
+            for k, v in enumerate(wid):
+                v = int(v)
+                if v < 0 or v >= n_v:
+                    print(f"[Watch]   slot{k}: id={v} not in range (dropped or not yet valid)",
+                          flush=True)
+                    continue
+                p = pos[v]
+                cur[v] = p.copy()
+                inc = np.where((tets == v).any(axis=1))[0]
+                n_act = int((W[inc] > 0.0).sum())
+                n_inert = len(inc) - n_act
+                # 1-ring through ACTIVE tets only, excluding the watched verts.
+                ring = np.unique(tets[inc[W[inc] > 0.0]].ravel()) if n_act > 0 else np.zeros(0, dtype=np.int64)
+                ring = ring[(ring != v) & ~np.isin(ring, list(wset))]
+                if len(ring) > 0:
+                    rm = pos[ring].mean(axis=0)
+                    rel = p - rm
+                    ring_str = (f"ring(active,n={len(ring)}) mean=({rm[0]:+.4f},{rm[1]:+.4f},{rm[2]:+.4f}) "
+                                f"v-ring=({rel[0]:+.4f},{rel[1]:+.4f},{rel[2]:+.4f}) |{np.linalg.norm(rel):.4f}|")
+                else:
+                    ring_str = "ring(active): NONE"
+                d_str = ""
+                if prev is not None and k in prev:
+                    d = p - prev[k]
+                    d_str = f" dPrev=({d[0]:+.4f},{d[1]:+.4f},{d[2]:+.4f}) |{np.linalg.norm(d):.4f}|"
+                o_str = ""
+                if v in omap:
+                    m, off = omap[v]
+                    mp = pos[m] if 0 <= m < n_v else None
+                    o_str = (f" ORPHAN master={m} off=({off[0]:+.4f},{off[1]:+.4f},{off[2]:+.4f})"
+                             + (f" master_pos=({mp[0]:+.4f},{mp[1]:+.4f},{mp[2]:+.4f}) "
+                                f"master_fixed={int(fixed[m])} master_mass={float(mass[m]):.3e}"
+                                if mp is not None else " master OUT OF RANGE"))
+                print(f"[Watch]   v{v:>6d}: pos=({p[0]:+.4f},{p[1]:+.4f},{p[2]:+.4f}) "
+                      f"vel=({vel[v,0]:+.3f},{vel[v,1]:+.3f},{vel[v,2]:+.3f}) "
+                      f"mass={float(mass[v]):.3e} fixed={int(fixed[v])} "
+                      f"tets: active={n_act} inert={n_inert}{d_str}{o_str}", flush=True)
+                print(f"[Watch]           {ring_str}", flush=True)
+            ids = [int(v) for v in wid if int(v) in cur]
+            if len(ids) >= 2:
+                pairs = []
+                for i in range(len(ids)):
+                    for j in range(i + 1, len(ids)):
+                        pairs.append(f"{ids[i]}-{ids[j]}={np.linalg.norm(cur[ids[i]] - cur[ids[j]]):.4f}")
+                print(f"[Watch]   edges: {'  '.join(pairs)}", flush=True)
+            self._watch_prev = {k: cur[int(v)] for k, v in enumerate(wid) if int(v) in cur}
+        except Exception as _e:
+            print(f"[Watch] report skipped ({_e})", flush=True)
+
+    # ---- [WatchRel] watched face vs reference face, checked at every site that
+    # writes positions or velocities. Prints only when the relation changes
+    # (or when force=True at stage boundaries), so the first site that moves
+    # the face relative to its live neighbours is the one that gets blamed.
+    _WATCHREL_EPS = 2e-3   # print when the relation drifted this much since the last print
+
+    def _watch_metric(self):
+        wid = getattr(self, '_watch_ids', None)
+        rid = getattr(self, '_watch_ref_ids', None)
+        if wid is None or rid is None or not getattr(self, '_watch_epoch_valid', False):
+            return None
+        n_v = int(self._simulator.n_verts)
+        if (wid < 0).any() or (rid < 0).any() or wid.max() >= n_v or rid.max() >= n_v:
+            return None
+        pos = self._simulator.positions.to_numpy()[:n_v]
+        A = pos[wid]; B = pos[rid]
+        ac = A.mean(axis=0); bc = B.mean(axis=0)
+        if len(rid) >= 3:
+            n = np.cross(B[1] - B[0], B[2] - B[0])
+            n = n / (float(np.linalg.norm(n)) or 1.0)
+        else:
+            n = (ac - bc); n = n / (float(np.linalg.norm(n)) or 1.0)
+        height = float(np.dot(ac - bc, n))
+        dist   = float(np.linalg.norm(ac - bc))
+        # Face shape too: mean edge of the watched face (collapse / stretch).
+        edges = [float(np.linalg.norm(A[i] - A[j]))
+                 for i in range(len(wid)) for j in range(i + 1, len(wid))]
+        edge = float(np.mean(edges)) if edges else 0.0
+        return {'height': height, 'dist': dist, 'edge': edge, 'ac': ac, 'bc': bc, 'n': n}
+
+    def _watch_check(self, site: str, force: bool = False) -> None:
+        if getattr(self, '_watch_ref_ids', None) is None:
+            return
+        try:
+            m = self._watch_metric()
+        except Exception as _e:
+            print(f"[WatchRel] {site}: metric failed ({_e})", flush=True)
+            return
+        if m is None:
+            return
+        prev  = self._watch_last_metric          # previous check (any site)
+        lastp = getattr(self, '_watch_last_printed', None)
+        self._watch_last_metric = m
+        if prev is None or lastp is None:
+            force = True
+        def _d(a, b, key):
+            return 0.0 if b is None else a[key] - b[key]
+        dh, dd, de = _d(m, prev, 'height'), _d(m, prev, 'dist'), _d(m, prev, 'edge')
+        ch, cd, ce = _d(m, lastp, 'height'), _d(m, lastp, 'dist'), _d(m, lastp, 'edge')
+        eps = self._WATCHREL_EPS
+        if not force and abs(ch) < eps and abs(cd) < eps and abs(ce) < eps:
+            return
+        self._watch_last_printed = m
+        tag = "" if force else "  <-- moved (this site: dh={:+.4f})".format(dh)
+        print(f"[WatchRel] step#{self._watch_step_count} {site}: "
+              f"height={m['height']:+.4f} (site d{dh:+.4f}, since-print d{ch:+.4f})  "
+              f"dist={m['dist']:.4f} (d{dd:+.4f})  edge={m['edge']:.4f} (d{de:+.4f})  "
+              f"Ac=({m['ac'][0]:+.4f},{m['ac'][1]:+.4f},{m['ac'][2]:+.4f}) "
+              f"Bc=({m['bc'][0]:+.4f},{m['bc'][1]:+.4f},{m['bc'][2]:+.4f}){tag}",
+              flush=True)
+
+    def _watch_frame_tick(self) -> None:
+        if getattr(self, '_watch_ids', None) is None or self._watch_frame is None:
+            return
+        self._watch_frame += 1
+        f = self._watch_frame
+        if f in self._WATCH_FRAMES:
+            self._watch_report(f"cut {getattr(self, '_cut_index', '?')} f+{f}")
+        if f >= self._WATCH_FRAMES[-1]:
+            self._watch_frame = None
+
+    # ---- [TransWatch] cut-N -> cut-N+1 transition watch (MEASUREMENT ONLY) ---
+    # The old-wound pocket shows up the moment the next cut starts. This tracks
+    # the previous cut's wound verts (INTER/DUP + on-plane ORIGs) across the
+    # bake + setup (index-mapped through the bake remap) and through the first
+    # frames after, and reports how far they move RELATIVE to the rest of the
+    # mesh (global drift removed). A jump at "setup" = kinematic (bake/orphan
+    # bookkeeping); growth over the first frames = the solve pulling them.
+    _TW_FRAMES = (1, 2, 3, 5, 10, 20, 40, 60, 100)
+
+    def _tw_begin(self) -> None:
+        try:
+            n_v = int(self._simulator.n_verts)
+            pos = self._simulator.positions.to_numpy()[:n_v].copy()
+            n_orig_prev = int(self._n_orig_val or n_v)
+            wound = np.zeros(n_v, dtype=bool)
+            wound[n_orig_prev:] = True
+            shared = getattr(self, '_full_shared_list', None) or []
+            if len(shared) > 0:
+                s = np.asarray(shared, dtype=np.int64)
+                wound[s[s < n_v]] = True
+            orph = np.zeros(n_v, dtype=bool)
+            oid = getattr(self, '_orphan_ids', None)
+            if oid is not None and len(oid) > 0:
+                o = np.asarray(oid, dtype=np.int64)
+                orph[o[(o >= 0) & (o < n_v)]] = True
+            self._tw = {'pos_pre': pos, 'wound_old': wound, 'orph_old': orph,
+                        'cut': int(getattr(self, '_cut_index', 0))}
+            print(f"[TransWatch] cut {self._tw['cut']}: snapshot before bake: "
+                  f"{n_v} verts, {int(wound.sum())} prev-wound verts "
+                  f"({int((wound & orph).sum())} of them orphans)", flush=True)
+        except Exception as _e:
+            print(f"[TransWatch] begin skipped ({_e})", flush=True)
+            self._tw = None
+
+    def _tw_stats(self, tag, pos_now):
+        tw = self._tw
+        n = tw['n_baked']
+        d = pos_now[:n] - tw['pos_ref']
+        wound = tw['wound_new']
+        # Global drift = median motion of the NON-wound verts.
+        drift = np.median(d[~wound], axis=0) if (~wound).any() else np.zeros(3)
+        rel = d - drift
+        mag = np.linalg.norm(rel, axis=1)
+        mw = mag[wound]; mo = mag[~wound]
+        def _q(a):
+            if len(a) == 0:
+                return "n=0"
+            return (f"n={len(a)} p50={np.median(a):.4f} p99={np.percentile(a, 99):.4f} "
+                    f"max={a.max():.4f}")
+        print(f"[TransWatch] {tag}: drift=({drift[0]:+.4f},{drift[1]:+.4f},{drift[2]:+.4f})  "
+              f"|rel| wound: {_q(mw)}  |  other: {_q(mo)}", flush=True)
+        try:
+            mass = self._simulator._masses.to_numpy()[:n]
+            fixed = self._simulator._fixed.to_numpy()[:n]
+        except Exception:
+            mass = fixed = None
+        oid = getattr(self, '_orphan_ids', None)
+        orph_now = set(int(o) for o in oid) if oid is not None and len(oid) > 0 else set()
+        wi = np.where(wound)[0]
+        top = wi[np.argsort(mag[wi])[::-1][:4]]
+        for v in top:
+            v = int(v)
+            m = f"{float(mass[v]):.3e}" if mass is not None else "?"
+            fx = int(fixed[v]) if fixed is not None else -1
+            print(f"[TransWatch]     wound vert {v:>6d}: |rel|={mag[v]:.4f} "
+                  f"rel=({rel[v,0]:+.4f},{rel[v,1]:+.4f},{rel[v,2]:+.4f}) "
+                  f"mass={m} fixed={fx} orphan_now={v in orph_now} "
+                  f"was_orphan={bool(tw['orph_new'][v])}", flush=True)
+
+    def _tw_after_setup(self) -> None:
+        tw = self._tw
+        if tw is None or 'pos_pre' not in tw:
+            return
+        try:
+            remap = getattr(self, '_bake_remap_old_to_new', None)
+            if remap is None:
+                print("[TransWatch] no bake remap; skipped", flush=True)
+                self._tw = None
+                return
+            n_v_old = len(tw['pos_pre'])
+            remap = remap[:n_v_old]
+            keep = remap >= 0
+            n_baked = int(remap.max()) + 1
+            n_v = int(self._simulator.n_verts)
+            pos_now = self._simulator.positions.to_numpy()[:n_v]
+            # pos_ref: the pre-bake positions carried to baked indices, so the
+            # "setup" line measures the bake+setup jump itself.
+            pos_ref = np.zeros((n_baked, 3), dtype=np.float32)
+            pos_ref[remap[keep]] = tw['pos_pre'][keep]
+            wound_new = np.zeros(n_baked, dtype=bool)
+            wound_new[remap[keep]] = tw['wound_old'][keep]
+            orph_new = np.zeros(n_baked, dtype=bool)
+            orph_new[remap[keep]] = tw['orph_old'][keep]
+            n_dropped_wound = int((tw['wound_old'] & ~keep).sum())
+            tw.update({'pos_ref': pos_ref, 'wound_new': wound_new, 'orph_new': orph_new,
+                       'n_baked': n_baked, 'frame': 0, 'super_reported': False})
+            print(f"[TransWatch] cut {tw['cut']}: bake kept {n_baked}/{n_v_old} verts; "
+                  f"prev-wound verts dropped by bake={n_dropped_wound}, "
+                  f"carried={int(wound_new.sum())}", flush=True)
+            self._tw_stats("after setup (f+0)", pos_now)
+            # From here on, measure against the post-setup positions.
+            tw['pos_ref'] = pos_now[:n_baked].copy()
+        except Exception as _e:
+            print(f"[TransWatch] after-setup skipped ({_e})", flush=True)
+            self._tw = None
+
+    def _tw_frame(self) -> None:
+        tw = getattr(self, '_tw', None)
+        if tw is None or 'pos_ref' not in tw or 'frame' not in tw:
+            return
+        tw['frame'] += 1
+        f = tw['frame']
+        if f > self._TW_FRAMES[-1]:
+            self._tw = None
+            return
+        report = f in self._TW_FRAMES
+        if getattr(self, '_superset_initialized', False) and not tw['super_reported']:
+            tw['super_reported'] = True
+            report = True
+            tag = f"f+{f} (FIRST frame with superset layout)"
+        else:
+            tag = f"f+{f}"
+        if not report:
+            return
+        try:
+            n_v = int(self._simulator.n_verts)
+            pos_now = self._simulator.positions.to_numpy()[:n_v]
+            self._tw_stats(tag, pos_now)
+        except Exception as _e:
+            print(f"[TransWatch] frame skipped ({_e})", flush=True)
+            self._tw = None
 
     def advance_blade(self, blade_travel: float) -> bool:
         # Progressive: grow the split mask if the blade has reached new tets,
@@ -2099,6 +2541,18 @@ class FEMMethod(SimulationMethod):
         init_vel = np.zeros((n_full_v, 3), dtype=np.float32)
         init_pos[:n_p] = cur_pristine_pos
         init_vel[:n_p] = cur_pristine_vel
+        # DUPs of SNAPPED originals are used by non-crossing below-half tets
+        # that are active from the start (no split-mask flip ever writes their
+        # state), so they must start at their source's LIVE position, not the
+        # rest position, or the below tets touching them get a jump.
+        _sh = self._full_shared_arr
+        if len(_sh) > 0:
+            _src_orig = _sh < n_p
+            if _src_orig.any():
+                _d = self._full_shared_dup_arr[_src_orig]
+                _s = _sh[_src_orig]
+                init_pos[_d] = cur_pristine_pos[_s]
+                init_vel[_d] = cur_pristine_vel[_s]
 
         init_fixed = self._full_final_fixed.copy()
         init_fixed[~active_verts_used] = 1  # pin inactive INTER/DUP
@@ -2132,6 +2586,13 @@ class FEMMethod(SimulationMethod):
         self._active_verts_used    = active_verts_used
         self._split_mask           = np.zeros(len(self._pristine_tets), dtype=bool)
         self._superset_initialized = True
+        # [Watch] ids become meaningful once the cut-1 superset exists.
+        if getattr(self, '_cut_index', 0) >= 1:
+            self._watch_epoch_valid = True
+        self._watch_report(f"cut {getattr(self, '_cut_index', '?')}: SUPERSET INIT "
+                           f"(positions re-uploaded, orphans pinned)")
+        self._watch_check(f"cut {getattr(self, '_cut_index', '?')}: AFTER superset init",
+                          force=True)
 
     def _apply_split_mask_delta(self, new_mask: np.ndarray) -> None:
         """
@@ -2297,7 +2758,9 @@ class FEMMethod(SimulationMethod):
             # First call: initialize with everything unsplit, then apply the
             # current mask via the same delta logic that runs each frame.
             self._init_superset_layout()
+        self._watch_check('grow: before split-mask delta')
         self._apply_split_mask_delta(new_mask)
+        self._watch_check('grow: after split-mask delta (new INTER/DUP state written)')
         _t_apply = _t.perf_counter() - _t1
 
         # Snapshot current sim state as a small numpy array for the ECS
@@ -2417,6 +2880,7 @@ class FEMMethod(SimulationMethod):
                 build_simulator = False,
                 blade_dir       = self._blade_dir,
                 split_mask      = None,      # FULL split
+                snap_verts      = getattr(self, '_snap_verts', None),   # same set as setup_cut
             )
         finally:
             _tcu._QUIET_CUT_LOGS = False
@@ -2529,6 +2993,27 @@ class FEMMethod(SimulationMethod):
             if len(_pos_vols) > 0:
                 _degen_floor = _degen_frac * float(np.median(_pos_vols))
                 is_sliver = is_sliver | (vols < _degen_floor)
+                # [DegenSweep] MEASUREMENT ONLY. Tets just above the floor stay
+                # active with almost no stiffness: their verts drift far under
+                # the opening (measured W~1e-5 tets stretched 10x, a free vert
+                # 1.65 from rest). Show what a higher floor would cost, now
+                # that stranded verts are covered by WeakSupport + piece-
+                # restricted masters (the old objection to raising it).
+                _med = float(np.median(_pos_vols))
+                _nfv = int(self._full_final_pos.shape[0])
+                _cnt4 = np.bincount(super_tets[vols >= _degen_floor].ravel(),
+                                    minlength=_nfv)
+                _line = []
+                for _f in (1e-4, 1e-3, 1e-2, 3e-2, 1e-1):
+                    _fl = _f * _med
+                    _act = vols >= _fl
+                    _c = np.bincount(super_tets[_act].ravel(), minlength=_nfv)
+                    _touched = _cnt4 > 0
+                    _line.append(f"{_f:.0e}: inert+{int((vols < _fl).sum()) - int((vols < _degen_floor).sum()):,} "
+                                 f"verts<2act+{int((_touched & (_c < 2)).sum()) - int((_touched & (_cnt4 < 2)).sum()):,}")
+                print(f"[DegenSweep] median active vol={_med:.3e}, floor now={_degen_floor:.3e} "
+                      f"({int((vols < _degen_floor).sum()):,} inert). Raising the floor would add -> "
+                      + "  ".join(_line), flush=True)
 
         # ---- [SnapProbe] diagnostic (MEASUREMENT ONLY -- no behavior change) ---
         # Option-1 groundwork. Slivers are born when the cut plane passes very
@@ -2739,13 +3224,11 @@ class FEMMethod(SimulationMethod):
         # tet. If that tet holds two such verts, the pair can rotate rigidly
         # about the tet's anchored edge at zero elastic cost (corotational FEM
         # has no stiffness against rigid rotation), so every opening nudges it
-        # further into the body and nothing pulls it back: a slowly forming
-        # dent in the wound (measured: two cut-1 INTERs sharing one active tet,
-        # 8 mm below the wound plane after cut-1's opening, their single tet
-        # exactly at rest). A vertex needs at least two active tets to be
-        # kinematically determined; slave the ones with fewer to a master like
-        # the sliver-only orphans. Masters are piece-restricted (above), so
-        # slaving a vertex that owns an active tet cannot weld pieces.
+        # further into the body and nothing pulls it back: a permanent dent in
+        # the wound (measured: two cut-1 INTERs sharing one active tet, 8 mm
+        # below the wound plane, their single tet exactly at rest). A vertex
+        # needs at least two active tets to be kinematically determined; slave
+        # the ones with fewer to a master like the sliver-only orphans.
         _min_act = int(self._params.get('min_active_tets', 2))
         if _min_act > 1 and len(good_end_slots) > 0:
             good_cnt = np.bincount(super_tets[good_end_slots].ravel(), minlength=n_full_v)
@@ -2761,6 +3244,15 @@ class FEMMethod(SimulationMethod):
         # --- end under-determined verts ---------------------------------------
 
         orphan_ids = np.where(orphan_mask)[0].astype(np.int32)
+        # [diag] which rule orphaned each vertex: 1 sliver-only (volume floor),
+        # 2 severed island, 3 weak support. Read by the pick tool.
+        _cls = np.zeros(n_full_v, dtype=np.int8)
+        _cls[touched_by_any_end & (vol_by_vert < _floor)] = 1
+        if 'island_vmask' in locals():
+            _cls[island_vmask & (_cls == 0)] = 2
+        if 'weak' in locals() and weak is not None:
+            _cls[weak & (_cls == 0)] = 3
+        self._orphan_class = _cls
 
         # Piece labels: connected components of the END-STATE superset tets
         # (full-block rows, slivers included). Vertex duplication at every cut
@@ -2779,9 +3271,87 @@ class FEMMethod(SimulationMethod):
             _a = np.concatenate([_et[:, 0], _et[:, 0], _et[:, 0], _et[:, 1], _et[:, 1], _et[:, 2]])
             _b = np.concatenate([_et[:, 1], _et[:, 2], _et[:, 3], _et[:, 2], _et[:, 3], _et[:, 3]])
             _g = _csr((np.ones(len(_a)), (_a, _b)), shape=(n_full_v, n_full_v))
-            _, _piece_lab = _cc(_g, directed=False)
+            _n_pieces, _piece_lab = _cc(_g, directed=False)
+            self._piece_lab = _piece_lab          # for the pick tool ([Piece])
+            # GOOD-graph labels (active, non-sliver tets only): -1 for verts
+            # that touch no good tet. Slivers can lump two physical pieces into
+            # one sliver-inclusive component; comparing the two labelings
+            # exposes that.
+            _gt = super_tets[good_end_slots]
+            _ga = np.concatenate([_gt[:, 0], _gt[:, 0], _gt[:, 0], _gt[:, 1], _gt[:, 1], _gt[:, 2]])
+            _gb = np.concatenate([_gt[:, 1], _gt[:, 2], _gt[:, 3], _gt[:, 2], _gt[:, 3], _gt[:, 3]])
+            _gg = _csr((np.ones(len(_ga)), (_ga, _gb)), shape=(n_full_v, n_full_v))
+            _n_good, _good_lab = _cc(_gg, directed=False)
+            _in_good = np.zeros(n_full_v, dtype=bool)
+            _in_good[np.unique(_gt.ravel())] = True
+            _good_lab = np.where(_in_good, _good_lab, -1)
+            self._piece_lab_good = _good_lab
+            # How many good-graph pieces (>= 4 verts) does each sliver-inclusive
+            # piece contain? > 1 anywhere = slivers lump physical pieces.
+            _pairs = np.unique(np.stack([_piece_lab[_in_good], _good_lab[_in_good]], axis=1), axis=0)
+            _gsz = np.bincount(_good_lab[_in_good], minlength=_n_good)
+            _pairs = _pairs[_gsz[_pairs[:, 1]] >= 4]
+            _per = np.bincount(_pairs[:, 0], minlength=_n_pieces)
+            _lumped = np.where(_per > 1)[0]
+            print(f"[MasterIsland] cut {getattr(self, '_cut_index', '?')}: sliver-inclusive pieces="
+                  f"{_n_pieces}, good-graph pieces(>=4 verts)={int((_gsz >= 4).sum())}; "
+                  f"pieces LUMPING several good pieces: {len(_lumped)} "
+                  f"{[(int(p), int(_per[p])) for p in _lumped][:8]}", flush=True)
+            # Which INERT tets do the lumping? For each sliver row whose verts carry
+            # >= 2 distinct good labels (>= 4-vert pieces only), measure the
+            # closest cross-label vertex pair: ~0 = coincident copies of one
+            # cut-plane point (tet built from both sides of a cut = topology
+            # defect); normal edge length = a sliver neck inside one piece.
+            _sl_rows = np.where(is_sliver[:n_full_tets])[0]
+            _big = _gsz >= 4
+            _bridges = []
+            _v = self._full_final_pos
+            for _r in _sl_rows:
+                _tv = super_tets[_r]
+                _ls = _good_lab[_tv]
+                _ok = (_ls >= 0) & _big[np.maximum(_ls, 0)]
+                _u = np.unique(_ls[_ok])
+                if len(_u) < 2:
+                    continue
+                _dmin = np.inf
+                for _i in range(4):
+                    for _j in range(_i + 1, 4):
+                        if _ok[_i] and _ok[_j] and _ls[_i] != _ls[_j]:
+                            _dmin = min(_dmin, float(np.linalg.norm(_v[_tv[_i]] - _v[_tv[_j]])))
+                _bridges.append((int(_r), _tv.tolist(), _ls.tolist(), _dmin))
+            if _bridges:
+                _dm = np.array([b[3] for b in _bridges])
+                _edge_med = float(np.median(np.linalg.norm(
+                    _v[_gt[:, 1]] - _v[_gt[:, 0]], axis=1))) if len(_gt) else 1.0
+                # Bridges between two LARGE active pieces (>= 200 verts each) are
+                # tets spanning physical pieces; bridges to a tiny piece are islands.
+                def _sizes(ls):
+                    return sorted(set(int(_gsz[l]) for l in ls if l >= 0 and _gsz[l] >= 4))
+                _big2 = [b for b in _bridges if len([s for s in _sizes(b[2]) if s >= 200]) >= 2]
+                print(f"[MasterIsland]   bridging inert tets: {len(_bridges)}; cross-label min "
+                      f"vertex distance: p50={np.median(_dm):.4f} p90={np.percentile(_dm, 90):.4f} "
+                      f"max={_dm.max():.4f} (median good edge={_edge_med:.4f}); "
+                      f"coincident(<1e-4)={int((_dm < 1e-4).sum())}; "
+                      f"between two LARGE pieces: {len(_big2)}", flush=True)
+                _born_chain = getattr(self, '_bake_used_chain', None) or []
+                def _born(v):
+                    cur = int(v); ep = len(_born_chain) + 1
+                    for k in range(len(_born_chain) - 1, -1, -1):
+                        if cur >= len(_born_chain[k]):
+                            return ep
+                        cur = int(_born_chain[k][cur]); ep -= 1
+                    return ep
+                for _b in sorted(_bridges, key=lambda b: -b[3])[:10]:
+                    _tv = _b[1]
+                    _res = bool(_pip is not None and _b[0] < n_full_tets
+                                and _pip[int(self._full_all_tets_parent[_b[0]])])
+                    print(f"[MasterIsland]     row {_b[0]} verts={_tv} born={[_born(v) for v in _tv]} "
+                          f"good_pieces={_b[2]} sizes={_sizes(_b[2])} "
+                          f"cross-min-dist={_b[3]:.4f} resident_inert_parent={_res}", flush=True)
+            else:
+                print(f"[MasterIsland]   no inert tet spans two good pieces", flush=True)
         except Exception as _e:
-            print(f"[Orphan] piece labels unavailable ({_e}); masters by distance only",
+            print(f"[MasterIsland] piece labels unavailable ({_e}); masters by distance only",
                   flush=True)
 
         # Master finding: for each orphan, look at its geometric neighborhood.
@@ -2866,6 +3436,22 @@ class FEMMethod(SimulationMethod):
             # ORIGs and non-orphan DUPs (mimics one-shot's pool).
             masters = np.where(vi_match, vis, vjs).astype(np.int64)
 
+            # Piece check on the EDGE-derived master too. Matching side_label
+            # does not guarantee the same PIECE: with several pieces per side
+            # (and with snapped endpoints, which belong to whichever sub-tets
+            # kept them) an edge endpoint can sit on another piece, and slaving
+            # to it stretches the orphan's tets across the cut. Route those to
+            # the piece-restricted fallback below. (Measured: INTER on piece 0
+            # mastered to an ORIG on piece 1.)
+            if _piece_lab is not None:
+                _edge_ok = _piece_lab[masters] == _piece_lab[orphan_ids]
+                _n_edge_cross = int(((vi_match | vj_match) & ~_edge_ok).sum())
+                if _n_edge_cross > 0:
+                    print(f"[Orphan] {_n_edge_cross} edge-endpoint masters on another "
+                          f"piece -> re-picked on the orphan's own piece", flush=True)
+                vi_match &= _edge_ok
+                vj_match &= _edge_ok
+
             neither_matches = ~vi_match & ~vj_match
             if neither_matches.any():
                 # Master pool: same-side ORIGs by SIDE_LABEL (the physics side)
@@ -2928,11 +3514,41 @@ class FEMMethod(SimulationMethod):
                             masters[o_local] = _pick(below_tree, below_pool_idx, o_pos, o_lab)
                         # else: no pool on this side -- keep vj fallback.
                     if _n_nopiece > 0:
-                        print(f"[Orphan] {_n_nopiece} orphans have no eligible master on "
+                        print(f"[MasterIsland] {_n_nopiece} orphans have NO eligible master on "
                               f"their own piece (piece is all-orphan/inert); nearest used",
                               flush=True)
                 except ImportError:
                     pass  # scipy not available; keep the vj fallback
+
+            # ---- [MasterIsland] diagnostic (MEASUREMENT ONLY) -----------------
+            # Does each orphan's master live on the orphan's own PIECE? Pieces =
+            # connected components of the end-state superset tets (full-block
+            # rows, slivers included; vertex duplication at every cut plane keeps
+            # separate pieces disconnected). A master on another piece is a
+            # kinematic bridge between pieces: harmless-looking for sliver-only
+            # orphans (drags inert tets), a MECHANICAL weld for orphans that own
+            # an active tet (weak-support class).
+            try:
+                if _piece_lab is None:
+                    raise RuntimeError("no piece labels")
+                _nc, _lab = _n_pieces, _piece_lab
+                _mis = _lab[orphan_ids] != _lab[masters]
+                _weak_m = np.zeros(n_full_v, dtype=bool)
+                if 'weak' in locals() and weak is not None:
+                    _weak_m = weak
+                _isl_m = np.zeros(n_full_v, dtype=bool)
+                if 'island_vmask' in locals():
+                    _isl_m = island_vmask
+                _w = _weak_m[orphan_ids]; _i = _isl_m[orphan_ids] & ~_w
+                _s = ~_w & ~_i
+                print(f"[MasterIsland] cut {getattr(self, '_cut_index', '?')}: pieces={_nc}  "
+                      f"orphans with master on ANOTHER piece: {int(_mis.sum())} of {len(orphan_ids)}  "
+                      f"(weak-support {int((_mis & _w).sum())}/{int(_w.sum())}, "
+                      f"island {int((_mis & _i).sum())}/{int(_i.sum())}, "
+                      f"sliver-only {int((_mis & _s).sum())}/{int(_s.sum())})", flush=True)
+                self._orphan_piece_mismatch = _mis
+            except Exception as _e:
+                print(f"[MasterIsland] skipped ({_e})", flush=True)
 
             # Offset: orphan_pristine_pos - master_pristine_pos.
             offsets = (self._full_final_pos[orphan_ids]

@@ -258,6 +258,15 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
     below_nocross = tetrahedra[below_mask]
 
     def iv(vi: int, vj: int) -> int:
+        # A vertex lying exactly ON the plane (snapped, signed_dist == 0) IS
+        # the intersection of every edge leaving it: return it instead of
+        # inserting a coincident INTER at t=0 (the needle-tet source). The
+        # templates below then emit some sub-tets with a repeated vertex;
+        # those are degenerate by construction and dropped afterwards.
+        if signed_dist[vi] == 0.0:
+            return int(vi)
+        if signed_dist[vj] == 0.0:
+            return int(vj)
         key = (min(vi, vj), max(vi, vj))
         if key not in edge_cache:
             di, dj = float(signed_dist[vi]), float(signed_dist[vj])
@@ -344,6 +353,23 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
                      if above_list else np.zeros((0, 4), dtype=np.int32))
     below_cross   = (np.array(below_list, dtype=np.int32)
                      if below_list else np.zeros((0, 4), dtype=np.int32))
+    above_parent  = np.asarray(above_parent, dtype=np.int32)
+    below_parent  = np.asarray(below_parent, dtype=np.int32)
+
+    # Drop degenerate sub-tets (a repeated vertex id): produced by the templates
+    # when an on-plane vertex stands in for one or more INTERs (see iv()).
+    def _nondegenerate(t):
+        if len(t) == 0:
+            return np.ones(0, dtype=bool)
+        return ((t[:, 0] != t[:, 1]) & (t[:, 0] != t[:, 2]) & (t[:, 0] != t[:, 3])
+                & (t[:, 1] != t[:, 2]) & (t[:, 1] != t[:, 3]) & (t[:, 2] != t[:, 3]))
+    _ka = _nondegenerate(above_cross)
+    _kb = _nondegenerate(below_cross)
+    if len(_ka) and not _ka.all() or len(_kb) and not _kb.all():
+        _log(f"[Cut] on-plane vertex templates: dropped {int((~_ka).sum()) + int((~_kb).sum())} "
+              f"degenerate sub-tets")
+        above_cross, above_parent = above_cross[_ka], above_parent[_ka]
+        below_cross, below_parent = below_cross[_kb], below_parent[_kb]
     above_arr     = np.vstack([above_nocross.astype(np.int32), above_cross])
     below_arr     = np.vstack([below_nocross.astype(np.int32), below_cross])
     unsplit_cross = (np.array(unsplit_list, dtype=np.int32)
@@ -354,16 +380,35 @@ def _split_crossed_tets(tetrahedra: np.ndarray,
     # from; for unsplit_cross it's their pristine index.
     above_parent_arr = np.concatenate([
         np.where(above_mask)[0].astype(np.int32),
-        np.asarray(above_parent, dtype=np.int32),
+        above_parent,
     ])
     below_parent_arr = np.concatenate([
         np.where(below_mask)[0].astype(np.int32),
-        np.asarray(below_parent, dtype=np.int32),
+        below_parent,
     ])
     unsplit_parent_arr = np.asarray(unsplit_parent, dtype=np.int32)
 
     return (new_pos, above_arr, below_arr, inter_data, phantom_above_face_keys,
             unsplit_cross, above_parent_arr, below_parent_arr, unsplit_parent_arr)
+
+
+def snap_candidates(tets: np.ndarray, signed_dist: np.ndarray, frac: float) -> np.ndarray:
+    """Bool mask of vertices to snap onto the plane: an endpoint of any edge
+    the plane crosses within `frac` of that endpoint (t < frac or t > 1-frac,
+    t measured from the first vertex). Tolerance is relative to each edge, so
+    it scales with the local tet size."""
+    t4 = np.asarray(tets, dtype=np.int64)
+    pairs = np.array([[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]])
+    a = t4[:, pairs[:, 0]].ravel()
+    b = t4[:, pairs[:, 1]].ravel()
+    da, db = signed_dist[a], signed_dist[b]
+    cross = (da * db) < 0.0
+    a, b, da, db = a[cross], b[cross], da[cross], db[cross]
+    t = da / (da - db)
+    out = np.zeros(len(signed_dist), dtype=bool)
+    out[a[t < frac]] = True
+    out[b[t > 1.0 - frac]] = True
+    return out
 
 
 def _cut_topology_physics(
@@ -378,7 +423,9 @@ def _cut_topology_physics(
         normal:          np.ndarray,
         build_simulator: bool = True,
         blade_dir:       np.ndarray = None,
-        split_mask:      np.ndarray = None):
+        split_mask:      np.ndarray = None,
+        snap_frac:       float = 0.0,
+        snap_verts:      np.ndarray = None):
     """
     Pure topology-change computation — no Component dependency.
 
@@ -386,13 +433,39 @@ def _cut_topology_physics(
     rebuilds the spring-mass simulator.  Used by both the ECS wrapper
     (_cut_topology) and SpringMassMethod.setup_cut().
 
+    Vertex snapping (needle prevention): an edge the plane crosses within
+    `snap_frac` of an endpoint would get an INTER a few mm from that vertex,
+    and every tet on it becomes a needle/sliver (zero-volume, inert, an
+    orphan vertex, and a face whose normal swings with sub-mm noise). Instead
+    the endpoint is moved ONTO the plane (signed_dist = 0) and stands in for
+    the INTER: _split_crossed_tets emits no vertex on its edges, and it is
+    duplicated for the below half like an INTER (it joins shared_list).
+    `snap_verts` overrides the per-call decision so the two split calls of a
+    progressive cut (live positions in setup_cut, rest positions in the full
+    precompute) snap the SAME vertex set.
+
     Returns
     -------
     (new_sim, final_pos, final_vel, final_mass, final_fixed,
      all_tets, n_orig, n_split, shared_list, remap, inter_data, orig_surf_set)
     or None if the cut plane does not divide the mesh.
     """
+    positions    = np.array(positions, dtype=np.float32, copy=True)
     signed_dist  = (positions - origin) @ normal
+
+    # --- Vertex snapping onto the plane ---
+    snapped = np.zeros(len(positions), dtype=bool)
+    if snap_verts is not None and len(snap_verts) > 0:
+        snapped[np.asarray(snap_verts, dtype=np.int64)] = True
+    elif snap_frac > 0.0:
+        snapped = snap_candidates(current_tets, signed_dist, snap_frac)
+    signed_dist_presnap = signed_dist
+    if snapped.any():
+        positions[snapped] -= signed_dist[snapped, np.newaxis] * normal
+        signed_dist = signed_dist.copy()
+        signed_dist[snapped] = 0.0
+        _log(f"[Snap] {int(snapped.sum())} vertices snapped onto the cut plane "
+              f"(no INTER on their edges)")
 
     # --- Original outer surface set (to detect interior-exposed faces later) ---
     face_combos = np.array([[0,1,2],[0,1,3],[0,2,3],[1,2,3]], dtype=np.int32)
@@ -436,7 +509,9 @@ def _cut_topology_physics(
     # Kept strictly <= snap_eps so anything we relabel to below-side is also
     # physically snapped onto the plane by the rim-snap block (no jigsaw).
     sos_eps    = mesh_scale * 1e-5
-    on_plane_mask = np.abs(signed_dist) < sos_eps
+    # Snapped vertices are on the plane BY DESIGN (exact 0, handled by the
+    # split templates); SoS only relabels accidental near-zeros.
+    on_plane_mask = (np.abs(signed_dist) < sos_eps) & ~snapped
     if on_plane_mask.any():
         n_above_side = int(((signed_dist > 0) & on_plane_mask).sum())
         n_below_side = int(((signed_dist <= 0) & on_plane_mask).sum())
@@ -527,11 +602,17 @@ def _cut_topology_physics(
 
     # --- Vertex duplication (seam) ---
     # INTER verts (idx >= n_orig) appearing in both halves get a below-half
-    # DUP. Because the SoS pass above ensures no ORIG has signed_dist == 0,
-    # every ORIG is classified into exactly one half and never needs duping.
+    # DUP, and so do SNAPPED originals (exactly on the plane, used by tets of
+    # both halves). The SoS pass ensures every other ORIG is classified into
+    # exactly one half and never needs duping.
     _shared_all   = np.intersect1d(above_tets.ravel(), below_tets.ravel(),
                                    assume_unique=False)
-    shared_list   = [int(v) for v in _shared_all[_shared_all >= n_orig]]
+    _shared_keep  = ((_shared_all >= n_orig)
+                     | ((_shared_all < n_orig) & snapped[np.minimum(_shared_all, n_orig - 1)]))
+    shared_list   = [int(v) for v in _shared_all[_shared_keep]]
+    n_snap_shared = int(((_shared_all < n_orig) & _shared_keep).sum())
+    if n_snap_shared:
+        _log(f"[Snap] {n_snap_shared} snapped originals duplicated for the below half")
     n_shared      = len(shared_list)
     _log(f"[Cut] Duplicating {n_shared} seam vertices")
 
@@ -566,6 +647,17 @@ def _cut_topology_physics(
     side_label[:n_orig]            = np.where(signed_dist_split >= 0, 1, -1).astype(np.int8)
     side_label[n_orig:n_split]     = 1
     side_label[n_split:]           = -1
+    # SNAPPED originals have signed_dist exactly 0, which the rule above would
+    # label +1 whatever half they belong to. Their side is the one they were
+    # on BEFORE the snap moved them (a few mm at most), which is stable in
+    # both the progressive and full-split calls. Tet membership is NOT usable
+    # here: in progressive mode above_tets holds only the non-crossing above
+    # tets, so a plane-adjacent vertex appears in none of them. (Measured: a
+    # mislabelled snapped vertex enters the wrong master pool and drags INTER
+    # orphans across the wound.)
+    if snapped.any():
+        _sn = np.where(snapped)[0]
+        side_label[_sn] = np.where(signed_dist_presnap[_sn] > 0, 1, -1).astype(np.int8)
 
     # --- Rebuild simulator (skipped when caller is FEM and only wants topology) ---
     if build_simulator:
@@ -709,7 +801,8 @@ def _filter_surface_faces(raw_surface, final_pos, normal, n_orig, n_split,
     return outer_arr, wound
 
 
-def _split_disc_verts_for_rendering(outer_faces, wound_faces, n_phys, n_orig):
+def _split_disc_verts_for_rendering(outer_faces, wound_faces, n_phys, n_orig,
+                                    seam_orig=None):
     """
     Create rendering-only duplicate vertices for intersection vertices that appear
     in both disc (wound) faces and collar (outer) faces.
@@ -738,8 +831,12 @@ def _split_disc_verts_for_rendering(outer_faces, wound_faces, n_phys, n_orig):
         return (wf_arr.astype(np.uint32).reshape(-1, 3),
                 np.array([], dtype=np.int32))
 
-    # Disc verts: verts in an all->=n_orig wound face.
-    all_ge = (wf_arr >= n_orig).all(axis=1)
+    # Disc verts: verts in an all-on-plane wound face (>= n_orig, or a SNAPPED
+    # original listed in seam_orig, which sits on the plane like an INTER).
+    on_pl = wf_arr >= n_orig
+    if seam_orig is not None and len(seam_orig) > 0:
+        on_pl = on_pl | np.isin(wf_arr, np.asarray(seam_orig, dtype=np.int64))
+    all_ge = on_pl.all(axis=1)
     if not all_ge.any():
         return wf_arr.astype(np.uint32), np.array([], dtype=np.int32)
     disc_v = np.unique(wf_arr[all_ge].ravel())
@@ -1067,9 +1164,13 @@ def _finalize_wound_slot_normals(exp_norm:            np.ndarray,
                                   n_split:             int,
                                   n_phys:              int,
                                   disc_split_phys_idx: np.ndarray,
-                                  cut_normal:          np.ndarray) -> np.ndarray:
+                                  cut_normal:          np.ndarray,
+                                  seam_orig:           np.ndarray = None) -> np.ndarray:
     """
     Override normals for wound-face slots with the topologically-correct +-cut_n.
+
+    seam_orig: SNAPPED originals (on the plane, above-half copies); classed
+    with the INTERs so a wound face touching one is not "mixed".
 
     The per-vertex normal pipeline (`_compute_normals_post_cut`) cannot give
     correct shading for a vertex that belongs to both a wound face and a
@@ -1133,6 +1234,8 @@ def _finalize_wound_slot_normals(exp_norm:            np.ndarray,
             resolved[rmask] = np.asarray(disc_split_phys_idx,
                                           dtype=np.int64)[resolved[rmask] - n_phys]
     is_inter = (resolved >= n_orig) & (resolved < n_split)
+    if seam_orig is not None and len(seam_orig) > 0:
+        is_inter = is_inter | np.isin(resolved, np.asarray(seam_orig, dtype=np.int64))
     is_dup   = resolved >= n_split
     all_inter = is_inter.all(axis=1)
     all_dup   = is_dup.all(axis=1)

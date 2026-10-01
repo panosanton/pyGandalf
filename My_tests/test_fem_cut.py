@@ -103,6 +103,31 @@ def main():
                         help='Debug: trace every force-manip site and report the '
                              'FIRST one each frame that makes forces/velocities/'
                              'positions go bad (sniffed from argv at import).')
+    parser.add_argument('--cg-trace', action='store_true', default=False,
+                        help='Debug: read the on-GPU PCG scalars each CG iteration '
+                             'and report the FIRST breakdown (pAp<=0 => A not SPD, '
+                             'or non-finite), plus diag health and the worst active '
+                             'tet (sniffed from argv at import).')
+    parser.add_argument('--bruteforce', action='store_true', default=False,
+                        help='Debug: with --auto-cut, self-terminate each run '
+                             '(NaN => exit 1 with a [Bruteforce] NAN-DETECTED '
+                             'marker; else exit 0 CLEAN after cuts+settle) so '
+                             'My_tests/bruteforce_nan.py can loop it. Sniffed at '
+                             'import.')
+    parser.add_argument('--watch-verts', type=str, default=None,
+                        help='Debug: comma-separated vertex ids in the CUT-1 '
+                             'superset index space (get them from the [Genealogy] '
+                             'lines of a Ctrl+click pick). They are carried through '
+                             'every bake renumbering and their full state is dumped '
+                             'at each cut stage and the frames after (sniffed at '
+                             'import).')
+    parser.add_argument('--watch-ref', type=str, default=None,
+                        help='Debug: comma-separated cut-1 superset ids of a '
+                             'REFERENCE face on the good live surface next to the '
+                             'watched face. With --watch-verts, every site that '
+                             'writes positions/velocities reports the watched '
+                             'face height above the reference plane whenever it '
+                             'changes ([WatchRel]). Sniffed at import.')
     parser.add_argument('--cg_iters', type=int, default=20,
                         help='CG solver iterations (default: 20; increase for larger/stiffer meshes)')
     parser.add_argument('--tet_scale', type=float, default=1.0,
@@ -288,7 +313,7 @@ def main():
     # unchanged) via _regen_plane; timing uses a SEPARATE seeded rng so bumping
     # --timing-seed explores different pre-cut physics states. NUM_CUTS and the
     # max delay are constants for now.
-    NUM_CUTS = 3
+    NUM_CUTS = 2
     DELAY_MAX_FRAMES = 40
     taichi_comp.auto_cut_enabled   = args.auto_cut
     taichi_comp.auto_cut_rng       = np.random.default_rng(args.timing_seed)
