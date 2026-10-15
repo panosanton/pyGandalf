@@ -2734,19 +2734,28 @@ class FEMMethod(SimulationMethod):
                 print(f"[IslandReattach] skipped ({_e})", flush=True)
         # --- end severed-island reattachment ---------------------------------
 
-        # --- Under-determined (hinge) verts -----------------------------------
-        # Sliver deactivation can leave a free vertex with exactly ONE active
-        # tet. If that tet holds two such verts, the pair can rotate rigidly
-        # about the tet's anchored edge at zero elastic cost (corotational FEM
-        # has no stiffness against rigid rotation), so every opening nudges it
-        # further into the body and nothing pulls it back: a slowly forming
-        # dent in the wound (measured: two cut-1 INTERs sharing one active tet,
-        # 8 mm below the wound plane after cut-1's opening, their single tet
-        # exactly at rest). A vertex needs at least two active tets to be
-        # kinematically determined; slave the ones with fewer to a master like
-        # the sliver-only orphans. Masters are piece-restricted (above), so
-        # slaving a vertex that owns an active tet cannot weld pieces.
-        _min_act = int(self._params.get('min_active_tets', 2))
+        # --- Under-determined (hinge) verts -- DISABLED BY DEFAULT ------------
+        # The idea: sliver deactivation can leave a free vertex with one active
+        # tet, hinged about that tet's anchored edge at zero elastic cost, so
+        # it sinks a few mm into the wound over successive openings (measured:
+        # two cut-1 INTERs sharing one active tet, 8 mm down, the tet at rest).
+        # Slaving such verts did stop that sinking.
+        #
+        # But it caused a far worse regression: pinning a vertex that STILL
+        # OWNS an active tet leaves that tet's elastic force unbalanced, and
+        # because a kinematic constraint always wins, the reaction is pumped
+        # into the tet's free neighbours every frame. Measured: pinned orphan
+        # v48163 carrying |F|=288 on mass 2.6e-3 with a free tet-mate at
+        # |v|=2.31, and whole islands dragged away by that steady pull. Every
+        # top constraint-reaction vertex was one of these. Disabling it stops
+        # the drifting, and the dent does NOT come back, because what made the
+        # dent visible was the needle-face normals (fixed separately), not the
+        # 8 mm of sinking.
+        #
+        # If revisited: do not pin these verts. Either deactivate their last
+        # active tet too (so they become true orphans with no unbalanced
+        # force), or add real support instead of a Dirichlet constraint.
+        _min_act = int(self._params.get('min_active_tets', 1))
         if _min_act > 1 and len(good_end_slots) > 0:
             good_cnt = np.bincount(super_tets[good_end_slots].ravel(), minlength=n_full_v)
             weak = touched_by_any_end & (good_cnt > 0) & (good_cnt < _min_act) & (~orphan_mask)
